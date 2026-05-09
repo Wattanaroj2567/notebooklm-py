@@ -1,0 +1,27 @@
+services:
+  notebooklm-mcp:
+    build:
+      context: .
+    container_name: notebooklm-mcp
+    restart: unless-stopped
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - NOTEBOOKLM_HOME=/root/.notebooklm
+    volumes:
+      # Map the entire .notebooklm directory to handle profiles and config correctly
+      - ~/.notebooklm:/root/.notebooklm
+    ports:
+      - "8000:8000"
+
+  # Dedicated tunnel for notebooklm-mcp.tawanlab.site
+  # This separates it from the 'fallhelp-backend' tunnel.
+  mcp-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: mcp-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      - notebooklm-mcp

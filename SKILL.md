@@ -1,14 +1,29 @@
 ---
 name: notebooklm
-description: Complete API for Google NotebookLM - full programmatic access including features not in the web UI. Create notebooks, add sources, generate all artifact types, download in multiple formats. Activates on explicit /notebooklm or intent like "create a podcast about X"
+description: Advanced AI Automation via NotebookLM - full programmatic access. Activates on intent like "research topic X" or "automate research workflow". Optimized for AI Sub-agent collaboration (Minnie, Reas, Vera, Indy, Day).
 ---
 
-# NotebookLM Automation
+# NotebookLM AI Team Automation
 
-Complete programmatic access to Google NotebookLM—including capabilities not exposed in the web UI. Create notebooks, add sources (URLs, YouTube, PDFs, audio, video, images), chat with content, generate all artifact types, and download results in multiple formats.
+Complete programmatic access to Google NotebookLM. This skill is optimized for **AI Agentic Orchestration**, allowing a lead agent to coordinate specialized sub-agents for deep research, verification, and insight extraction.
 
-## Installation
+## AI Team Framework (Operational Roles)
 
+When using this skill, the agent should adopt or delegate these roles:
+- **Minnie (Idea Generator):** Decomposes goals into specific research queries.
+- **Reas (Reasoning):** Plans multi-step workflows and handles complex technical logic.
+- **Vera (Verification):** Fact-checks findings against grounded sources and monitors task status.
+- **Indy (Integration):** Executes tool calls and manages the MCP transport layer.
+- **Day (Delivery):** Synthesizes final reports and automates artifact deployment.
+
+## Core Directives for Agents
+
+- **Explicit IDs:** ALWAYS pass explicit notebook IDs using `-n <id>` or `--notebook <id>`. DO NOT rely on the global context to ensure parallel safety in multi-agent environments.
+- **Structured Output:** ALWAYS use the `--json` flag to obtain machine-readable results for internal processing.
+- **Smart Compression:** Use NotebookLM as a high-density RAG layer (1M+ tokens) to avoid prompt stuffing and preserve the agent's context window.
+
+## Installation & Prerequisites
+...
 **From PyPI (Recommended):**
 ```bash
 pip install notebooklm-py
