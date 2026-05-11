@@ -606,7 +606,7 @@ def _load_storage_state(path: Path | None = None) -> dict[str, Any]:
         except json.JSONDecodeError as e:
             raise ValueError(
                 f"Invalid JSON in NOTEBOOKLM_AUTH_JSON environment variable: {e}\n"
-                f"Ensure the value is valid Playwright storage state JSON."
+                "Ensure the value is valid Playwright storage state JSON."
             ) from e
         # Validate structure
         if not isinstance(storage_state, dict) or "cookies" not in storage_state:
@@ -738,7 +738,7 @@ def load_httpx_cookies(path: Path | None = None) -> "httpx.Cookies":
     if missing:
         raise ValueError(
             f"Missing required cookies for downloads: {missing}\n"
-            f"Run 'notebooklm login' to re-authenticate."
+            "Run 'notebooklm login' to re-authenticate."
         )
 
     return cookies

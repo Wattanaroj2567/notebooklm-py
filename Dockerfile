@@ -14,7 +14,7 @@ WORKDIR /app
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
-COPY README.md SKILL.md AGENTS.md ./
+COPY README.md SKILL.md AGENTS.md notebooklm-py.png ./
 # Fix DNS and IPv6 issues for uv in Docker Desktop
 ENV UV_NATIVE_TLS=1 \
     UV_HTTP_TIMEOUT=300

@@ -11,16 +11,20 @@ services:
     volumes:
       # Map the entire .notebooklm directory to handle profiles and config correctly
       - ~/.notebooklm:/root/.notebooklm
+      # Map AI Workspace and Skills for the MCP server
+      - ./ai_workspace:/app/ai_workspace:ro
+      - ./MCP_SKILL.md:/app/MCP_SKILL.md:ro
     ports:
       - "8000:8000"
 
   # Dedicated tunnel for notebooklm-mcp.tawanlab.site
-  # This separates it from the 'fallhelp-backend' tunnel.
+  # This separates it from the 'notebooklm-backend' tunnel.
   mcp-tunnel:
     image: cloudflare/cloudflared:latest
     container_name: mcp-tunnel
     restart: unless-stopped
-    command: tunnel --no-autoupdate run
+    # Use --url to explicitly route traffic to the mcp service within the docker network
+    command: tunnel --no-autoupdate run --url http://notebooklm-mcp:8000
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
     depends_on:

@@ -4,94 +4,156 @@ This document explains how to run the NotebookLM Model Context Protocol (MCP) se
 
 ## Prerequisites
 
-- Python 3.10+
-- A NotebookLM authenticated storage state (run `notebooklm login` first)
-- `ngrok` or similar tunnel for exposing local server to the web
+- Python 3.10+ **or** Docker with Docker Compose
+- A NotebookLM authenticated storage state (run `notebooklm login` on the host first)
+- A public HTTPS URL for ChatGPT to reach your server (Cloudflare Tunnel, ngrok, or similar)
 
-## Installation
+## Installation (local Python)
 
 Install the package with MCP support:
 
 ```bash
-pip install -e .
-pip install mcp fastapi uvicorn
+uv sync --extra dev --extra browser
+# or: pip install -e ".[browser]"
 ```
 
-## Running the Server
+## Running the server
 
-1. **Start the MCP Server:**
+### Option A: Local process
 
-   ```bash
-   python scripts/run_mcp.py
-   ```
-   The server will start on `http://0.0.0.0:8000`.
+```bash
+uv run notebooklm-mcp
+# or: python scripts/run_mcp.py
+```
 
-2. **Expose with ngrok:**
+The server listens on `http://0.0.0.0:8000` by default (`HOST` / `PORT` env vars override this).
 
-   In another terminal, expose the port 8000:
-   ```bash
-   ngrok http 8000
-   ```
-   Copy the `https://` forwarding URL (e.g., `https://random-id.ngrok-free.app`).
+### Option B: Docker Compose + Cloudflare (recommended for a fixed URL)
+
+From the repository root:
+
+```bash
+export TUNNEL_TOKEN=<your-cloudflare-tunnel-token>
+docker compose up -d --build
+```
+
+- Service **notebooklm-mcp** exposes port **8000** and mounts `~/.notebooklm` into the container as `/root/.notebooklm` so the same login session as on your machine is used.
+- Service **mcp-tunnel** runs `cloudflared` and forwards traffic to `http://notebooklm-mcp:8000`.
+
+Point ChatGPT at your tunnel hostname with path **`/sse`** (see below).
+
+### Health check (SSE)
+
+The MCP stream endpoint keeps the connection open; a quick check is:
+
+```bash
+curl -N --max-time 3 http://127.0.0.1:8000/sse
+```
+
+You should see HTTP 200 and the beginning of an SSE stream (timeouts are normal).
+
+## Smoke test (Python MCP client)
+
+The repo file `test_mcp_client.py` exercises the **same SSE transport** ChatGPT uses:
+
+```bash
+# Local server (default)
+uv run python test_mcp_client.py
+
+# Cloudflare / public URL — full path must end with /sse
+export NOTEBOOKLM_MCP_SSE_URL="https://your-host.example.com/sse"
+uv run python test_mcp_client.py
+```
+
+Optional override: `uv run python test_mcp_client.py --url https://your-host.example.com/sse`
 
 ## Connecting to ChatGPT Web
 
-1. **Open ChatGPT:** Go to [chatgpt.com](https://chatgpt.com).
-2. **Enable Developer Mode:**
-   - Go to **Settings** -> **Apps** -> **Advanced settings**.
-   - Toggle **Developer mode** to ON.
-3. **Add New App:**
-   - Click **Create app** (or **New Connector**).
-   - Enter a name (e.g., "NotebookLM").
-   - **Server URL:** Paste your ngrok URL followed by `/sse` (e.g., `https://random-id.ngrok-free.app/sse`).
-   - **Authentication:** Select "No Authentication" (the server relies on your local `notebooklm login` state).
-4. **Activate in Chat:**
-   - Start a new chat.
-   - Click the **+** (Attach) icon.
-   - Select **Developer mode**.
-   - Toggle your **NotebookLM** app to ON.
+1. Open [chatgpt.com](https://chatgpt.com).
+2. Enable **Developer mode** under **Settings → Apps → Advanced settings**.
+3. **Create app** (connector): set **Server URL** to your public URL with **`/sse`** appended, for example `https://your-host.example.com/sse`.
+4. Authentication: typically **none** at the HTTP layer; the server uses your NotebookLM session from `notebooklm login` on the host (or mounted volume in Docker).
+5. In a chat, use **Attach → Developer mode** and enable your NotebookLM connector.
 
-## Available Tools
+## Available tools (current server)
 
-Once connected, ChatGPT can use the following tools:
+The Python MCP server registers **40** tools. Summary by area:
+
+### Framework / workflows
+
+| Tool | Purpose |
+|------|---------|
+| `read_framework_manual` | Read NotebookLM `ai_workspace` manuals (`strategy` / `quiz` / `study`). |
+| `run_research_team_workflow` | Create a notebook, add one URL (deduped), optional Thai summary. |
+| `run_deep_search_workflow` | Create a notebook, run web research, auto-import results, summarize in Thai. |
+
+### Research (CLI parity)
+
+Matches `notebooklm source add-research` and `notebooklm research status` / `research wait --import-all` on an **existing** `notebook_id`:
+
+| Tool | Purpose |
+|------|---------|
+| `start_research` | Start web/drive research (`source`, `mode` same as CLI). |
+| `poll_research_results` | One-shot poll (`research status`). |
+| `import_research_sources` | Import after completion; omit `source_indices` to import all. |
+| `research_wait_and_import` | Poll until complete then import every discovered source (`research wait --import-all`). |
 
 ### Notebooks
-- `list_notebooks`: List all your NotebookLM notebooks.
-- `get_notebook_summary`: Get the summary and description of a notebook.
+
+| Tool | Purpose |
+|------|---------|
+| `list_notebooks` | List notebooks. |
+| `create_notebook` | Create a notebook. |
+| `delete_notebook` | Delete a notebook. |
+| `rename_notebook` | Rename a notebook (`new_title`). |
+| `get_notebook_summary` | Summary and suggested topics (`notebook_id`). |
+| `get_share_status` | Sharing state and collaborators. |
+| `set_notebook_public` | Turn public link on/off. |
 
 ### Sources
-- `list_sources`: List all sources in a notebook.
-- `add_url_source`: Add a new URL source to a notebook.
-- `add_text_source`: Add a new text source (raw text) to a notebook.
-- `delete_source`: Remove a source from a notebook.
 
-### Notes
-- `list_notes`: List all user-created notes in a notebook.
-- `create_note`: Create a new note with a title and content.
-- `get_note`: Read the content of a specific note.
-- `delete_note`: Delete a note.
+| Tool | Purpose |
+|------|---------|
+| `list_sources` | List sources. |
+| `add_url_source` | Add URL/YouTube (dedupe). Default **`wait=false`** (returns quickly); set `wait=true` only if you must block until indexed (often slow for YouTube). |
+| `add_text_source` | Add pasted text (title dedupe). |
+| `refresh_source` | Refresh a source. |
+| `get_source_fulltext` | Full indexed text. |
+| `delete_source` | Remove a source. |
 
-### Artifacts (AI Content)
-- `list_artifacts`: List all AI-generated content (Audio, Study Guides, etc.).
-- `generate_audio_overview`: Start generating a podcast-style Audio Overview.
-- `generate_study_guide`: Start generating a Study Guide report.
-- `poll_artifact_status`: Check if a generation task is complete or failed.
-- `delete_artifact`: Delete an artifact.
+### Studio generation
 
-### Research
-- `start_research`: Search the web or Google Drive for new information.
-- `poll_research_results`: Get the status and found sources of a research task.
-- `import_research_sources`: Add discovered research sources into your notebook.
+All of these return a task payload; use `poll_artifact_status` with `notebook_id` and `task_id` until complete (rate limits may apply).
 
-### Sharing
-- `get_share_status`: Check current sharing settings and user access.
-- `set_notebook_public`: Enable or disable public link sharing.
+| Tool | Purpose |
+|------|---------|
+| `generate_audio_overview` | Podcast-style audio. |
+| `generate_video_overview` | Video overview. |
+| `generate_cinematic_video` | Cinematic video. |
+| `generate_report` | Report (briefing, study guide, blog, custom). |
+| `generate_quiz` / `generate_flashcards` | Quiz / flashcards. |
+| `generate_infographic` | Infographic. |
+| `generate_slide_deck` | Slides. |
+| `generate_data_table` | Data table from instructions. |
+| `generate_mind_map` | Mind map (saved as a note). |
+| `poll_artifact_status` | Poll a generation task. |
+| `list_artifacts` | List studio artifacts (audio, report, quiz, mind map, …). |
+| `get_artifact` | Metadata for one artifact by `artifact_id`. |
 
-### Chat
-- `ask_question`: Ask a question based on a specific notebook's sources.
+### Notes, chat, export
 
-## Security Notes
+| Tool | Purpose |
+|------|---------|
+| `ask_question` | RAG Q&A over notebook sources. |
+| `list_notes` / `create_note` / `get_note` / `rename_note` / `delete_note` | Manage user notes. |
+| `export_artifact` | Export to Google Docs or Sheets (`type`: `DOCS` / `SHEETS`). |
 
-- The server uses your local authentication tokens.
-- Using `ngrok` exposes your server to the internet. Close the tunnel when not in use.
-- ChatGPT will send requests to your server; ensure you trust the environment where it's running.
+## Security notes
+
+- The connector URL is effectively a **public MCP endpoint** unless you protect it (for example Cloudflare Access, IP allowlists, or a private tunnel).
+- The server uses your NotebookLM credentials from disk; treat `~/.notebooklm` like a secret and keep tunnel tokens out of git.
+
+## See also
+
+- Repository `docker-compose.yml` for tunnel + MCP layout.
+- `MCP_SKILL.md` for agent-oriented orchestration hints loaded by the server when present.

@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+> **🚨 MCP TOOL USAGE DIRECTIVE 🚨**
+> If you are connected to this project via the Model Context Protocol (MCP), you **MUST** use the provided MCP tools (e.g., `create_notebook`, `add_url_source`, `ask_question`) directly from your interface. **DO NOT** attempt to open a terminal or run `notebooklm` bash commands locally unless explicitly instructed by the user to debug the CLI.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 **IMPORTANT:** Follow documentation rules in [CONTRIBUTING.md](CONTRIBUTING.md) - especially the file creation and naming conventions.

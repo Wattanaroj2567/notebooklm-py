@@ -138,7 +138,7 @@ def get_error_message_for_code(code: int | None) -> tuple[str, bool]:
     # Unknown code - provide generic guidance based on HTTP status code ranges
     if 400 <= code < 500:
         return (f"Client error {code}. Check your request parameters.", False)
-    if 500 <= code < 600:
+    if code in (500, 502, 503, 504):
         return (f"Server error {code}. This is usually temporary - try again later.", True)
     return (f"Error code: {code}", False)
 
@@ -245,7 +245,7 @@ def parse_chunked_response(response: str) -> list[Any]:
         if error_rate > 0.1:  # More than 10% malformed
             raise RPCError(
                 f"Response parsing failed: {skipped_count} of {len(lines)} chunks malformed. "
-                f"This may indicate API changes or data corruption.",
+                "This may indicate API changes or data corruption.",
                 raw_response=response[:500],
             )
         # Non-critical but warn user results may be incomplete
@@ -465,7 +465,7 @@ def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) ->
             raise RPCError(
                 f"No result found for RPC ID '{rpc_id}'. "
                 f"Response contains IDs: {found_ids}. "
-                f"The RPC method ID may have changed.",
+                "The RPC method ID may have changed.",
                 method_id=rpc_id,
                 found_ids=found_ids,
                 raw_response=response_preview,
@@ -502,7 +502,7 @@ def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) ->
                 )
             raise RPCError(
                 f"RPC {rpc_id} returned null result data "
-                f"(possible server error or parameter mismatch)",
+                "(possible server error or parameter mismatch)",
                 method_id=rpc_id,
                 found_ids=found_ids,
                 raw_response=response_preview,

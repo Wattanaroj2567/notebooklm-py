@@ -1,53 +1,17 @@
 ---
 name: notebooklm
-description: Advanced AI Automation via NotebookLM - full programmatic access. Activates on intent like "research topic X" or "automate research workflow". Optimized for AI Sub-agent collaboration (Minnie, Reas, Vera, Indy, Day).
+description: Advanced AI Automation via NotebookLM - full programmatic access. Activates on intent like "research topic X" or "automate research workflow".
 ---
 
 # NotebookLM AI Team Automation
 
+> **🚨 CRITICAL MCP DIRECTIVE FOR CLAUDE 🚨**
+> 
+> **Are you connected via the MCP Server?**
+> If you have access to tools like `create_notebook`, `add_url_source`, `ask_question`, etc., **YOU MUST USE THOSE MCP TOOLS DIRECTLY.** 
+> **DO NOT** attempt to run `notebooklm` bash/CLI commands (e.g., `notebooklm create`, `notebooklm auth check`) via the terminal. The bash commands listed below are ONLY for standalone CLI users, NOT for MCP-connected agents.
+
 Complete programmatic access to Google NotebookLM. This skill is optimized for **AI Agentic Orchestration**, allowing a lead agent to coordinate specialized sub-agents for deep research, verification, and insight extraction.
-
-## AI Team Framework (Operational Roles)
-
-When using this skill, the agent should adopt or delegate these roles:
-- **Minnie (Idea Generator):** Decomposes goals into specific research queries.
-- **Reas (Reasoning):** Plans multi-step workflows and handles complex technical logic.
-- **Vera (Verification):** Fact-checks findings against grounded sources and monitors task status.
-- **Indy (Integration):** Executes tool calls and manages the MCP transport layer.
-- **Day (Delivery):** Synthesizes final reports and automates artifact deployment.
-
-## Core Directives for Agents
-
-- **Explicit IDs:** ALWAYS pass explicit notebook IDs using `-n <id>` or `--notebook <id>`. DO NOT rely on the global context to ensure parallel safety in multi-agent environments.
-- **Structured Output:** ALWAYS use the `--json` flag to obtain machine-readable results for internal processing.
-- **Smart Compression:** Use NotebookLM as a high-density RAG layer (1M+ tokens) to avoid prompt stuffing and preserve the agent's context window.
-
-## Installation & Prerequisites
-...
-**From PyPI (Recommended):**
-```bash
-pip install notebooklm-py
-```
-
-**From GitHub (use latest release tag, NOT main branch):**
-```bash
-# Get the latest release tag (using curl)
-LATEST_TAG=$(curl -s https://api.github.com/repos/teng-lin/notebooklm-py/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-pip install "git+https://github.com/teng-lin/notebooklm-py@${LATEST_TAG}"
-```
-
-⚠️ **DO NOT install from main branch** (`pip install git+https://github.com/teng-lin/notebooklm-py`). The main branch may contain unreleased/unstable changes. Always use PyPI or a specific release tag, unless you are testing unreleased features.
-
-**Skill install methods:**
-
-- `notebooklm skill install` installs this skill into the supported local agent directories managed by the CLI.
-- `npx skills add teng-lin/notebooklm-py` installs this skill from the GitHub repository into compatible agent skill directories.
-- If you are already reading this file inside an agent skill directory, the skill is already installed. You only need the Python package and authentication below.
-
-**CLI-managed install:**
-```bash
-notebooklm skill install
-```
 
 ## Prerequisites
 

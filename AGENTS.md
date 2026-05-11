@@ -34,6 +34,9 @@ Put pure logic in `tests/unit/`, VCR-backed flows in `tests/integration/`, and a
 
 Follow the existing commit style: `feat(cli): ...`, `fix(cli): ...`, `refactor(test): ...`, `style: ...`. PRs should include a short summary, linked issue when relevant, and the commands run locally.
 
+### 🤖 NotebookLM AI Team Framework
+For detailed information about our specialized agent roles (Minnie, Reas, Vera, Indy, Day, Chris) and their operational workflows, please refer to **[AI_TEAM.md](./AI_TEAM.md)**.
+
 For Codex or other parallel agents:
 
 - Prefer `--json` output and pass explicit notebook IDs instead of relying on `notebooklm use`.
