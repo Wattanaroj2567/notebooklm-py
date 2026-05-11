@@ -2,7 +2,13 @@
 # shellcheck disable=SC2317
 
 # Script สำหรับ sync upstream อย่างปลอดภัย
-# ทำการ update main จาก upstream แล้ว rebase feature branch เดิม
+# ทำการ update upstream-tracking จาก upstream แล้ว merge เข้า feature branch
+#
+# Workflow:
+#   1. Fetch upstream
+#   2. Update 'upstream-tracking' branch from upstream/main
+#   3. Merge upstream-tracking into current feature branch
+#   4. โค้ดของคุณจะไม่ถูกแทน (ใช้ merge commit แทน rebase)
 #
 # Usage:
 #   ./sync-upstream.sh
@@ -10,7 +16,7 @@
 # รองรับ:
 #   - stash working tree อัตโนมัติถ้ามี uncommitted changes
 #   - cleanup ถ้า script ถูก interrupt (Ctrl+C)
-#   - rebase feature branch ใดๆ (ไม่ใช่แค่ "my-changes")
+#   - merge ทุก feature branch (ไม่ใช่แค่ "my-changes")
 
 set -euo pipefail
 
@@ -39,20 +45,12 @@ header() {
 # --- Trap: cleanup on exit/interrupt ---
 STASHED=false
 MERGE_IN_PROGRESS=false
-REBASE_IN_PROGRESS=false
 
 abort_merge() {
     if $MERGE_IN_PROGRESS; then
         log "${YELLOW}🧹 Cleaning up unfinished merge...${RESET}"
         git merge --abort 2>/dev/null || true
         MERGE_IN_PROGRESS=false
-    fi
-}
-abort_rebase() {
-    if $REBASE_IN_PROGRESS; then
-        log "${YELLOW}🧹 Cleaning up unfinished rebase...${RESET}"
-        git rebase --abort 2>/dev/null || true
-        REBASE_IN_PROGRESS=false
     fi
 }
 restore_stash() {
@@ -65,7 +63,6 @@ restore_stash() {
 cleanup() {
     local exit_code=$?
     abort_merge
-    abort_rebase
     # Return to original branch if we're not there
     local current
     current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
@@ -112,58 +109,41 @@ fi
 header "🌐 Fetching upstream..."
 git fetch upstream 2>&1 | tee -a "$LOG_FILE"
 
-# --- Step 2: Update main ---
-header "🔄 Updating main..."
-git checkout main 2>&1 | tee -a "$LOG_FILE"
-
-if git merge-base --is-ancestor upstream/main main 2>/dev/null; then
-    log "${GREEN}✅ main is already up-to-date with upstream/main${RESET}"
+# --- Step 2: Create/update upstream-tracking branch from upstream/main ---
+header "🔄 Updating upstream-tracking branch..."
+if git show-ref --verify --quiet refs/heads/upstream-tracking; then
+    git checkout upstream-tracking 2>&1 | tee -a "$LOG_FILE"
+    git reset --hard upstream/main 2>&1 | tee -a "$LOG_FILE"
+    log "${GREEN}✅ upstream-tracking updated to upstream/main${RESET}"
 else
-    # Fast-forward if possible, otherwise create a merge commit
-    if git merge --ff-only upstream/main 2>&1 | tee -a "$LOG_FILE"; then
-        log "${GREEN}✅ Fast-forwarded main to upstream/main${RESET}"
-    else
-        # Try a no-fast-forward merge with conflict detection
-        if git merge --no-commit --no-ff upstream/main 2>&1 | tee -a "$LOG_FILE"; then
-            MERGE_IN_PROGRESS=true
-            git commit -m "chore: merge upstream/main" 2>&1 | tee -a "$LOG_FILE"
-            MERGE_IN_PROGRESS=false
-            log "${GREEN}✅ Successfully merged upstream/main into main${RESET}"
-        else
-            MERGE_IN_PROGRESS=true
-            abort_merge
-            log "${RED}❌ Merge conflict detected — aborted.${RESET}"
-            log "   Manual fix: git checkout main && git merge upstream/main"
-            exit 1
-        fi
-    fi
+    git checkout -b upstream-tracking upstream/main 2>&1 | tee -a "$LOG_FILE"
+    log "${GREEN}✅ Created upstream-tracking from upstream/main${RESET}"
 fi
 
-# --- Step 3: Rebase feature branch (if not main) ---
-if [ "$CURRENT_BRANCH" != "main" ]; then
-    header "🔄 Rebasing ${CURRENT_BRANCH} on main..."
+# --- Step 3: Merge upstream-tracking into feature branch (if not upstream-tracking) ---
+if [ "$CURRENT_BRANCH" != "upstream-tracking" ]; then
+    header "🔄 Merging upstream-tracking into ${CURRENT_BRANCH}..."
     git checkout "$CURRENT_BRANCH" 2>&1 | tee -a "$LOG_FILE"
 
-    if git rebase main 2>&1 | tee -a "$LOG_FILE"; then
-        log "${GREEN}✅ Successfully rebased ${CURRENT_BRANCH} on main${RESET}"
+    if git merge upstream-tracking --no-ff 2>&1 | tee -a "$LOG_FILE"; then
+        log "${GREEN}✅ Successfully merged upstream-tracking into ${CURRENT_BRANCH}${RESET}"
     else
-        REBASE_IN_PROGRESS=true
-        log "${RED}❌ Rebase conflict on ${CURRENT_BRANCH}.${RESET}"
-        log "   Fix conflicts, then run: git rebase --continue"
-        log "   Or cancel with:          git rebase --abort"
+        MERGE_IN_PROGRESS=true
+        log "${RED}❌ Merge conflict on ${CURRENT_BRANCH}.${RESET}"
+        log "   Fix conflicts, then run: git merge --continue"
+        log "   Or cancel with:          git merge --abort"
         exit 1
     fi
 else
-    # Already on main, nothing to rebase
-    log "${GREEN}ℹ️  Staying on main — no rebase needed${RESET}"
+    log "${GREEN}ℹ️  Staying on upstream-tracking — no merge needed${RESET}"
 fi
 
 # --- Step 4: Optional push ---
 header "📤 Push options"
-if [ "$CURRENT_BRANCH" != "main" ]; then
-    log "   To push rebased branch: ${BOLD}git push --force-with-lease origin ${CURRENT_BRANCH}${RESET}"
+if [ "$CURRENT_BRANCH" != "upstream-tracking" ]; then
+    log "   To push merged branch: ${BOLD}git push origin ${CURRENT_BRANCH}${RESET}"
 else
-    log "   To push updated main:   ${BOLD}git push origin main${RESET}"
+    log "   To push upstream-tracking: ${BOLD}git push origin upstream-tracking${RESET}"
 fi
 
 exit 0
