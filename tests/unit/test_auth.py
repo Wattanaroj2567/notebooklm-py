@@ -1,15 +1,24 @@
 """Tests for authentication module."""
 
+import asyncio
 import json
 import os
+import re
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+from notebooklm import auth as auth_module
 from notebooklm.auth import (
+    KEEPALIVE_ROTATE_URL,
+    NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV,
     AuthTokens,
+    build_httpx_cookies_from_storage,
     convert_rookiepy_cookies_to_storage_state,
     extract_cookies_from_storage,
     extract_cookies_with_domains,
@@ -552,6 +561,171 @@ class TestLoadHttpxCookiesWithEnvVar:
         assert cookies.get("SID", domain=".google.com") == "from_file"
 
 
+class TestCookieAttributePreservation:
+    """Round-trip preservation of path, secure, and httpOnly across load+save (#365)."""
+
+    @staticmethod
+    def _find_cookie(jar, name, domain, path=None):
+        for cookie in jar.jar:
+            if cookie.name == name and cookie.domain == domain:
+                if path is None or cookie.path == path:
+                    return cookie
+        raise AssertionError(f"cookie {name}@{domain} (path={path}) not in jar")
+
+    def _attr_storage_state(self):
+        """Storage state with explicit non-default attributes on every cookie."""
+        return {
+            "cookies": [
+                {
+                    "name": "SID",
+                    "value": "sid-value",
+                    "domain": ".google.com",
+                    "path": "/u/0/",
+                    "expires": 1893456000,
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "None",
+                },
+                {
+                    "name": "__Host-GAPS",
+                    "value": "host-only-value",
+                    "domain": "accounts.google.com",
+                    "path": "/",
+                    "expires": -1,
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Strict",
+                },
+            ]
+        }
+
+    def test_load_httpx_cookies_preserves_attributes(self, tmp_path):
+        """``load_httpx_cookies`` should carry path/secure/httpOnly into the jar."""
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(json.dumps(self._attr_storage_state()))
+
+        jar = load_httpx_cookies(path=storage_file)
+
+        sid = self._find_cookie(jar, "SID", ".google.com")
+        assert sid.path == "/u/0/"
+        assert sid.secure is True
+        assert sid.has_nonstandard_attr("HttpOnly")
+
+        gaps = self._find_cookie(jar, "__Host-GAPS", "accounts.google.com")
+        assert gaps.path == "/"
+        assert gaps.secure is True
+        assert gaps.has_nonstandard_attr("HttpOnly")
+
+    def test_build_httpx_cookies_from_storage_preserves_attributes(self, tmp_path):
+        """``build_httpx_cookies_from_storage`` should preserve the same attrs."""
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(json.dumps(self._attr_storage_state()))
+
+        jar = build_httpx_cookies_from_storage(storage_file)
+
+        sid = self._find_cookie(jar, "SID", ".google.com")
+        assert sid.path == "/u/0/"
+        assert sid.secure is True
+        assert sid.has_nonstandard_attr("HttpOnly")
+
+        gaps = self._find_cookie(jar, "__Host-GAPS", "accounts.google.com")
+        assert gaps.path == "/"
+        assert gaps.secure is True
+        assert gaps.has_nonstandard_attr("HttpOnly")
+
+    def test_round_trip_with_value_change_preserves_attributes(self, tmp_path):
+        """Load → bump value → save → reload preserves path/secure/httpOnly.
+
+        Mutating the value forces ``save_cookies_to_storage`` into the
+        "changed" branch that overwrites stored attrs from the live jar — the
+        path that previously eroded attributes to defaults.
+        """
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(json.dumps(self._attr_storage_state()))
+
+        jar = build_httpx_cookies_from_storage(storage_file)
+        for cookie in jar.jar:
+            if cookie.name == "SID":
+                cookie.value = "rotated-sid"
+        save_cookies_to_storage(jar, storage_file)
+
+        on_disk = json.loads(storage_file.read_text())
+        sid_entry = next(c for c in on_disk["cookies"] if c["name"] == "SID")
+        assert sid_entry["path"] == "/u/0/"
+        assert sid_entry["secure"] is True
+        assert sid_entry["httpOnly"] is True
+
+        gaps_entry = next(c for c in on_disk["cookies"] if c["name"] == "__Host-GAPS")
+        assert gaps_entry["path"] == "/"
+        assert gaps_entry["secure"] is True
+        assert gaps_entry["httpOnly"] is True
+
+    def test_round_trip_without_value_change_preserves_attributes(self, tmp_path):
+        """Load → save (no mutation) → reload preserves attrs.
+
+        This is the silent-erosion path users hit on idle calls: nothing
+        changes, but the save side appends fresh entries from the in-memory
+        jar (auth.py:1095). Without the load-side fix, those appended entries
+        would carry default ``path=/``, ``secure=False``, ``httpOnly=False``.
+        """
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(json.dumps(self._attr_storage_state()))
+
+        jar = build_httpx_cookies_from_storage(storage_file)
+        save_cookies_to_storage(jar, storage_file)
+
+        reloaded = build_httpx_cookies_from_storage(storage_file)
+        sid = self._find_cookie(reloaded, "SID", ".google.com")
+        assert sid.path == "/u/0/"
+        assert sid.secure is True
+        assert sid.has_nonstandard_attr("HttpOnly")
+
+    def test_session_cookie_round_trips_as_minus_one(self, tmp_path):
+        """Session cookies (expires=-1) survive without becoming a real timestamp."""
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(json.dumps(self._attr_storage_state()))
+
+        jar = build_httpx_cookies_from_storage(storage_file)
+        gaps = self._find_cookie(jar, "__Host-GAPS", "accounts.google.com")
+        assert gaps.expires is None
+
+        for cookie in jar.jar:
+            if cookie.name == "__Host-GAPS":
+                cookie.value = "rotated-gaps"
+        save_cookies_to_storage(jar, storage_file)
+
+        on_disk = json.loads(storage_file.read_text())
+        gaps_entry = next(c for c in on_disk["cookies"] if c["name"] == "__Host-GAPS")
+        assert gaps_entry["expires"] == -1
+
+    def test_expires_zero_round_trips(self, tmp_path):
+        """``expires=0`` (Unix epoch) is a legitimate timestamp, not a sentinel.
+
+        Some Playwright variants emit ``0`` for cookies that expired at the
+        epoch. The load helper must distinguish ``0`` from ``-1`` / ``None``.
+        """
+        state = {
+            "cookies": [
+                {
+                    "name": "SID",
+                    "value": "v",
+                    "domain": ".google.com",
+                    "path": "/",
+                    "expires": 0,
+                    "httpOnly": True,
+                    "secure": True,
+                }
+            ]
+        }
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(json.dumps(state))
+
+        jar = build_httpx_cookies_from_storage(storage_file)
+        sid = self._find_cookie(jar, "SID", ".google.com")
+        # 0 is preserved as 0 — not collapsed to None (session) or -1.
+        assert sid.expires == 0
+
+
 class TestExtractCSRFRedirect:
     """Test CSRF extraction redirect detection."""
 
@@ -647,6 +821,23 @@ class TestFetchTokens:
         assert session_id == "session_id_456"
 
     @pytest.mark.asyncio
+    async def test_fetch_tokens_success_preserves_input_without_refresh(
+        self, httpx_mock: HTTPXMock
+    ):
+        """Successful fetch without refresh does not rewrite caller cookies."""
+        html = '"SNlM0e":"csrf_ok" "FdrFJe":"sess_ok"'
+        httpx_mock.add_response(url="https://notebooklm.google.com/", content=html.encode())
+
+        cookies = {("SID", ".google.com"): "test_sid", ("APP_COOKIE", "example.com"): "keep"}
+        original = cookies.copy()
+
+        csrf, session_id = await fetch_tokens(cookies)
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"
+        assert cookies == original
+
+    @pytest.mark.asyncio
     async def test_fetch_tokens_redirect_to_login(self, httpx_mock: HTTPXMock):
         """Test raises error when redirected to login page."""
         httpx_mock.add_response(
@@ -697,6 +888,7 @@ class TestFetchTokens:
             request
             for request in httpx_mock.get_requests()
             if request.url.host == "accounts.google.com"
+            and not request.url.path.startswith("/RotateCookies")
         ]
         assert len(account_requests) == 2
 
@@ -799,6 +991,308 @@ class TestFetchTokens:
         assert storage_state["cookies"][0]["value"] == "new"
 
 
+class TestFetchTokensAutoRefresh:
+    """Test NOTEBOOKLM_REFRESH_CMD auto-refresh behavior in fetch_tokens."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_refresh_flag(self, monkeypatch):
+        # Ensure each test starts with no prior attempt flag
+        monkeypatch.delenv("_NOTEBOOKLM_REFRESH_ATTEMPTED", raising=False)
+        monkeypatch.delenv("NOTEBOOKLM_REFRESH_CMD", raising=False)
+
+    @staticmethod
+    def _python_refresh_cmd(script: Path) -> str:
+        if os.name != "nt":
+            return shlex.join([sys.executable, str(script)])
+        return subprocess.list2cmdline([sys.executable, str(script)])
+
+    @pytest.mark.asyncio
+    async def test_no_refresh_when_env_unset(self, httpx_mock: HTTPXMock):
+        """Auth error propagates unchanged when NOTEBOOKLM_REFRESH_CMD is not set."""
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            status_code=302,
+            headers={"Location": "https://accounts.google.com/signin"},
+        )
+        httpx_mock.add_response(
+            url="https://accounts.google.com/signin",
+            content=b"<html>Login</html>",
+        )
+
+        with pytest.raises(ValueError, match="Authentication expired"):
+            await fetch_tokens({"SID": "stale"})
+
+    @pytest.mark.asyncio
+    async def test_refresh_retries_once_and_succeeds(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """On auth failure, runs refresh cmd, reloads cookies, retries successfully."""
+        # Stage 1: write a stale cookie file
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "stale", "domain": ".google.com"}]})
+        )
+        monkeypatch.setattr("notebooklm.auth.get_storage_path", lambda profile=None: storage_file)
+
+        # Refresh command rewrites the file with a fresh SID
+        fresh_file = tmp_path / "fresh_cookies.json"
+        fresh_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "fresh", "domain": ".google.com"}]})
+        )
+        refresh_script = tmp_path / "refresh.py"
+        refresh_script.write_text(
+            "\n".join(
+                [
+                    "import shutil",
+                    f"shutil.copyfile({str(fresh_file)!r}, {str(storage_file)!r})",
+                ]
+            )
+        )
+        monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", self._python_refresh_cmd(refresh_script))
+
+        # First HTTP call: auth redirect
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            status_code=302,
+            headers={"Location": "https://accounts.google.com/signin"},
+        )
+        httpx_mock.add_response(
+            url="https://accounts.google.com/signin",
+            content=b"<html>Login</html>",
+        )
+        # Second HTTP call (after refresh): success
+        html = '"SNlM0e":"csrf_ok" "FdrFJe":"sess_ok"'
+        httpx_mock.add_response(url="https://notebooklm.google.com/", content=html.encode())
+
+        cookies = {"SID": "stale"}
+        csrf, session_id = await fetch_tokens(cookies)
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"
+        # Cookies dict was mutated in place with fresh values
+        assert cookies["SID"] == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_refresh_reloads_explicit_storage_path(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """Refresh reloads from the caller's explicit storage path."""
+        storage_file = tmp_path / "custom_storage_state.json"
+        storage_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "stale", "domain": ".google.com"}]})
+        )
+
+        fresh_file = tmp_path / "fresh_cookies.json"
+        fresh_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "fresh", "domain": ".google.com"}]})
+        )
+        refresh_script = tmp_path / "refresh.py"
+        refresh_script.write_text(
+            "\n".join(
+                [
+                    "import shutil",
+                    f"shutil.copyfile({str(fresh_file)!r}, {str(storage_file)!r})",
+                ]
+            )
+        )
+        monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", self._python_refresh_cmd(refresh_script))
+
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            status_code=302,
+            headers={"Location": "https://accounts.google.com/signin"},
+        )
+        httpx_mock.add_response(
+            url="https://accounts.google.com/signin",
+            content=b"<html>Login</html>",
+        )
+        html = '"SNlM0e":"csrf_ok" "FdrFJe":"sess_ok"'
+        httpx_mock.add_response(url="https://notebooklm.google.com/", content=html.encode())
+
+        cookies = {"SID": "stale"}
+        csrf, session_id = await fetch_tokens(cookies, storage_file)
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"
+        assert cookies["SID"] == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_refresh_command_receives_profile_storage_path(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """Profile-based auth exposes the profile storage path to refresh commands."""
+        monkeypatch.setenv("NOTEBOOKLM_HOME", str(tmp_path))
+        storage_file = tmp_path / "profiles" / "work" / "storage_state.json"
+        storage_file.parent.mkdir(parents=True)
+        storage_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "stale", "domain": ".google.com"}]})
+        )
+
+        refresh_script = tmp_path / "refresh.py"
+        refresh_script.write_text(
+            "\n".join(
+                [
+                    "import json",
+                    "import os",
+                    "from pathlib import Path",
+                    "assert os.environ['_NOTEBOOKLM_REFRESH_ATTEMPTED'] == '1'",
+                    "assert os.environ['NOTEBOOKLM_REFRESH_PROFILE'] == 'work'",
+                    "storage = Path(os.environ['NOTEBOOKLM_REFRESH_STORAGE_PATH'])",
+                    f"assert storage == Path({str(storage_file)!r})",
+                    "storage.write_text(json.dumps({'cookies': [",
+                    "    {'name': 'SID', 'value': 'fresh', 'domain': '.google.com'},",
+                    "]}))",
+                ]
+            )
+        )
+        monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", self._python_refresh_cmd(refresh_script))
+
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            status_code=302,
+            headers={"Location": "https://accounts.google.com/signin"},
+        )
+        httpx_mock.add_response(
+            url="https://accounts.google.com/signin",
+            content=b"<html>Login</html>",
+        )
+        html = '"SNlM0e":"csrf_ok" "FdrFJe":"sess_ok"'
+        httpx_mock.add_response(url="https://notebooklm.google.com/", content=html.encode())
+
+        tokens = await AuthTokens.from_storage(profile="work")
+
+        assert tokens.flat_cookies["SID"] == "fresh"
+        assert tokens.csrf_token == "csrf_ok"
+        assert tokens.session_id == "sess_ok"
+        assert "_NOTEBOOKLM_REFRESH_ATTEMPTED" not in os.environ
+
+    @pytest.mark.asyncio
+    async def test_fetch_tokens_with_profile_reloads_profile_storage_path(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """fetch_tokens(profile=...) reloads from that profile's storage after refresh."""
+        monkeypatch.setenv("NOTEBOOKLM_HOME", str(tmp_path))
+        storage_file = tmp_path / "profiles" / "work" / "storage_state.json"
+        storage_file.parent.mkdir(parents=True)
+        storage_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "stale", "domain": ".google.com"}]})
+        )
+
+        refresh_script = tmp_path / "refresh.py"
+        refresh_script.write_text(
+            "\n".join(
+                [
+                    "import json",
+                    "import os",
+                    "from pathlib import Path",
+                    "assert os.environ['_NOTEBOOKLM_REFRESH_ATTEMPTED'] == '1'",
+                    "assert os.environ['NOTEBOOKLM_REFRESH_PROFILE'] == 'work'",
+                    "storage = Path(os.environ['NOTEBOOKLM_REFRESH_STORAGE_PATH'])",
+                    f"assert storage == Path({str(storage_file)!r})",
+                    "storage.write_text(json.dumps({'cookies': [",
+                    "    {'name': 'SID', 'value': 'fresh', 'domain': '.google.com'},",
+                    "]}))",
+                ]
+            )
+        )
+        monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", self._python_refresh_cmd(refresh_script))
+
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            status_code=302,
+            headers={"Location": "https://accounts.google.com/signin"},
+        )
+        httpx_mock.add_response(
+            url="https://accounts.google.com/signin",
+            content=b"<html>Login</html>",
+        )
+        html = '"SNlM0e":"csrf_ok" "FdrFJe":"sess_ok"'
+        httpx_mock.add_response(url="https://notebooklm.google.com/", content=html.encode())
+
+        cookies = {"SID": "stale"}
+        csrf, session_id = await fetch_tokens(cookies, profile="work")
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"
+        assert cookies["SID"] == "fresh"
+        assert "_NOTEBOOKLM_REFRESH_ATTEMPTED" not in os.environ
+
+    @pytest.mark.asyncio
+    async def test_fetch_tokens_with_domains_loads_profile_storage_path(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """fetch_tokens_with_domains(profile=...) loads that profile's storage."""
+        monkeypatch.setenv("NOTEBOOKLM_HOME", str(tmp_path))
+        storage_file = tmp_path / "profiles" / "work" / "storage_state.json"
+        storage_file.parent.mkdir(parents=True)
+        storage_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "fresh", "domain": ".google.com"}]})
+        )
+
+        html = '"SNlM0e":"csrf_ok" "FdrFJe":"sess_ok"'
+        httpx_mock.add_response(url="https://notebooklm.google.com/", content=html.encode())
+
+        csrf, session_id = await fetch_tokens_with_domains(profile="work")
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"
+
+    @pytest.mark.asyncio
+    async def test_refresh_does_not_loop(self, tmp_path, monkeypatch, httpx_mock: HTTPXMock):
+        """If refresh fails to fix auth, second failure propagates (no infinite loop)."""
+        storage_file = tmp_path / "storage_state.json"
+        storage_file.write_text(
+            json.dumps({"cookies": [{"name": "SID", "value": "stale", "domain": ".google.com"}]})
+        )
+        monkeypatch.setattr("notebooklm.auth.get_storage_path", lambda profile=None: storage_file)
+
+        # Refresh is a no-op (still stale after)
+        refresh_script = tmp_path / "refresh.py"
+        refresh_script.write_text("")
+        monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", self._python_refresh_cmd(refresh_script))
+
+        # Both attempts hit the same redirect
+        for _ in range(2):
+            httpx_mock.add_response(
+                url="https://notebooklm.google.com/",
+                status_code=302,
+                headers={"Location": "https://accounts.google.com/signin"},
+            )
+            httpx_mock.add_response(
+                url="https://accounts.google.com/signin",
+                content=b"<html>Login</html>",
+            )
+
+        with pytest.raises(ValueError, match="Authentication expired"):
+            await fetch_tokens({"SID": "stale"})
+        assert "_NOTEBOOKLM_REFRESH_ATTEMPTED" not in os.environ
+
+    @pytest.mark.asyncio
+    async def test_refresh_cmd_nonzero_exit_becomes_runtime_error(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """Refresh command failure surfaces as RuntimeError, not silent auth error."""
+        refresh_script = tmp_path / "refresh.py"
+        refresh_script.write_text(
+            "import sys\nprint('vault unavailable', file=sys.stderr)\nsys.exit(1)\n"
+        )
+        monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", self._python_refresh_cmd(refresh_script))
+
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            status_code=302,
+            headers={"Location": "https://accounts.google.com/signin"},
+        )
+        httpx_mock.add_response(
+            url="https://accounts.google.com/signin",
+            content=b"<html>Login</html>",
+        )
+
+        with pytest.raises(RuntimeError, match="exited 1"):
+            await fetch_tokens({"SID": "stale"})
+        assert "_NOTEBOOKLM_REFRESH_ATTEMPTED" not in os.environ
+
+
 class TestAuthTokensFromStorage:
     """Test AuthTokens.from_storage class method."""
 
@@ -830,6 +1324,40 @@ class TestAuthTokensFromStorage:
         """Test raises error when storage file doesn't exist."""
         with pytest.raises(FileNotFoundError):
             await AuthTokens.from_storage(tmp_path / "nonexistent.json")
+
+    @pytest.mark.asyncio
+    async def test_from_storage_preserves_cookie_attributes(self, tmp_path, httpx_mock: HTTPXMock):
+        """``AuthTokens.from_storage`` builds the jar via the lossless loader.
+
+        The recommended programmatic entry point must not erode path/secure/
+        httpOnly on its way to the live jar — otherwise #365's fix only covers
+        the direct loaders. See review feedback on PR #368.
+        """
+        storage_file = tmp_path / "storage_state.json"
+        storage_state = {
+            "cookies": [
+                {
+                    "name": "SID",
+                    "value": "sid",
+                    "domain": ".google.com",
+                    "path": "/u/0/",
+                    "expires": 1893456000,
+                    "httpOnly": True,
+                    "secure": True,
+                },
+            ]
+        }
+        storage_file.write_text(json.dumps(storage_state))
+
+        html = '"SNlM0e":"csrf_token" "FdrFJe":"session_id"'
+        httpx_mock.add_response(content=html.encode())
+
+        tokens = await AuthTokens.from_storage(storage_file)
+
+        sid = next(c for c in tokens.cookie_jar.jar if c.name == "SID")
+        assert sid.path == "/u/0/"
+        assert sid.secure is True
+        assert sid.has_nonstandard_attr("HttpOnly")
 
 
 # =============================================================================
@@ -931,9 +1459,37 @@ class TestAllowedCookieDomains:
         """Test ALLOWED_COOKIE_DOMAINS contains expected domains."""
         from notebooklm.auth import ALLOWED_COOKIE_DOMAINS
 
-        assert ".google.com" in ALLOWED_COOKIE_DOMAINS
-        assert any(domain == ".notebooklm.google.com" for domain in ALLOWED_COOKIE_DOMAINS)
-        assert "notebooklm.google.com" in ALLOWED_COOKIE_DOMAINS
+        # Single set-difference assertion. CodeQL's
+        # py/incomplete-url-substring-sanitization heuristic flags per-line
+        # ``"<literal>" in ALLOWED_COOKIE_DOMAINS`` patterns as if they were
+        # substring sanitization of a URL, even though this is set-membership
+        # against a constant. The set-diff form has no string-in-string
+        # appearance and reads at least as clearly.
+        expected = {
+            # Core NotebookLM/Google auth domains
+            ".google.com",
+            "google.com",
+            ".notebooklm.google.com",
+            "notebooklm.google.com",
+            ".googleusercontent.com",
+            "accounts.google.com",
+            ".accounts.google.com",
+            # Sibling Google product domains added in issue #360
+            ".youtube.com",
+            "youtube.com",
+            "accounts.youtube.com",
+            ".accounts.youtube.com",
+            "drive.google.com",
+            ".drive.google.com",
+            "docs.google.com",
+            ".docs.google.com",
+            "myaccount.google.com",
+            ".myaccount.google.com",
+            "mail.google.com",
+            ".mail.google.com",
+        }
+        missing = expected - ALLOWED_COOKIE_DOMAINS
+        assert not missing, f"ALLOWED_COOKIE_DOMAINS is missing: {missing}"
 
 
 # =============================================================================
@@ -1121,28 +1677,53 @@ class TestIsAllowedAuthDomain:
         assert _is_allowed_auth_domain(".google.de") is True  # Germany
         assert _is_allowed_auth_domain(".google.fr") is True  # France
 
+    def test_accepts_sibling_google_products(self):
+        """Test accepts sibling Google product domains (issue #360)."""
+        from notebooklm.auth import _is_allowed_auth_domain
+
+        # YouTube
+        assert _is_allowed_auth_domain(".youtube.com") is True
+        assert _is_allowed_auth_domain("youtube.com") is True
+        assert _is_allowed_auth_domain("accounts.youtube.com") is True
+        assert _is_allowed_auth_domain(".accounts.youtube.com") is True
+        # Drive / Docs / myaccount / mail
+        assert _is_allowed_auth_domain("drive.google.com") is True
+        assert _is_allowed_auth_domain(".drive.google.com") is True
+        assert _is_allowed_auth_domain("docs.google.com") is True
+        assert _is_allowed_auth_domain(".docs.google.com") is True
+        assert _is_allowed_auth_domain("myaccount.google.com") is True
+        assert _is_allowed_auth_domain(".myaccount.google.com") is True
+        assert _is_allowed_auth_domain("mail.google.com") is True
+
     def test_rejects_unrelated_domains(self):
         """Test rejects non-Google domains."""
         from notebooklm.auth import _is_allowed_auth_domain
 
-        assert _is_allowed_auth_domain(".youtube.com") is False
         assert _is_allowed_auth_domain("evil.com") is False
         assert _is_allowed_auth_domain(".evil-google.com") is False
+        assert _is_allowed_auth_domain(".not-youtube.com") is False
+        assert _is_allowed_auth_domain("notyoutube.com") is False
 
     def test_rejects_malicious_google_lookalikes(self):
         """Test rejects domains that look like Google but aren't."""
         from notebooklm.auth import _is_allowed_auth_domain
 
         assert _is_allowed_auth_domain("google.com.evil.sg") is False
-        assert _is_allowed_auth_domain(".mail.google.com") is False
-        assert _is_allowed_auth_domain(".evilnotebooklm.google.com") is False
+        # Note: post-#360 unification, .mail.google.com is accepted (it's a
+        # legitimate Google-owned subdomain). Only foreign suffixes are rejected.
         assert _is_allowed_auth_domain(".google.com.evil") is False
         assert _is_allowed_auth_domain(".evilnotebooklm.google.com.evil") is False
         assert _is_allowed_auth_domain(".not-google.com.sg") is False
         assert _is_allowed_auth_domain(".google.zz") is False  # Invalid ccTLD
 
     def test_requires_leading_dot_for_regional(self):
-        """Test regional domains must have leading dot."""
+        """Test regional domains require leading dot.
+
+        Regional ccTLDs like ``google.com.sg`` (no leading dot) are not in
+        ALLOWED_COOKIE_DOMAINS and are not accepted by ``_is_google_domain``
+        (which requires the leading dot for regional patterns) or by the
+        suffix paths (which require the leading-dot suffix).
+        """
         from notebooklm.auth import _is_allowed_auth_domain
 
         assert _is_allowed_auth_domain("google.com.sg") is False
@@ -1214,13 +1795,27 @@ class TestIsAllowedCookieDomainRegional:
         assert _is_allowed_cookie_domain("accounts.google.com") is True
         assert _is_allowed_cookie_domain("lh3.googleusercontent.com") is True
 
+    def test_accepts_sibling_google_products(self):
+        """Test accepts sibling Google product domains (issue #360)."""
+        from notebooklm.auth import _is_allowed_cookie_domain
+
+        assert _is_allowed_cookie_domain(".youtube.com") is True
+        assert _is_allowed_cookie_domain("youtube.com") is True
+        assert _is_allowed_cookie_domain("accounts.youtube.com") is True
+        assert _is_allowed_cookie_domain(".accounts.youtube.com") is True
+        assert _is_allowed_cookie_domain("drive.google.com") is True
+        assert _is_allowed_cookie_domain("docs.google.com") is True
+        assert _is_allowed_cookie_domain("myaccount.google.com") is True
+        assert _is_allowed_cookie_domain("mail.google.com") is True
+
     def test_rejects_invalid_domains(self):
         """Test rejects invalid domains."""
         from notebooklm.auth import _is_allowed_cookie_domain
 
         assert _is_allowed_cookie_domain(".google.zz") is False
         assert _is_allowed_cookie_domain("evil-google.com") is False
-        assert _is_allowed_cookie_domain(".youtube.com") is False
+        assert _is_allowed_cookie_domain(".not-youtube.com") is False
+        assert _is_allowed_cookie_domain("notyoutube.com") is False
 
 
 class TestExtractCookiesRegionalDomains:
@@ -1321,23 +1916,20 @@ class TestExtractCookiesRegionalDomains:
         cookies = extract_cookies_from_storage(storage_state)
         assert cookies["SID"] == "sid_global", ".google.com should win (regional first)"
 
-    def test_rejects_youtube_sid_but_accepts_regional_sid(self):
-        """Test rejects SID from youtube but accepts from regional Google domain."""
+    def test_regional_google_sid_outranks_sibling_product_sid(self):
+        """Regional Google SID outranks YouTube SID when both are present.
+
+        Post-#360 the allowlist accepts sibling-product cookies, but the
+        priority ladder still prefers a regional Google SID over a YouTube
+        SID when both are seen, because YouTube falls into the unranked tier
+        (priority 0) and regional Google domains sit at priority 1.
+        """
         storage_state = {
             "cookies": [
-                # YouTube SID should be rejected (not a Google auth domain)
                 {"name": "SID", "value": "youtube_sid", "domain": ".youtube.com"},
+                {"name": "SID", "value": "regional_sid", "domain": ".google.com.sg"},
             ]
         }
-
-        # Should fail because no valid SID from allowed domain
-        with pytest.raises(ValueError, match="Missing required cookies"):
-            extract_cookies_from_storage(storage_state)
-
-        # But if we add a regional Google SID, it should work
-        storage_state["cookies"].append(
-            {"name": "SID", "value": "regional_sid", "domain": ".google.com.sg"}
-        )
         cookies = extract_cookies_from_storage(storage_state)
         assert cookies["SID"] == "regional_sid"
 
@@ -1419,6 +2011,147 @@ class TestLoadHttpxCookiesRegional:
 
         cookies = load_httpx_cookies(path=storage_file)
         assert cookies.get("SID", domain=".google.de") == "sid_de"
+
+
+class TestSiblingGoogleProductExtraction:
+    """Test cookie extraction from sibling Google product domains (issue #360).
+
+    Pre-#360 the auth allowlist was strictly NotebookLM-shaped: cookies on
+    ``.youtube.com``, ``drive.google.com``, ``docs.google.com``,
+    ``myaccount.google.com``, and ``.mail.google.com`` were dropped at
+    extraction. The unified allowlist now keeps them so future flows that
+    traverse those domains have the cookies they need.
+    """
+
+    SIBLING_DOMAINS = [
+        ".youtube.com",
+        "youtube.com",
+        "accounts.youtube.com",
+        ".accounts.youtube.com",
+        "drive.google.com",
+        ".drive.google.com",
+        "docs.google.com",
+        ".docs.google.com",
+        "myaccount.google.com",
+        ".myaccount.google.com",
+        "mail.google.com",
+        ".mail.google.com",
+    ]
+
+    @pytest.mark.parametrize("domain", SIBLING_DOMAINS)
+    def test_extract_cookies_with_domains_keeps_sibling_cookies(self, domain):
+        """``extract_cookies_with_domains`` retains sibling-product cookies."""
+        storage_state = {
+            "cookies": [
+                # Required SID on .google.com so extraction doesn't fail
+                {"name": "SID", "value": "base_sid", "domain": ".google.com"},
+                # Sibling-product cookie that pre-#360 would have been dropped
+                {"name": "PRODUCT_TOKEN", "value": "sibling", "domain": domain},
+            ]
+        }
+        cookie_map = extract_cookies_with_domains(storage_state)
+        assert ("PRODUCT_TOKEN", domain) in cookie_map
+        assert cookie_map[("PRODUCT_TOKEN", domain)] == "sibling"
+
+    @pytest.mark.parametrize("domain", SIBLING_DOMAINS)
+    def test_load_httpx_cookies_keeps_sibling_cookies(self, tmp_path, domain):
+        """``load_httpx_cookies`` (download path) accepts sibling-product cookies."""
+        storage_state = {
+            "cookies": [
+                {"name": "SID", "value": "base_sid", "domain": ".google.com"},
+                {"name": "PRODUCT_TOKEN", "value": "sibling", "domain": domain},
+            ]
+        }
+        storage_file = tmp_path / "storage.json"
+        storage_file.write_text(json.dumps(storage_state))
+
+        cookies = load_httpx_cookies(path=storage_file)
+        assert cookies.get("PRODUCT_TOKEN", domain=domain) == "sibling"
+
+    @pytest.mark.parametrize("domain", SIBLING_DOMAINS)
+    def test_convert_rookiepy_keeps_sibling_cookies(self, domain):
+        """rookiepy → storage_state conversion keeps sibling-product cookies."""
+        raw = [
+            {
+                "domain": domain,
+                "name": "PRODUCT_TOKEN",
+                "value": "sibling",
+                "path": "/",
+                "secure": True,
+                "expires": None,
+                "http_only": False,
+            }
+        ]
+        result = convert_rookiepy_cookies_to_storage_state(raw)
+        assert len(result["cookies"]) == 1
+        assert result["cookies"][0]["domain"] == domain
+
+    def test_strict_allowlisted_domains_still_work(self):
+        """Regression: pre-existing strict-allowlisted domains keep working.
+
+        Ensures the unification didn't accidentally drop any of the original
+        canonical NotebookLM auth domains.
+        """
+        storage_state = {
+            "cookies": [
+                {"name": "SID", "value": "v1", "domain": ".google.com"},
+                {"name": "HSID", "value": "v2", "domain": ".google.com"},
+                {"name": "OSID", "value": "v3", "domain": "notebooklm.google.com"},
+                {"name": "OSID2", "value": "v4", "domain": ".notebooklm.google.com"},
+                {"name": "ACC", "value": "v5", "domain": "accounts.google.com"},
+                {"name": "ACC2", "value": "v6", "domain": ".accounts.google.com"},
+                {"name": "MEDIA", "value": "v7", "domain": ".googleusercontent.com"},
+            ]
+        }
+        cookie_map = extract_cookies_with_domains(storage_state)
+        assert ("SID", ".google.com") in cookie_map
+        assert ("HSID", ".google.com") in cookie_map
+        assert ("OSID", "notebooklm.google.com") in cookie_map
+        assert ("OSID2", ".notebooklm.google.com") in cookie_map
+        assert ("ACC", "accounts.google.com") in cookie_map
+        assert ("ACC2", ".accounts.google.com") in cookie_map
+        assert ("MEDIA", ".googleusercontent.com") in cookie_map
+
+    def test_unified_filter_rejects_unrelated_domains(self):
+        """Regression: cookies from unrelated domains are still rejected."""
+        storage_state = {
+            "cookies": [
+                {"name": "SID", "value": "v1", "domain": ".google.com"},
+                {"name": "EVIL", "value": "x", "domain": ".evil.com"},
+                {"name": "EVIL2", "value": "y", "domain": ".not-google.com"},
+                {"name": "EVIL3", "value": "z", "domain": ".evil-google.com"},
+                {"name": "EVIL4", "value": "w", "domain": ".not-youtube.com"},
+            ]
+        }
+        cookie_map = extract_cookies_with_domains(storage_state)
+        kept_names = {name for name, _ in cookie_map}
+        assert kept_names == {"SID"}
+
+
+class TestRookiepyDomainsCoverage:
+    """Confirm ``_login_with_browser_cookies`` would request sibling domains.
+
+    The login path constructs its rookiepy ``domains`` list from
+    ``ALLOWED_COOKIE_DOMAINS + regional ccTLDs``, so adding a domain to the
+    constant automatically widens what we ask the browser for. This test pins
+    that contract — if someone narrows the constant later, the contract here
+    flags it.
+    """
+
+    def test_allowlist_covers_sibling_products(self):
+        from notebooklm.auth import ALLOWED_COOKIE_DOMAINS
+
+        for domain in (
+            ".youtube.com",
+            "accounts.youtube.com",
+            "drive.google.com",
+            "docs.google.com",
+            "myaccount.google.com",
+        ):
+            assert domain in ALLOWED_COOKIE_DOMAINS, (
+                f"{domain!r} must be in ALLOWED_COOKIE_DOMAINS so "
+                "_login_with_browser_cookies asks rookiepy for it (issue #360)"
+            )
 
 
 class TestConvertRookiepyCookies:
@@ -1550,18 +2283,639 @@ class TestConvertRookiepyCookies:
         assert result["cookies"][0]["domain"] == ".notebooklm.google.com"
         assert result["cookies"][0]["name"] == "OSID"
 
-    def test_other_google_subdomains_filtered(self):
-        """Auth conversion only keeps explicitly allowed Google subdomains."""
+    def test_sibling_google_product_subdomains_kept(self):
+        """Auth conversion keeps sibling Google product cookies (issue #360).
+
+        Pre-#360 the auth allowlist was strict and dropped subdomains like
+        ``.mail.google.com``. The unified allowlist now matches the broader
+        download policy so cookies from ``.youtube.com``, ``drive.google.com``,
+        ``docs.google.com``, ``myaccount.google.com``, and ``.mail.google.com``
+        survive extraction.
+        """
         raw = [
             {
-                "domain": ".mail.google.com",
-                "name": "OSID",
-                "value": "x",
+                "domain": domain,
+                "name": "SID",
+                "value": "v",
                 "path": "/",
                 "secure": True,
                 "expires": None,
                 "http_only": False,
             }
+            for domain in (
+                ".mail.google.com",
+                ".youtube.com",
+                ".drive.google.com",
+                ".docs.google.com",
+                ".myaccount.google.com",
+            )
+        ]
+        result = convert_rookiepy_cookies_to_storage_state(raw)
+        kept_domains = {c["domain"] for c in result["cookies"]}
+        assert kept_domains == {
+            ".mail.google.com",
+            ".youtube.com",
+            ".drive.google.com",
+            ".docs.google.com",
+            ".myaccount.google.com",
+        }
+
+    def test_unrelated_domains_still_filtered(self):
+        """Cookies from non-Google domains are still dropped."""
+        raw = [
+            {
+                "domain": ".evil.com",
+                "name": "SID",
+                "value": "x",
+                "path": "/",
+                "secure": True,
+                "expires": None,
+                "http_only": False,
+            },
+            {
+                "domain": ".not-google.com",
+                "name": "SID",
+                "value": "x",
+                "path": "/",
+                "secure": True,
+                "expires": None,
+                "http_only": False,
+            },
         ]
         result = convert_rookiepy_cookies_to_storage_state(raw)
         assert result == {"cookies": [], "origins": []}
+
+
+_POKE_URL_RE = re.compile(r"^https://accounts\.google\.com/RotateCookies$")
+_NOTEBOOKLM_HOMEPAGE_HTML = (
+    b'<html><script>window.WIZ_global_data={"SNlM0e":"csrf_ok","FdrFJe":"sess_ok"};</script></html>'
+)
+
+
+def _stale_storage(path: Path, *, age_seconds: float) -> None:
+    """Backdate ``path``'s mtime so the L1 rate-limit guard does not skip the poke."""
+    target = path.stat().st_mtime - age_seconds
+    os.utime(path, (target, target))
+
+
+class TestIsRecentlyRotated:
+    """Direct boundary coverage for ``_is_recently_rotated``."""
+
+    def test_none_path_is_not_recent(self):
+        assert auth_module._is_recently_rotated(None) is False
+
+    def test_missing_file_is_not_recent(self, tmp_path):
+        assert auth_module._is_recently_rotated(tmp_path / "nope.json") is False
+
+    def test_just_written_file_is_recent(self, tmp_path):
+        path = tmp_path / "storage_state.json"
+        path.write_text("{}")
+        assert auth_module._is_recently_rotated(path) is True
+
+    def test_age_just_inside_window_is_recent(self, tmp_path):
+        path = tmp_path / "storage_state.json"
+        path.write_text("{}")
+        _stale_storage(path, age_seconds=auth_module._KEEPALIVE_RATE_LIMIT_SECONDS - 1.0)
+        assert auth_module._is_recently_rotated(path) is True
+
+    def test_age_just_past_window_is_not_recent(self, tmp_path):
+        path = tmp_path / "storage_state.json"
+        path.write_text("{}")
+        _stale_storage(path, age_seconds=auth_module._KEEPALIVE_RATE_LIMIT_SECONDS + 1.0)
+        assert auth_module._is_recently_rotated(path) is False
+
+    def test_future_mtime_is_not_recent(self, tmp_path):
+        """A future mtime (clock skew, NTP step) must not wedge the guard."""
+        path = tmp_path / "storage_state.json"
+        path.write_text("{}")
+        future = path.stat().st_mtime + 3600
+        os.utime(path, (future, future))
+        assert auth_module._is_recently_rotated(path) is False
+
+
+class TestPokeConcurrencyThrottling:
+    """In-process and cross-process throttling of ``_poke_session``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_concurrent_async_callers_share_single_post(
+        self, tmp_path, httpx_mock: HTTPXMock
+    ):
+        """``asyncio.gather`` over 10 fresh callers must fire exactly one POST.
+
+        The disk mtime guard alone can't do this — none of the callers have
+        written storage_state.json yet, so they all see the same stale mtime.
+        The in-process ``asyncio.Lock`` + monotonic timestamp is what dedupes
+        them.
+        """
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        # Backdate so the disk mtime fast path doesn't pre-empt the poke.
+        _stale_storage(storage_path, age_seconds=120)
+
+        httpx_mock.add_response(
+            url=_POKE_URL_RE,
+            status_code=200,
+            is_reusable=True,
+        )
+
+        async with httpx.AsyncClient() as client:
+            await asyncio.gather(
+                *(auth_module._poke_session(client, storage_path) for _ in range(10))
+            )
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert len(poke_requests) == 1, (
+            f"expected exactly one RotateCookies POST across 10 concurrent callers, "
+            f"got {len(poke_requests)}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_skips_when_external_process_holds_flock(
+        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+    ):
+        """If another process holds the ``.rotate.lock`` flock, skip silently."""
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        _stale_storage(storage_path, age_seconds=120)
+
+        # Simulate an external process holding the flock by making the
+        # non-blocking acquire raise the real contention errno. Generic
+        # ``OSError`` would be treated as "lock infrastructure unavailable"
+        # and fail open instead — this test must mimic actual contention.
+        import errno as _errno
+
+        if sys.platform == "win32":
+            import msvcrt
+
+            def fail_lock(*_args, **_kwargs):
+                raise OSError(_errno.EWOULDBLOCK, "simulated external lock holder")
+
+            monkeypatch.setattr(msvcrt, "locking", fail_lock)
+        else:
+            import fcntl
+
+            original_flock = fcntl.flock
+
+            def maybe_fail(fd, op):
+                if op & fcntl.LOCK_NB:
+                    raise OSError(_errno.EWOULDBLOCK, "simulated external lock holder")
+                return original_flock(fd, op)
+
+            monkeypatch.setattr(fcntl, "flock", maybe_fail)
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._poke_session(client, storage_path)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert (
+            poke_requests == []
+        ), "expected no RotateCookies POST when another process holds the rotation lock"
+
+    def test_rotation_lock_path_is_sibling_of_storage(self, tmp_path):
+        """Lock sentinel sits next to the storage file with a ``.rotate.lock`` suffix."""
+        storage_path = tmp_path / "storage_state.json"
+        lock_path = auth_module._rotation_lock_path(storage_path)
+        assert lock_path == tmp_path / ".storage_state.json.rotate.lock"
+
+    def test_rotation_lock_path_returns_none_for_no_storage(self):
+        assert auth_module._rotation_lock_path(None) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_flock_released_after_poke(self, tmp_path, httpx_mock: HTTPXMock):
+        """A successful poke releases the rotation flock so the next call can acquire."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX-specific test; Windows uses msvcrt.locking")
+
+        import fcntl
+
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        _stale_storage(storage_path, age_seconds=120)
+
+        httpx_mock.add_response(
+            url=_POKE_URL_RE,
+            status_code=200,
+            is_reusable=True,
+        )
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._poke_session(client, storage_path)
+
+        # After the poke, an external attempt to acquire LOCK_EX | LOCK_NB
+        # should succeed — proving we released our hold.
+        lock_path = auth_module._rotation_lock_path(storage_path)
+        assert lock_path is not None and lock_path.exists()
+        fd = os.open(lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_rotate_cookies_honours_disable_env(self, monkeypatch, httpx_mock: HTTPXMock):
+        """``NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1`` short-circuits the bare path too.
+
+        Layer-1 ``_poke_session`` already honoured the env var, but the
+        layer-2 keepalive loop bypasses ``_poke_session`` and calls
+        ``_rotate_cookies`` directly. Without the env-var check on the bare
+        function, setting the variable would silently fail to disable the
+        background loop.
+        """
+        monkeypatch.setenv(NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV, "1")
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._rotate_cookies(client)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert (
+            poke_requests == []
+        ), "_rotate_cookies must short-circuit when NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_failed_poke_blocks_in_process_retries_within_window(
+        self, tmp_path, httpx_mock: HTTPXMock
+    ):
+        """A failed POST must still consume the rate-limit window.
+
+        Otherwise 10 fanned-out callers would each wait the full 15 s timeout
+        against a hung accounts.google.com — sequential failure stampede.
+        """
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        _stale_storage(storage_path, age_seconds=120)
+
+        httpx_mock.add_response(
+            url=_POKE_URL_RE,
+            status_code=503,
+            is_reusable=True,
+        )
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._poke_session(client, storage_path)
+            _stale_storage(storage_path, age_seconds=120)
+            await auth_module._poke_session(client, storage_path)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert len(poke_requests) == 1, (
+            f"failed poke must still bump the in-process attempt timestamp; "
+            f"got {len(poke_requests)} POSTs (the second should have skipped)"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_per_profile_timestamp_does_not_cross_profiles(
+        self, tmp_path, httpx_mock: HTTPXMock
+    ):
+        """A poke against profile A must not suppress profile B for the window.
+
+        Multi-profile setups (``~/.notebooklm/profiles/<name>/storage_state.json``)
+        are first-class. With a single global timestamp, a CLI invocation under
+        profile ``work`` would silence rotation for profile ``personal`` for
+        the next minute.
+        """
+        profile_a = tmp_path / "a" / "storage_state.json"
+        profile_b = tmp_path / "b" / "storage_state.json"
+        for path in (profile_a, profile_b):
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"cookies": []}))
+            _stale_storage(path, age_seconds=120)
+
+        httpx_mock.add_response(url=_POKE_URL_RE, status_code=200, is_reusable=True)
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._poke_session(client, profile_a)
+            await auth_module._poke_session(client, profile_b)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert (
+            len(poke_requests) == 2
+        ), f"each profile must rotate independently; got {len(poke_requests)} POSTs"
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_timestamp_stamped_before_post_completes(self, tmp_path, httpx_mock: HTTPXMock):
+        """A layer-1 caller arriving while a layer-2 POST is in flight must skip.
+
+        L2 keepalive calls ``_rotate_cookies`` directly (no async lock); if
+        the timestamp were only stamped in a ``finally`` after the await, an
+        L1 caller arriving mid-flight would see a stale timestamp and fire
+        its own POST. Stamping *before* the await closes that overlap.
+        """
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        _stale_storage(storage_path, age_seconds=120)
+
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        post_calls = 0
+
+        async def slow_post(*_args, **_kwargs):
+            nonlocal post_calls
+            post_calls += 1
+            entered.set()
+            await gate.wait()
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", auth_module.KEEPALIVE_ROTATE_URL),
+            )
+
+        async with httpx.AsyncClient() as client:
+            client.post = slow_post  # type: ignore[method-assign]
+            # L2-style: bare ``_rotate_cookies``, no per-profile async lock.
+            task_l2 = asyncio.create_task(auth_module._rotate_cookies(client, storage_path))
+            # Wait for slow_post to enter via an event rather than a timed
+            # poll — busy-waits in the 100s of ms range can flake on loaded
+            # CI runners (notably Windows) where the first task switch after
+            # ``create_task`` doesn't always land in time.
+            await asyncio.wait_for(entered.wait(), timeout=2.0)
+            assert post_calls == 1, "L2 task should be parked inside slow_post"
+            # L1-style: ``_poke_session`` acquires the per-profile async lock
+            # (uncontended because L2 didn't take it) and reads the per-profile
+            # timestamp. Claimed early, this short-circuits without a 2nd POST.
+            await auth_module._poke_session(client, storage_path)
+            assert (
+                post_calls == 1
+            ), f"L1 fired during L2's in-flight POST; early-stamp broken (post_calls={post_calls})"
+            gate.set()
+            await task_l2
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_concurrent_rotate_cookies_same_profile_share_single_post(
+        self, tmp_path, httpx_mock: HTTPXMock
+    ):
+        """Two layer-2-style direct ``_rotate_cookies`` calls on the same profile
+        must share a single POST — verifies the atomic check-and-claim, not
+        just the layer-1 async lock.
+        """
+        storage_path = tmp_path / "storage_state.json"
+
+        httpx_mock.add_response(url=_POKE_URL_RE, status_code=200, is_reusable=True)
+
+        async with httpx.AsyncClient() as client:
+            # Two L2-style direct callers. Neither holds the layer-1 async
+            # lock; the dedup must come from ``_try_claim_rotation``.
+            await asyncio.gather(
+                auth_module._rotate_cookies(client, storage_path),
+                auth_module._rotate_cookies(client, storage_path),
+            )
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert len(poke_requests) == 1, (
+            f"two L2 callers on the same profile must coordinate via the atomic "
+            f"claim; got {len(poke_requests)} POSTs"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_lock_unavailable_fails_open(self, tmp_path, monkeypatch, httpx_mock: HTTPXMock):
+        """Lock infrastructure failure must NOT permanently suppress rotation.
+
+        On read-only auth dirs, NFS without flock support, or permission
+        errors opening the sentinel, rotation should fall through to a
+        best-effort POST instead of being silenced for the lifetime of the
+        process.
+        """
+        import errno as _errno
+
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        _stale_storage(storage_path, age_seconds=120)
+
+        original_open = os.open
+        rotate_lock = auth_module._rotation_lock_path(storage_path)
+
+        def selective_open(path, *args, **kwargs):
+            if str(path) == str(rotate_lock):
+                raise OSError(_errno.EACCES, "simulated read-only auth dir")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", selective_open)
+        httpx_mock.add_response(url=_POKE_URL_RE, status_code=200, is_reusable=True)
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._poke_session(client, storage_path)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert len(poke_requests) == 1, (
+            f"infra failure must fail open and let rotation proceed; "
+            f"got {len(poke_requests)} POSTs"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_in_process_timestamp_blocks_within_window(self, tmp_path, httpx_mock: HTTPXMock):
+        """A second call before storage save lands still skips via the monotonic timestamp.
+
+        Storage save happens in the caller (``_fetch_tokens_with_jar``) after
+        ``_poke_session`` returns, so two successive direct calls would both
+        see stale mtime. The monotonic timestamp inside the async lock catches
+        the second one.
+        """
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(json.dumps({"cookies": []}))
+        _stale_storage(storage_path, age_seconds=120)
+
+        httpx_mock.add_response(
+            url=_POKE_URL_RE,
+            status_code=200,
+            is_reusable=True,
+        )
+
+        async with httpx.AsyncClient() as client:
+            await auth_module._poke_session(client, storage_path)
+            # storage_state.json mtime is intentionally NOT refreshed between
+            # calls — proving the in-memory timestamp is what gates this.
+            _stale_storage(storage_path, age_seconds=120)
+            await auth_module._poke_session(client, storage_path)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert (
+            len(poke_requests) == 1
+        ), f"second poke should skip via monotonic timestamp; got {len(poke_requests)} POSTs"
+
+
+class TestKeepalivePoke:
+    """Tests for the proactive ``accounts.google.com/RotateCookies`` poke."""
+
+    @pytest.mark.asyncio
+    async def test_poke_made_by_default(self, httpx_mock: HTTPXMock):
+        """Token fetch hits RotateCookies before notebooklm.google.com."""
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        await fetch_tokens({"SID": "x"})
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        all_urls = [str(r.url) for r in httpx_mock.get_requests()]
+        assert (
+            len(poke_requests) == 1
+        ), f"expected exactly one RotateCookies request, got: {all_urls}"
+        assert str(poke_requests[0].url) == KEEPALIVE_ROTATE_URL
+        assert poke_requests[0].method == "POST"
+
+    @pytest.mark.asyncio
+    async def test_poke_uses_jspb_body_and_origin(self, httpx_mock: HTTPXMock):
+        """Body matches the Chrome jspb sentinel; Origin is the accounts surface."""
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        await fetch_tokens({"SID": "x"})
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert len(poke_requests) == 1
+        request = poke_requests[0]
+        assert request.content == b'[000,"-0000000000000000000"]'
+        assert request.headers.get("content-type") == "application/json"
+        assert request.headers.get("origin") == "https://accounts.google.com"
+
+    @pytest.mark.asyncio
+    async def test_poke_skipped_when_disabled(self, monkeypatch, httpx_mock: HTTPXMock):
+        """``NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1`` suppresses the poke."""
+        monkeypatch.setenv(NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV, "1")
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        await fetch_tokens({"SID": "x"})
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert poke_requests == []
+
+    @pytest.mark.asyncio
+    async def test_poke_skipped_when_storage_recently_rotated(
+        self, tmp_path, httpx_mock: HTTPXMock
+    ):
+        """Storage_state.json mtime within the rate-limit window suppresses the poke."""
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(
+            json.dumps(
+                {"cookies": [{"name": "SID", "value": "x", "domain": ".google.com", "path": "/"}]}
+            )
+        )
+        # storage_state.json was just written — mtime is "now", well inside the 60s window.
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        await fetch_tokens_with_domains(path=storage_path)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert (
+            poke_requests == []
+        ), "rate-limit guard should skip RotateCookies when storage_state.json is fresh"
+
+    @pytest.mark.asyncio
+    async def test_poke_fires_when_storage_older_than_window(self, tmp_path, httpx_mock: HTTPXMock):
+        """An older storage_state.json mtime allows the rotation poke through."""
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(
+            json.dumps(
+                {"cookies": [{"name": "SID", "value": "x", "domain": ".google.com", "path": "/"}]}
+            )
+        )
+        _stale_storage(storage_path, age_seconds=120)
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        await fetch_tokens_with_domains(path=storage_path)
+
+        poke_requests = [r for r in httpx_mock.get_requests() if _POKE_URL_RE.match(str(r.url))]
+        assert len(poke_requests) == 1, "expected RotateCookies poke when storage is stale"
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_token_fetch_succeeds_when_poke_5xx(self, httpx_mock: HTTPXMock):
+        """A failing poke is best-effort and never aborts token fetch."""
+        httpx_mock.add_response(
+            url=_POKE_URL_RE,
+            status_code=503,
+            is_reusable=True,
+        )
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        csrf, session_id = await fetch_tokens({"SID": "x"})
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_poke_rotated_sidts_lands_in_jar(self, tmp_path, httpx_mock: HTTPXMock):
+        """Set-Cookie from RotateCookies response is persisted to storage_state.json."""
+        storage_path = tmp_path / "storage_state.json"
+        storage_path.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {
+                            "name": "SID",
+                            "value": "old_sid",
+                            "domain": ".google.com",
+                            "path": "/",
+                        },
+                        {
+                            "name": "__Secure-1PSIDTS",
+                            "value": "stale_sidts",
+                            "domain": ".google.com",
+                            "path": "/",
+                        },
+                    ]
+                }
+            )
+        )
+        # Backdate so the rate-limit guard doesn't pre-empt the poke.
+        _stale_storage(storage_path, age_seconds=120)
+        httpx_mock.add_response(
+            url=_POKE_URL_RE,
+            status_code=200,
+            headers={
+                "Set-Cookie": (
+                    "__Secure-1PSIDTS=ROTATED; Domain=.google.com; Path=/; Secure; HttpOnly"
+                )
+            },
+        )
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        await fetch_tokens_with_domains(path=storage_path)
+
+        rewritten = json.loads(storage_path.read_text())
+        sidts_values = [c["value"] for c in rewritten["cookies"] if c["name"] == "__Secure-1PSIDTS"]
+        assert sidts_values == [
+            "ROTATED"
+        ], f"expected rotated SIDTS persisted to disk, got: {sidts_values}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_default_keepalive_mock
+    async def test_token_fetch_succeeds_when_poke_raises_httperror(self, httpx_mock: HTTPXMock):
+        """Network-level HTTPError on the poke is swallowed at DEBUG; token fetch proceeds."""
+        httpx_mock.add_exception(httpx.ConnectError("simulated DNS failure"), url=_POKE_URL_RE)
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=_NOTEBOOKLM_HOMEPAGE_HTML,
+        )
+
+        csrf, session_id = await fetch_tokens({"SID": "x"})
+
+        assert csrf == "csrf_ok"
+        assert session_id == "sess_ok"

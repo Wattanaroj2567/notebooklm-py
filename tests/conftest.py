@@ -2,10 +2,65 @@
 
 import json
 import os
+import re
 
 import pytest
 
 from notebooklm.rpc import RPCMethod
+
+
+@pytest.fixture(autouse=True)
+def _reset_poke_state():
+    """Reset module-level rotation guards between tests.
+
+    The ``notebooklm.auth`` rotation throttle keeps two pieces of module-global
+    state that persist across tests and would otherwise leak:
+
+    1. ``_LAST_POKE_ATTEMPT_MONOTONIC`` (``dict[Path | None, float]``) — keyed
+       per-profile. Without clearing, the first test to poke any profile sets
+       the timestamp and subsequent tests in that file see "we just poked"
+       and silently skip the POST they're asserting on.
+    2. ``_POKE_LOCKS_BY_LOOP`` (``WeakKeyDictionary[loop, dict[..., Lock]]``) —
+       in production each per-loop entry is reclaimed automatically when its
+       loop is GC'd. In tests the loop typically outlives the explicit
+       cleanup point (pytest-asyncio's loop teardown happens after fixtures
+       run), so we clear it eagerly to keep tests independent.
+    """
+    from notebooklm import auth as _auth
+
+    _auth._LAST_POKE_ATTEMPT_MONOTONIC.clear()
+    _auth._POKE_LOCKS_BY_LOOP.clear()
+    yield
+    _auth._LAST_POKE_ATTEMPT_MONOTONIC.clear()
+    _auth._POKE_LOCKS_BY_LOOP.clear()
+
+
+@pytest.fixture(autouse=True)
+def _mock_keepalive_poke(request):
+    """Default-mock the auth keepalive poke so tests don't trip on it.
+
+    ``_fetch_tokens_with_jar`` makes a best-effort POST to
+    ``accounts.google.com/RotateCookies`` to rotate SIDTS. Tests that use
+    ``httpx_mock`` would otherwise fail with "no response set" when this
+    request fires. The mock is optional+reusable so tests that don't trigger
+    the poke aren't penalised.
+
+    Tests that need full control over the poke response (e.g. to assert on
+    rotated Set-Cookie or simulate failure) should mark themselves with
+    ``@pytest.mark.no_default_keepalive_mock`` to skip this default and
+    register their own response.
+    """
+    if "httpx_mock" not in request.fixturenames:
+        return
+    if request.node.get_closest_marker("no_default_keepalive_mock"):
+        return
+    httpx_mock = request.getfixturevalue("httpx_mock")
+    httpx_mock.add_response(
+        url=re.compile(r"^https://accounts\.google\.com/RotateCookies$"),
+        is_optional=True,
+        is_reusable=True,
+        status_code=200,
+    )
 
 
 def pytest_configure(config):
@@ -13,6 +68,11 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "vcr: marks tests that use VCR cassettes (may be skipped if cassettes unavailable)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "no_default_keepalive_mock: skip the default accounts.google.com/RotateCookies "
+        "mock so the test can register its own response",
     )
     # Disable Rich/Click formatting in tests to avoid ANSI escape codes in output
     # This ensures consistent test assertions regardless of -s flag
@@ -60,7 +120,7 @@ def mock_list_notebooks_response():
             [
                 [
                     "My First Notebook",
-                    [],
+                    [["src_001"], ["src_002"]],
                     "nb_001",
                     "📘",
                     None,
@@ -68,7 +128,7 @@ def mock_list_notebooks_response():
                 ],
                 [
                     "Research Notes",
-                    [],
+                    None,
                     "nb_002",
                     "📚",
                     None,

@@ -32,6 +32,7 @@ from .exceptions import (
 # Re-export enums from rpc/types.py for convenience
 from .rpc.types import (
     ArtifactStatus,
+    ArtifactTypeCode,
     AudioFormat,
     AudioLength,
     ChatGoal,
@@ -294,6 +295,118 @@ def _extract_source_url(metadata: Any, *, allow_bare_http: bool = True) -> str |
     return url
 
 
+def _datetime_from_timestamp(value: Any) -> datetime | None:
+    """Convert an API seconds timestamp to ``datetime``, returning ``None`` if invalid."""
+    try:
+        return datetime.fromtimestamp(value)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _extract_source_created_at(metadata: Any) -> datetime | None:
+    """Extract a source creation timestamp from a ``src[2]`` metadata array."""
+    if not isinstance(metadata, list) or len(metadata) <= 2:
+        return None
+
+    timestamp_list = metadata[2]
+    if not isinstance(timestamp_list, list) or not timestamp_list:
+        return None
+
+    return _datetime_from_timestamp(timestamp_list[0])
+
+
+def _is_valid_artifact_url(value: Any) -> bool:
+    """Return True when ``value`` looks like a downloadable artifact URL."""
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def _extract_audio_artifact_url(data: list[Any]) -> str | None:
+    if len(data) <= 6 or not isinstance(data[6], list) or len(data[6]) <= 5:
+        return None
+
+    media_list = data[6][5]
+    if not isinstance(media_list, list):
+        return None
+
+    for item in media_list:
+        if (
+            isinstance(item, list)
+            and len(item) > 2
+            and item[2] == "audio/mp4"
+            and _is_valid_artifact_url(item[0])
+        ):
+            return item[0]
+
+    for item in media_list:
+        if isinstance(item, list) and item and _is_valid_artifact_url(item[0]):
+            return item[0]
+
+    return None
+
+
+def _extract_video_artifact_url(data: list[Any]) -> str | None:
+    if len(data) <= 8 or not isinstance(data[8], list):
+        return None
+
+    fallback_url = None
+    for media_list in data[8]:
+        if not isinstance(media_list, list):
+            continue
+        for item in media_list:
+            if not isinstance(item, list) or not item or not _is_valid_artifact_url(item[0]):
+                continue
+            if fallback_url is None:
+                fallback_url = item[0]
+            if len(item) > 2 and item[2] == "video/mp4":
+                if len(item) > 1 and item[1] == 4:
+                    return item[0]
+                fallback_url = item[0]
+
+    return fallback_url
+
+
+def _extract_infographic_artifact_url(data: list[Any]) -> str | None:
+    for item in data:
+        if not isinstance(item, list) or len(item) <= 2:
+            continue
+        content = item[2]
+        if not isinstance(content, list) or not content:
+            continue
+        first_content = content[0]
+        if not isinstance(first_content, list) or len(first_content) <= 1:
+            continue
+        img_data = first_content[1]
+        if isinstance(img_data, list) and img_data and _is_valid_artifact_url(img_data[0]):
+            return img_data[0]
+    return None
+
+
+def _extract_slide_deck_artifact_url(data: list[Any]) -> str | None:
+    """Extract the slide-deck PDF URL. The PPTX URL at ``data[16][4]`` is not
+    surfaced — callers wanting PPTX should use ``download_slide_deck(output_format="pptx")``."""
+    if (
+        len(data) > 16
+        and isinstance(data[16], list)
+        and len(data[16]) > 3
+        and _is_valid_artifact_url(data[16][3])
+    ):
+        return data[16][3]
+    return None
+
+
+def _extract_artifact_url(data: list[Any], artifact_type: int | None) -> str | None:
+    """Extract a public download URL from known artifact response shapes."""
+    if artifact_type == ArtifactTypeCode.AUDIO.value:
+        return _extract_audio_artifact_url(data)
+    if artifact_type == ArtifactTypeCode.VIDEO.value:
+        return _extract_video_artifact_url(data)
+    if artifact_type == ArtifactTypeCode.INFOGRAPHIC.value:
+        return _extract_infographic_artifact_url(data)
+    if artifact_type == ArtifactTypeCode.SLIDE_DECK.value:
+        return _extract_slide_deck_artifact_url(data)
+    return None
+
+
 __all__ = [
     # Dataclasses
     "Notebook",
@@ -407,6 +520,12 @@ class SourceSummary:
         }
 
 
+def _extract_notebook_sources_count(data: list[Any]) -> int:
+    """Extract the embedded source count from a notebook API payload."""
+    sources = data[1] if len(data) > 1 else None
+    return len(sources) if isinstance(sources, list) else 0
+
+
 @dataclass
 class Notebook:
     """Represents a NotebookLM notebook."""
@@ -429,23 +548,27 @@ class Notebook:
         """
         raw_title = data[0] if len(data) > 0 and isinstance(data[0], str) else ""
         title = raw_title.replace("thought\n", "").strip()
+        sources_count = _extract_notebook_sources_count(data)
         notebook_id = data[2] if len(data) > 2 and isinstance(data[2], str) else ""
 
         created_at = None
         if len(data) > 5 and isinstance(data[5], list) and len(data[5]) > 5:
             ts_data = data[5][5]
             if isinstance(ts_data, list) and len(ts_data) > 0:
-                try:
-                    created_at = datetime.fromtimestamp(ts_data[0])
-                except (TypeError, ValueError):
-                    pass
+                created_at = _datetime_from_timestamp(ts_data[0])
 
         # Extract ownership - data[5][1] = False means owner, True means shared
         is_owner = True
         if len(data) > 5 and isinstance(data[5], list) and len(data[5]) > 1:
             is_owner = data[5][1] is False
 
-        return cls(id=notebook_id, title=title, created_at=created_at, is_owner=is_owner)
+        return cls(
+            id=notebook_id,
+            title=title,
+            created_at=created_at,
+            sources_count=sources_count,
+            is_owner=is_owner,
+        )
 
 
 @dataclass
@@ -644,8 +767,15 @@ class Source:
                         and isinstance(metadata[4], int)
                         else None
                     )
+                    created_at = _extract_source_created_at(metadata)
 
-                    return cls(id=str(source_id), title=title, url=url, _type_code=type_code)
+                    return cls(
+                        id=str(source_id),
+                        title=title,
+                        url=url,
+                        _type_code=type_code,
+                        created_at=created_at,
+                    )
 
                 # Deeply-nested shape: extract URL (via shared helper) and
                 # type code from entry[2] if present. Full precedence applies:
@@ -657,12 +787,14 @@ class Source:
                     if metadata is not None and len(metadata) > 4 and isinstance(metadata[4], int)
                     else None
                 )
+                created_at = _extract_source_created_at(metadata)
 
                 return cls(
                     id=str(source_id),
                     title=title,
                     url=url,
                     _type_code=type_code,
+                    created_at=created_at,
                 )
 
         # Simple flat format: [id, title] or [id, title, ...]
@@ -782,7 +914,8 @@ class Artifact:
         kind: Artifact type as ArtifactType enum (str enum, comparable to strings).
         status: Processing status (1=processing, 2=pending, 3=completed, 4=failed).
         created_at: When the artifact was created.
-        url: Download URL (if available).
+        url: Download URL (if available). For slide decks this is the PDF URL
+            only — PPTX is fetched separately via ``download_slide_deck(output_format="pptx")``.
 
     Example:
         artifact.kind == ArtifactType.AUDIO  # True
@@ -859,10 +992,7 @@ class Artifact:
         # Extract timestamp from data[15][0]
         created_at = None
         if len(data) > 15 and isinstance(data[15], list) and len(data[15]) > 0:
-            try:
-                created_at = datetime.fromtimestamp(data[15][0])
-            except (TypeError, ValueError):
-                pass
+            created_at = _datetime_from_timestamp(data[15][0])
 
         # Extract variant code from data[9][1][0] for quiz/flashcard distinction
         variant = None
@@ -871,12 +1001,15 @@ class Artifact:
             if isinstance(options, list) and len(options) > 0:
                 variant = options[0]
 
+        url = _extract_artifact_url(data, artifact_type if isinstance(artifact_type, int) else None)
+
         return cls(
             id=str(artifact_id),
             title=str(title),
             _artifact_type=artifact_type,
             status=status,
             created_at=created_at,
+            url=url,
             _variant=variant,
         )
 
@@ -923,10 +1056,7 @@ class Artifact:
             if len(inner) > 2 and isinstance(inner[2], list) and len(inner[2]) > 2:
                 ts_data = inner[2][2]
                 if isinstance(ts_data, list) and len(ts_data) > 0:
-                    try:
-                        created_at = datetime.fromtimestamp(ts_data[0])
-                    except (TypeError, ValueError):
-                        pass
+                    created_at = _datetime_from_timestamp(ts_data[0])
 
         return cls(
             id=str(mind_map_id),
@@ -1131,10 +1261,7 @@ class Note:
 
         created_at = None
         if len(data) > 3 and isinstance(data[3], list) and len(data[3]) > 0:
-            try:
-                created_at = datetime.fromtimestamp(data[3][0])
-            except (TypeError, ValueError):
-                pass
+            created_at = _datetime_from_timestamp(data[3][0])
 
         return cls(
             id=str(note_id),
