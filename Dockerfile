@@ -19,8 +19,8 @@ COPY README.md SKILL.md AGENTS.md notebooklm-py.png ./
 ENV UV_NATIVE_TLS=1 \
     UV_HTTP_TIMEOUT=300
 
-# Install project and browser dependencies using pip instead of uv due to Docker DNS bugs
-RUN pip install --no-cache-dir .[browser]
+# Install project and browser dependencies using uv
+RUN uv sync --extra browser
 
 # Expose MCP port
 EXPOSE 8000
@@ -28,4 +28,4 @@ EXPOSE 8000
 # Set environment variables
 ENV PORT=8000
 ENV HOST=0.0.0.0
-CMD ["notebooklm-mcp"]
+CMD ["uv", "run", "notebooklm-mcp"]
