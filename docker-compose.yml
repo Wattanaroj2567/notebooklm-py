@@ -8,11 +8,13 @@ services:
       - PORT=8000
       - HOST=0.0.0.0
       - NOTEBOOKLM_HOME=/root/.notebooklm
+      # Optional: NotebookLM notebook containing AI-team manuals and MCP workflow docs.
+      # Agents query this through ask_framework_manual instead of local framework files.
+      - NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID=${NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID:-}
     volumes:
       # Map the entire .notebooklm directory to handle profiles and config correctly
       - ~/.notebooklm:/root/.notebooklm
-      # Map AI Workspace and Skills for the MCP server
-      - ./ai_workspace:/app/ai_workspace:ro
+      # Map MCP skill hints for deterministic tool-use rules.
       - ./MCP_SKILL.md:/app/MCP_SKILL.md:ro
     ports:
       - "8000:8000"
@@ -23,9 +25,14 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: mcp-tunnel
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     # Use --url to explicitly route traffic to the mcp service within the docker network
     command: tunnel --no-autoupdate run --url http://notebooklm-mcp:8000
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+      - TUNNEL_TRANSPORT_PROTOCOL=http2
+      - TUNNEL_EDGE_IP_VERSION=auto
     depends_on:
       - notebooklm-mcp
