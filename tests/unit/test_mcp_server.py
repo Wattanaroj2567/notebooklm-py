@@ -26,11 +26,18 @@ from notebooklm.types import Artifact, SharedUser, ShareStatus
 EXPECTED_TOOLS = frozenset(
     {
         "read_framework_manual",
+        "ask_framework_manual",
         "run_research_team_workflow",
         "run_deep_search_workflow",
         "list_notebooks",
         "create_notebook",
+        "get_or_create_notebook",
         "delete_notebook",
+        "delete_notebooks",
+        "delete_notebooks_by_title",
+        "archive_notebooks",
+        "find_duplicate_notebooks",
+        "cleanup_duplicate_notebooks",
         "get_notebook_summary",
         "list_sources",
         "add_url_source",
@@ -62,12 +69,14 @@ EXPECTED_TOOLS = frozenset(
         "set_notebook_public",
         "list_artifacts",
         "get_artifact",
+        "get_artifact_content",
         "get_note",
         "rename_note",
         "delete_note",
         "wait_source_ready",
         "add_drive",
         "add_file",
+        "check_auth_status",
     }
 )
 
@@ -105,6 +114,7 @@ TOOLS_WITH_NOTEBOOK_ID = frozenset(
         "set_notebook_public",
         "list_artifacts",
         "get_artifact",
+        "get_artifact_content",
         "get_note",
         "rename_note",
         "delete_note",
@@ -126,15 +136,13 @@ def _make_mock_client():
     client.notebooks.create = AsyncMock(return_value=nb)
     client.notebooks.delete = AsyncMock(return_value=True)
     client.notebooks.rename = AsyncMock(
-        side_effect=lambda notebook_id, new_title: MagicMock(
-            id=notebook_id, title=new_title)
+        side_effect=lambda notebook_id, new_title: MagicMock(id=notebook_id, title=new_title)
     )
     topic = MagicMock(question="Sample topic?")
     desc = MagicMock(summary="Notebook summary text", suggested_topics=[topic])
     client.notebooks.get_description = AsyncMock(return_value=desc)
 
-    source = MagicMock(id="src-1", title="Source One",
-                       url="https://example.com/page")
+    source = MagicMock(id="src-1", title="Source One", url="https://example.com/page")
     source.status = SourceStatus.READY
     client.sources.list = AsyncMock(return_value=[source])
     client.sources.add_url = AsyncMock(return_value=source)
@@ -152,26 +160,26 @@ def _make_mock_client():
     client.notes.update = AsyncMock(return_value=None)
     client.notes.delete = AsyncMock(return_value=True)
 
-    task_status = MagicMock(
-        task_id="task-1", status="pending", is_complete=False)
+    task_status = MagicMock(task_id="task-1", status="pending", is_complete=False)
     client.artifacts.generate_audio = AsyncMock(return_value=task_status)
     client.artifacts.generate_video = AsyncMock(return_value=task_status)
-    client.artifacts.generate_cinematic_video = AsyncMock(
-        return_value=task_status)
+    client.artifacts.generate_cinematic_video = AsyncMock(return_value=task_status)
     client.artifacts.generate_report = AsyncMock(return_value=task_status)
     client.artifacts.generate_quiz = AsyncMock(return_value=task_status)
     client.artifacts.generate_flashcards = AsyncMock(return_value=task_status)
     client.artifacts.generate_infographic = AsyncMock(return_value=task_status)
     client.artifacts.generate_slide_deck = AsyncMock(return_value=task_status)
     client.artifacts.generate_data_table = AsyncMock(return_value=task_status)
-    client.artifacts.generate_mind_map = AsyncMock(
-        return_value={"note_id": "mm-1", "mind_map": {}})
+    client.artifacts.generate_mind_map = AsyncMock(return_value={"note_id": "mm-1", "mind_map": {}})
     client.artifacts.poll_status = AsyncMock(return_value=task_status)
-    client.artifacts.export = AsyncMock(
-        return_value={"url": "https://docs.example/exported"})
+    client.artifacts.export = AsyncMock(return_value={"url": "https://docs.example/exported"})
+    client.artifacts.download_report = AsyncMock(return_value=None)
+    client.artifacts.download_quiz = AsyncMock(return_value=None)
+    client.artifacts.download_flashcards = AsyncMock(return_value=None)
+    client.artifacts.download_data_table = AsyncMock(return_value=None)
+    client.artifacts.download_mind_map = AsyncMock(return_value=None)
 
-    client.research.start = AsyncMock(
-        return_value={"task_id": "res-1", "status": "running"})
+    client.research.start = AsyncMock(return_value={"task_id": "res-1", "status": "running"})
     client.research.poll = AsyncMock(
         return_value={
             "task_id": "res-1",
@@ -190,23 +198,20 @@ def _make_mock_client():
             ],
         }
     )
-    client.research.import_sources = AsyncMock(
-        return_value=[{"id": "src-2", "title": "Wiki"}])
+    client.research.import_sources = AsyncMock(return_value=[{"id": "src-2", "title": "Wiki"}])
 
     share_status = ShareStatus(
         notebook_id="nb-1",
         is_public=False,
         access=ShareAccess.RESTRICTED,
         view_level=ShareViewLevel.FULL_NOTEBOOK,
-        shared_users=[SharedUser(
-            email="peer@example.com", permission=SharePermission.VIEWER)],
+        shared_users=[SharedUser(email="peer@example.com", permission=SharePermission.VIEWER)],
         share_url=None,
     )
     client.sharing.get_status = AsyncMock(return_value=share_status)
     client.sharing.set_public = AsyncMock(return_value=share_status)
 
-    studio_art = Artifact(id="art-1", title="Studio A",
-                          _artifact_type=1, status=3)
+    studio_art = Artifact(id="art-1", title="Studio A", _artifact_type=1, status=3)
     client.artifacts.list = AsyncMock(return_value=[studio_art])
     client.artifacts.get = AsyncMock(
         side_effect=lambda _nid, aid: studio_art if aid == "art-1" else None
@@ -247,8 +252,7 @@ class TestToolDiscovery:
         from notebooklm.mcp_server import mcp
 
         tools = await mcp.list_tools()
-        missing_desc = [t.name for t in tools if not (
-            t.description or "").strip()]
+        missing_desc = [t.name for t in tools if not (t.description or "").strip()]
         assert not missing_desc, f"Tools missing descriptions: {missing_desc}"
 
     @pytest.mark.asyncio
@@ -259,8 +263,7 @@ class TestToolDiscovery:
         for tool in tools:
             schema = tool.inputSchema
             assert schema is not None, f"{tool.name}: inputSchema is None"
-            schema_dict = schema.model_dump() if hasattr(
-                schema, "model_dump") else dict(schema)
+            schema_dict = schema.model_dump() if hasattr(schema, "model_dump") else dict(schema)
             assert "properties" in schema_dict, f"{tool.name}: schema missing 'properties'"
 
 
@@ -428,8 +431,7 @@ class TestGetClient:
                     "notebooklm.mcp_server.NotebookLMClient.from_storage",
                     side_effect=FileNotFoundError("no credentials"),
                 ),
-                pytest.raises(
-                    RuntimeError, match="NotebookLM client not ready"),
+                pytest.raises(RuntimeError, match="NotebookLM client not ready"),
             ):
                 await srv.get_client()
         finally:
@@ -487,6 +489,7 @@ class TestToolLogic:
 
         result = await get_notebook_summary("nb-1")
         assert result["notebook_id"] == "nb-1"
+        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
         assert result["summary"] == "Notebook summary text"
         assert isinstance(result["topics"], list)
         assert result["topics"][0]["question"] == "Sample topic?"
@@ -496,7 +499,13 @@ class TestToolLogic:
         from notebooklm.mcp_server import list_sources
 
         result = await list_sources("nb-1")
-        assert result[0]["status"] == "ready"
+        assert result["notebook_id"] == "nb-1"
+        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["count"] == 1
+        assert result["ready_count"] == 1
+        assert result["processing_count"] == 0
+        assert result["error_count"] == 0
+        assert result["sources"][0]["status"] == "ready"
 
     @pytest.mark.asyncio
     async def test_add_url_source_returns_id_and_status(self):
@@ -514,11 +523,46 @@ class TestToolLogic:
         assert result["id"] == "src-1"
 
     @pytest.mark.asyncio
+    async def test_delete_notebook_defaults_to_dry_run(self):
+        from notebooklm.mcp_server import delete_notebook
+
+        result = await delete_notebook("nb-1")
+        assert result["dry_run"] is True
+        assert result["would_delete"]["id"] == "nb-1"
+        assert result["next_action"]["tool"] == "delete_notebook"
+
+    @pytest.mark.asyncio
+    async def test_delete_source_defaults_to_dry_run(self):
+        from notebooklm.mcp_server import delete_source
+
+        result = await delete_source("nb-1", "src-1")
+        assert result["dry_run"] is True
+        assert result["would_delete"]["source_id"] == "src-1"
+        assert result["next_action"]["tool"] == "delete_source"
+
+    @pytest.mark.asyncio
     async def test_poll_artifact_status_returns_status_and_complete_flag(self):
         from notebooklm.mcp_server import poll_artifact_status
 
         result = await poll_artifact_status("nb-1", "task-1")
-        assert result == {"status": "pending", "is_complete": False}
+        assert result["status"] == "pending"
+        assert result["is_complete"] is False
+        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["next_action"]["tool"] == "poll_artifact_status"
+
+    @pytest.mark.asyncio
+    async def test_poll_artifact_status_completed_returns_artifact_metadata(self, patch_client):
+        from notebooklm.mcp_server import poll_artifact_status
+        from notebooklm.types import GenerationStatus
+
+        patch_client.artifacts.poll_status = AsyncMock(
+            return_value=GenerationStatus(task_id="art-1", status="completed")
+        )
+
+        result = await poll_artifact_status("nb-1", "art-1")
+        assert result["status"] == "completed"
+        assert result["artifact"]["id"] == "art-1"
+        assert result["next_action"]["tool"] == "get_artifact_content"
 
     @pytest.mark.asyncio
     async def test_generate_report_returns_task_fields(self):
@@ -527,18 +571,28 @@ class TestToolLogic:
         result = await generate_report("nb-1", format="STUDY_GUIDE")
         assert result["task_id"] == "task-1"
         assert "status" in result
+        assert result["next_action"]["tool"] == "poll_artifact_status"
 
     @pytest.mark.asyncio
-    async def test_run_deep_search_workflow_completes(self, patch_client):
+    async def test_run_deep_search_workflow_returns_early(self, patch_client):
+        # Mock list notebooks to return empty so it creates one
+        from unittest.mock import AsyncMock
+
         from notebooklm.mcp_server import run_deep_search_workflow
 
-        with patch("notebooklm.mcp_server.asyncio.sleep", new_callable=AsyncMock):
-            result = await run_deep_search_workflow("climate tips", "Research NB")
-        assert result["notebook_id"] == "nb-1"
-        assert result["sources_imported"] == 1
-        assert "summary" in result
+        patch_client.notebooks.list = AsyncMock(return_value=[])
+
+        result = await run_deep_search_workflow("climate tips", "Research NB")
+        assert result["status"] == "in_progress"
+        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook"]["id"] == "nb-1"
+        assert result["notebook"]["url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook"]["title"] == "Research NB"
+        assert result["research"]["task_id"] == "res-1"
+        assert result["research"]["query"] == "climate tips"
+        assert result["next_action"]["tool"] == "research_wait_and_import"
+        patch_client.notebooks.create.assert_awaited()
         patch_client.research.start.assert_awaited()
-        patch_client.research.import_sources.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_start_research_returns_task(self):
@@ -551,8 +605,7 @@ class TestToolLogic:
     async def test_start_research_validation_error_dict(self, patch_client):
         from notebooklm.mcp_server import start_research
 
-        patch_client.research.start = AsyncMock(
-            side_effect=ValidationError("bad combo"))
+        patch_client.research.start = AsyncMock(side_effect=ValidationError("bad combo"))
         result = await start_research("nb-1", "q", source="drive", mode="deep")
         assert result.get("error") == "bad combo"
 
@@ -624,7 +677,11 @@ class TestToolLogic:
         from notebooklm.mcp_server import rename_notebook
 
         result = await rename_notebook("nb-1", "New Title")
-        assert result == {"id": "nb-1", "title": "New Title"}
+        assert result == {
+            "id": "nb-1",
+            "title": "New Title",
+            "url": "https://notebooklm.google.com/notebook/nb-1",
+        }
 
     @pytest.mark.asyncio
     async def test_get_share_status_shape(self):
@@ -639,10 +696,13 @@ class TestToolLogic:
     async def test_list_artifacts_returns_kinds(self):
         from notebooklm.mcp_server import list_artifacts
 
-        rows = await list_artifacts("nb-1")
-        assert len(rows) == 1
-        assert rows[0]["id"] == "art-1"
-        assert rows[0]["kind"] == "audio"
+        result = await list_artifacts("nb-1")
+        assert result["notebook_id"] == "nb-1"
+        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["count"] == 1
+        assert result["artifacts"][0]["id"] == "art-1"
+        assert result["artifacts"][0]["kind"] == "audio"
+        assert result["artifacts"][0]["supports_content_retrieval"] is False
 
     @pytest.mark.asyncio
     async def test_get_artifact_found(self):
@@ -657,6 +717,24 @@ class TestToolLogic:
 
         row = await get_artifact("nb-1", "missing")
         assert row.get("error") == "Artifact not found"
+
+    @pytest.mark.asyncio
+    async def test_get_artifact_content_data_table_json(self, patch_client):
+        from notebooklm.mcp_server import get_artifact_content
+
+        artifact = Artifact(id="table-1", title="Table", _artifact_type=9, status=3)
+        patch_client.artifacts.get = AsyncMock(return_value=artifact)
+
+        async def write_csv(_notebook_id, file_path, artifact_id=None):
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("Capability,Pass Criteria\nMCP,Parseable JSON\n")
+
+        patch_client.artifacts.download_data_table = AsyncMock(side_effect=write_csv)
+
+        result = await get_artifact_content("nb-1", "table-1", format="json")
+        assert result["content_format"] == "json"
+        assert result["columns"] == ["Capability", "Pass Criteria"]
+        assert result["rows"][0]["Capability"] == "MCP"
 
     @pytest.mark.asyncio
     async def test_get_note_returns_content(self):
@@ -677,18 +755,53 @@ class TestToolLogic:
     async def test_delete_note(self):
         from notebooklm.mcp_server import delete_note
 
-        assert await delete_note("nb-1", "note-1") is True
+        result = await delete_note("nb-1", "note-1")
+        assert result["dry_run"] is True
+        assert result["would_delete"]["note_id"] == "note-1"
 
     @pytest.mark.asyncio
-    async def test_read_framework_manual_reads_file(self, tmp_path, monkeypatch):
+    async def test_delete_note_confirmed(self, patch_client):
+        from notebooklm.mcp_server import delete_note
+
+        result = await delete_note("nb-1", "note-1", dry_run=False, confirm=True, verify=False)
+        assert result["result"] is True
+        assert result["deleted"]["note_id"] == "note-1"
+        patch_client.notes.delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_read_framework_manual_is_deprecated(self):
         import notebooklm.mcp_server as srv
 
-        ws = tmp_path / "ai_workspace"
-        ws.mkdir()
-        (ws / "master_automation_manual.md").write_text("manual-body", encoding="utf-8")
-        monkeypatch.setattr(srv, "AI_WORKSPACE_DIR", ws)
+        result = await srv.read_framework_manual()
 
-        assert await srv.read_framework_manual() == "manual-body"
+        assert result["deprecated"] is True
+        assert result["next_action"]["tool"] == "ask_framework_manual"
+
+    @pytest.mark.asyncio
+    async def test_ask_framework_manual_requires_config(self, monkeypatch):
+        from notebooklm.mcp_server import ask_framework_manual
+
+        monkeypatch.delenv("NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID", raising=False)
+        result = await ask_framework_manual("How should agents use MCP?")
+        assert result["ok"] is False
+        assert result["error"]["code"] == "FRAMEWORK_NOTEBOOK_NOT_CONFIGURED"
+
+    @pytest.mark.asyncio
+    async def test_ask_framework_manual_uses_framework_notebook(self, patch_client, monkeypatch):
+        from notebooklm.mcp_server import ask_framework_manual
+
+        monkeypatch.setenv("NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID", "framework-nb")
+        patch_client.chat.ask = AsyncMock(return_value=MagicMock(answer="Use next_action."))
+
+        result = await ask_framework_manual("How should agents use MCP?", role="Indy")
+
+        assert result["ok"] is True
+        assert result["notebook_id"] == "framework-nb"
+        assert result["role"] == "Indy"
+        assert result["answer"] == "Use next_action."
+        args, _kwargs = patch_client.chat.ask.call_args
+        assert args[0] == "framework-nb"
+        assert "Indy" in args[1]
 
     @pytest.mark.asyncio
     async def test_ask_question_returns_string(self):
@@ -709,6 +822,15 @@ class TestToolLogic:
         patch_client.chat.ask = AsyncMock(return_value=_NoAnswer())
         result = await srv.ask_question("nb-1", "Anything?")
         assert result == "fallback"
+
+    @pytest.mark.asyncio
+    async def test_ask_question_strict_json_failure_is_structured(self, patch_client):
+        from notebooklm.mcp_server import ask_question
+
+        patch_client.chat.ask = AsyncMock(return_value=MagicMock(answer="not json"))
+        result = await ask_question("nb-1", "Anything?", response_format="json", strict_json=True)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "STRICT_JSON_PARSE_FAILED"
 
 
 # ---------------------------------------------------------------------------
