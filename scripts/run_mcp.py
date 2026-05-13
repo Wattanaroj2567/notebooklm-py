@@ -6,8 +6,9 @@ Usage:
 
 Default listens on 127.0.0.1:8000 so you can expose it safely via ngrok.
 """
-import sys
+
 import os
+import sys
 
 # Add src to path if running from root
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
