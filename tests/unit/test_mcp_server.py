@@ -9,6 +9,7 @@ Tests cover:
 - Representative tool handlers with a mocked NotebookLM client
 """
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,6 +22,22 @@ from notebooklm.types import Artifact, SharedUser, ShareStatus
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _dump_schema(schema: Any) -> dict[str, Any]:
+    """Convert an MCP inputSchema (Pydantic model or plain dict) to a dict.
+
+    MCP library types inputSchema as dict[str, Any], but at runtime it may
+    be a Pydantic model with model_dump().  Using getattr avoids calling
+    .model_dump() on a statically-typed dict and keeps mypy happy.
+    """
+    dump = getattr(schema, "model_dump", None)
+    return dump() if callable(dump) else dict(schema)
+
 
 # Every @mcp.tool in notebooklm.mcp_server.
 EXPECTED_TOOLS = frozenset(
@@ -263,7 +280,7 @@ class TestToolDiscovery:
         for tool in tools:
             schema = tool.inputSchema
             assert schema is not None, f"{tool.name}: inputSchema is None"
-            schema_dict = schema.model_dump() if hasattr(schema, "model_dump") else dict(schema)
+            schema_dict = _dump_schema(schema)
             assert "properties" in schema_dict, f"{tool.name}: schema missing 'properties'"
 
 
@@ -282,11 +299,7 @@ class TestToolSchemas:
 
         for name in TOOLS_WITH_NOTEBOOK_ID:
             tool = tool_map[name]
-            schema_dict = (
-                tool.inputSchema.model_dump()
-                if hasattr(tool.inputSchema, "model_dump")
-                else dict(tool.inputSchema)
-            )
+            schema_dict = _dump_schema(tool.inputSchema)
             props = schema_dict.get("properties", {})
             assert "notebook_id" in props, f"{name}: missing 'notebook_id' in schema"
 
@@ -295,11 +308,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "add_url_source")
-        schema_dict = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )
+        schema_dict = _dump_schema(tool.inputSchema)
         assert "url" in schema_dict.get("properties", {})
 
     @pytest.mark.asyncio
@@ -307,11 +316,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "ask_question")
-        schema_dict = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )
+        schema_dict = _dump_schema(tool.inputSchema)
         assert "question" in schema_dict.get("properties", {})
 
     @pytest.mark.asyncio
@@ -319,11 +324,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "create_note")
-        schema_dict = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )
+        schema_dict = _dump_schema(tool.inputSchema)
         props = schema_dict.get("properties", {})
         assert "title" in props and "content" in props
 
@@ -332,11 +333,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "run_deep_search_workflow")
-        schema_dict = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )
+        schema_dict = _dump_schema(tool.inputSchema)
         props = schema_dict.get("properties", {})
         assert "query" in props and "notebook_title" in props
 
@@ -345,11 +342,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "export_artifact")
-        schema_dict = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )
+        schema_dict = _dump_schema(tool.inputSchema)
         assert "artifact_id" in schema_dict.get("properties", {})
 
     @pytest.mark.asyncio
@@ -357,11 +350,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "start_research")
-        props = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )["properties"]
+        props = _dump_schema(tool.inputSchema)["properties"]
         assert "query" in props
 
     @pytest.mark.asyncio
@@ -369,11 +358,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "import_research_sources")
-        props = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )["properties"]
+        props = _dump_schema(tool.inputSchema)["properties"]
         assert "task_id" in props
 
     @pytest.mark.asyncio
@@ -381,11 +366,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "set_notebook_public")
-        props = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )["properties"]
+        props = _dump_schema(tool.inputSchema)["properties"]
         assert "public" in props
 
     @pytest.mark.asyncio
@@ -393,11 +374,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "get_artifact")
-        props = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )["properties"]
+        props = _dump_schema(tool.inputSchema)["properties"]
         assert "artifact_id" in props
 
     @pytest.mark.asyncio
@@ -405,11 +382,7 @@ class TestToolSchemas:
         from notebooklm.mcp_server import mcp
 
         tool = next(t for t in await mcp.list_tools() if t.name == "rename_note")
-        props = (
-            tool.inputSchema.model_dump()
-            if hasattr(tool.inputSchema, "model_dump")
-            else dict(tool.inputSchema)
-        )["properties"]
+        props = _dump_schema(tool.inputSchema)["properties"]
         assert "new_title" in props
 
 
