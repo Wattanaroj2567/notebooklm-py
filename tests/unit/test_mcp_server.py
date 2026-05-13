@@ -32,11 +32,14 @@ def _dump_schema(schema: Any) -> dict[str, Any]:
     """Convert an MCP inputSchema (Pydantic model or plain dict) to a dict.
 
     MCP library types inputSchema as dict[str, Any], but at runtime it may
-    be a Pydantic model with model_dump().  Using getattr avoids calling
-    .model_dump() on a statically-typed dict and keeps mypy happy.
+    be a Pydantic model with model_dump().  Accessing attributes through
+    hasattr + direct call on an Any-typed variable lets mypy infer Any
+    (assignable to dict[str, Any]) rather than the object | None union
+    that getattr() with a default produces.
     """
-    dump = getattr(schema, "model_dump", None)
-    return dump() if callable(dump) else dict(schema)
+    if hasattr(schema, "model_dump"):
+        return schema.model_dump()  # schema is Any; Any return is assignable to dict[str, Any]
+    return dict(schema)
 
 
 # Every @mcp.tool in notebooklm.mcp_server.
