@@ -35,13 +35,11 @@ Before chatting or generating content, ensure all sources are `ready`.
 - **Timeouts:** If a `wait` command times out (Exit Code 2), check the status with `artifact list` before deciding next steps.
 - **Auth Issues:** If commands fail with auth errors, run `notebooklm auth check` and if needed, inform the user to run `notebooklm login`.
 
-## AI Workspace
+## Framework Notebook
 
-- **Location:** `ai_workspace/`
-- **Internal Tools:**
-    - `run_ai_team.py`: Main automation script for research workflows.
-    - `master_automation_manual.md`: Core strategy and setup guide.
-- **Usage:** When running internal automation, prefer using tools from this directory to keep the root clean.
+- **Source of truth:** Use the NotebookLM Framework Notebook configured by `NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID`.
+- **MCP usage:** Ask role and workflow questions through `ask_framework_manual`; do not depend on local framework files for new automation.
+- **Subagents:** Treat role names as capabilities that can read from NotebookLM: Minnie for planning, Reas for synthesis, Vera for verification, Indy for orchestration, Day for writing, Chris for technical implementation.
 
 ## Naming & Style
 - Follow the commit message style: `feat(cli): ...`, `fix(cli): ...`, `refactor(test): ...`.
