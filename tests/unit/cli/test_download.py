@@ -1,5 +1,6 @@
 """Tests for download CLI commands."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -389,6 +390,42 @@ class TestDownloadFlags:
 
             # File should remain unchanged
             assert output_file.read_bytes() == b"existing content"
+
+
+# =============================================================================
+# JSON OUTPUT UNICODE TESTS
+# =============================================================================
+
+
+class TestDownloadJsonOutputUnicode:
+    def test_download_json_output_preserves_unicode(self, runner, mock_auth):
+        """`download <type> --json` should emit CJK / emoji as real UTF-8, not \\uXXXX."""
+        fake_result = {
+            "artifact_id": "audio_123",
+            "title": "中文音频 🎧",
+            "output_path": "音频.mp3",
+        }
+
+        async def fake_download_generic(*args, **kwargs):
+            return fake_result
+
+        with (
+            patch.object(download_module, "_download_artifacts_generic", fake_download_generic),
+            patch(
+                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch,
+        ):
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["title"] == "中文音频 🎧"
+        assert data["output_path"] == "音频.mp3"
+        # Raw output must contain real CJK/emoji, not escaped sequences.
+        assert "中文音频" in result.output
+        assert "🎧" in result.output
+        assert "\\u" not in result.output
 
 
 # =============================================================================
@@ -856,3 +893,936 @@ class TestDownloadErrorHandling:
         assert result.exit_code != 0
         # Should mention no match found or available artifacts
         assert "No artifact" in result.output or "nonexistent" in result.output.lower()
+
+
+# =============================================================================
+# DOWNLOAD QUIZ + FLASHCARDS STANDARD-FLAG TESTS (P2.T4)
+# =============================================================================
+
+
+def make_quiz_artifact(
+    id: str, title: str, status: int = 3, created_at: datetime | None = None
+) -> Artifact:
+    """Quiz artifact factory: type=4 + variant=2 → ArtifactType.QUIZ."""
+    return Artifact(
+        id=id,
+        title=title,
+        _artifact_type=4,
+        status=status,
+        created_at=created_at or datetime.fromtimestamp(1234567890),
+        _variant=2,
+    )
+
+
+def make_flashcard_artifact(
+    id: str, title: str, status: int = 3, created_at: datetime | None = None
+) -> Artifact:
+    """Flashcard artifact factory: type=4 + variant=1 → ArtifactType.FLASHCARDS."""
+    return Artifact(
+        id=id,
+        title=title,
+        _artifact_type=4,
+        status=status,
+        created_at=created_at or datetime.fromtimestamp(1234567890),
+        _variant=1,
+    )
+
+
+class TestDownloadQuizStandardFlags:
+    """Smoke tests for the standard flag set on `download quiz` (P2.T4)."""
+
+    def test_quiz_help_lists_full_flag_set(self, runner):
+        """Each flag from the standard download flag set must appear in --help."""
+        result = runner.invoke(cli, ["download", "quiz", "--help"])
+        assert result.exit_code == 0
+        for flag in (
+            "--latest",
+            "--earliest",
+            "--all",
+            "--name",
+            "--artifact",
+            "--json",
+            "--dry-run",
+            "--force",
+            "--no-clobber",
+            "--format",
+        ):
+            assert flag in result.output, f"missing flag in `download quiz --help`: {flag}"
+
+    def test_quiz_basic_download_writes_file(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """Single-artifact download writes the file via the dispatched API call."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text('{"questions": []}')
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Chapter 1 Quiz")]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(cli, ["download", "quiz", str(output_file), "-n", "nb_123"])
+
+        assert result.exit_code == 0, result.output
+        assert output_file.exists()
+
+    def test_quiz_latest_flag_selects_newest(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """--latest picks the newest completed quiz artifact."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+            chosen_ids: list[str | None] = []
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                chosen_ids.append(artifact_id)
+                Path(output_path).write_text("{}")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[
+                    make_quiz_artifact(
+                        "quiz_old", "Old", created_at=datetime.fromtimestamp(1000000000)
+                    ),
+                    make_quiz_artifact(
+                        "quiz_new", "New", created_at=datetime.fromtimestamp(2000000000)
+                    ),
+                ]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--latest", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert chosen_ids == ["quiz_new"]
+
+    def test_quiz_earliest_flag_selects_oldest(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--earliest picks the oldest completed quiz artifact."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+            chosen_ids: list[str | None] = []
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                chosen_ids.append(artifact_id)
+                Path(output_path).write_text("{}")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[
+                    make_quiz_artifact(
+                        "quiz_old", "Old", created_at=datetime.fromtimestamp(1000000000)
+                    ),
+                    make_quiz_artifact(
+                        "quiz_new", "New", created_at=datetime.fromtimestamp(2000000000)
+                    ),
+                ]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--earliest", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert chosen_ids == ["quiz_old"]
+
+    def test_quiz_name_filter(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """--name picks the artifact whose title fuzzy-matches."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+            chosen_ids: list[str | None] = []
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                chosen_ids.append(artifact_id)
+                Path(output_path).write_text("{}")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[
+                    make_quiz_artifact("quiz_a", "Chapter 1 Basics"),
+                    make_quiz_artifact("quiz_b", "Final Exam Review"),
+                ]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--name", "Final", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert chosen_ids == ["quiz_b"]
+
+    def test_quiz_dry_run_does_not_download(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """--dry-run shows preview without invoking the API."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+            api_calls: list[str] = []
+
+            async def fake_download_quiz(*args, **kwargs):
+                api_calls.append("called")
+                return ""
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Quiz One")]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--dry-run", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "DRY RUN" in result.output
+        assert api_calls == []  # No actual download
+        assert not output_file.exists()
+
+    def test_quiz_all_flag_downloads_each(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """--all batch-downloads every completed quiz to the target directory."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_dir = tmp_path / "quizzes"
+            downloaded: list[str | None] = []
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                downloaded.append(artifact_id)
+                Path(output_path).write_text('{"q": []}')
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[
+                    make_quiz_artifact("quiz_1", "First Quiz"),
+                    make_quiz_artifact("quiz_2", "Second Quiz"),
+                ]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", "--all", str(output_dir), "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert sorted(downloaded) == ["quiz_1", "quiz_2"]
+        assert len(list(output_dir.glob("*.json"))) == 2
+
+    def test_quiz_force_overwrites_existing_file(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--force overwrites a file that already exists at output_path."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+            output_file.write_text("OLD")
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text("NEW")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Quiz One")]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--force", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert output_file.read_text() == "NEW"
+
+    def test_quiz_no_clobber_skips_existing_file(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--no-clobber leaves an existing file untouched."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+            output_file.write_text("EXISTING")
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text("OVERWROTE")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Quiz One")]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--no-clobber", "-n", "nb_123"],
+            )
+
+        # File untouched
+        assert output_file.read_text() == "EXISTING"
+
+    def test_quiz_force_and_no_clobber_conflict(self, runner, mock_auth, mock_fetch_tokens):
+        """--force + --no-clobber must fail with a clear message."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Quiz")]
+            )
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", "--force", "--no-clobber", "-n", "nb_123"],
+            )
+
+        assert result.exit_code != 0
+        assert "Cannot specify both --force and --no-clobber" in result.output
+
+    def test_quiz_json_output_emits_json(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """--json emits a parseable JSON document on success."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.json"
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text("{}")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Quiz One")]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "quiz", str(output_file), "--json", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["operation"] == "download_single"
+        assert data["status"] == "downloaded"
+        assert data["artifact"]["id"] == "quiz_1"
+
+    def test_quiz_format_markdown_passes_through_to_api(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--format markdown propagates output_format='markdown' to the API."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "quiz.md"
+            captured: dict[str, str] = {}
+
+            async def fake_download_quiz(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                captured["output_format"] = output_format
+                Path(output_path).write_text("# Quiz")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_quiz_artifact("quiz_1", "Quiz One")]
+            )
+            mock_client.artifacts.download_quiz = fake_download_quiz
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                [
+                    "download",
+                    "quiz",
+                    str(output_file),
+                    "--format",
+                    "markdown",
+                    "-n",
+                    "nb_123",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["output_format"] == "markdown"
+
+
+class TestDownloadFlashcardsStandardFlags:
+    """Smoke tests for the standard flag set on `download flashcards` (P2.T4)."""
+
+    def test_flashcards_help_lists_full_flag_set(self, runner):
+        """Each flag from the standard download flag set must appear in --help."""
+        result = runner.invoke(cli, ["download", "flashcards", "--help"])
+        assert result.exit_code == 0
+        for flag in (
+            "--latest",
+            "--earliest",
+            "--all",
+            "--name",
+            "--artifact",
+            "--json",
+            "--dry-run",
+            "--force",
+            "--no-clobber",
+            "--format",
+        ):
+            assert flag in result.output, f"missing flag in `download flashcards --help`: {flag}"
+
+    def test_flashcards_basic_download_writes_file(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """Single-artifact download writes the file via the dispatched API call."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.json"
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text('{"cards": []}')
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_flashcard_artifact("fc_1", "Vocabulary Deck")]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli, ["download", "flashcards", str(output_file), "-n", "nb_123"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert output_file.exists()
+
+    def test_flashcards_all_flag_downloads_each(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--all batch-downloads every completed deck to the target directory."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_dir = tmp_path / "flashcards"
+            downloaded: list[str | None] = []
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                downloaded.append(artifact_id)
+                Path(output_path).write_text('{"cards": []}')
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[
+                    make_flashcard_artifact("fc_1", "Deck A"),
+                    make_flashcard_artifact("fc_2", "Deck B"),
+                ]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "flashcards", "--all", str(output_dir), "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert sorted(downloaded) == ["fc_1", "fc_2"]
+        assert len(list(output_dir.glob("*.json"))) == 2
+
+    def test_flashcards_dry_run_does_not_download(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--dry-run shows preview without invoking the API."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.json"
+            api_calls: list[str] = []
+
+            async def fake_download_flashcards(*args, **kwargs):
+                api_calls.append("called")
+                return ""
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_flashcard_artifact("fc_1", "Deck One")]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "flashcards", str(output_file), "--dry-run", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "DRY RUN" in result.output
+        assert api_calls == []
+        assert not output_file.exists()
+
+    def test_flashcards_force_overwrites_existing_file(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--force overwrites a file that already exists at output_path."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.json"
+            output_file.write_text("OLD")
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text("NEW")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_flashcard_artifact("fc_1", "Deck One")]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "flashcards", str(output_file), "--force", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert output_file.read_text() == "NEW"
+
+    def test_flashcards_no_clobber_skips_existing_file(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--no-clobber leaves an existing file untouched."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.json"
+            output_file.write_text("EXISTING")
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text("OVERWROTE")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_flashcard_artifact("fc_1", "Deck One")]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            runner.invoke(
+                cli,
+                ["download", "flashcards", str(output_file), "--no-clobber", "-n", "nb_123"],
+            )
+
+        assert output_file.read_text() == "EXISTING"
+
+    def test_flashcards_json_output_emits_json(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--json emits a parseable JSON document on success."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.json"
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                Path(output_path).write_text("{}")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_flashcard_artifact("fc_1", "Deck One")]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                ["download", "flashcards", str(output_file), "--json", "-n", "nb_123"],
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["operation"] == "download_single"
+        assert data["status"] == "downloaded"
+        assert data["artifact"]["id"] == "fc_1"
+
+    def test_flashcards_format_html_passes_through_to_api(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """--format html propagates output_format='html' to the API."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.html"
+            captured: dict[str, str] = {}
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                captured["output_format"] = output_format
+                Path(output_path).write_text("<html></html>")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_flashcard_artifact("fc_1", "Deck One")]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                [
+                    "download",
+                    "flashcards",
+                    str(output_file),
+                    "--format",
+                    "html",
+                    "-n",
+                    "nb_123",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["output_format"] == "html"
+
+    def test_flashcards_artifact_id_selects_specific(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        """-a/--artifact selects a specific deck by ID (partial-match resolution)."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "cards.json"
+            chosen_ids: list[str | None] = []
+
+            async def fake_download_flashcards(
+                notebook_id, output_path, artifact_id=None, output_format="json"
+            ):
+                chosen_ids.append(artifact_id)
+                Path(output_path).write_text("{}")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[
+                    make_flashcard_artifact("fc_aaa111", "Deck A"),
+                    make_flashcard_artifact("fc_bbb222", "Deck B"),
+                ]
+            )
+            mock_client.artifacts.download_flashcards = fake_download_flashcards
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli,
+                [
+                    "download",
+                    "flashcards",
+                    str(output_file),
+                    "-a",
+                    "fc_bbb",
+                    "-n",
+                    "nb_123",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert chosen_ids == ["fc_bbb222"]
+
+
+# =============================================================================
+# DOWNLOAD TYPED ERROR PATH TESTS (P3.T2 / I14)
+# =============================================================================
+#
+# These tests pin the contract that `download <type>` exception paths route
+# through `cli.error_handler` (the typed handler) rather than the legacy
+# `helpers.handle_error()` shim that always exits 1 with a text-only message
+# regardless of `--json`. The handler is invoked from
+# `_run_artifact_download` and applies to every `download` subcommand
+# (audio/video/slide-deck/...); we exercise `download audio` as a
+# representative because the dispatch is shared.
+#
+# Contract under test (audit row I14, error_handler.py):
+#   - --json honored on the exception path: emits a JSON envelope of shape
+#     {"error": true, "code": "<TYPED_CODE>", "message": "..."} on stdout.
+#   - RateLimitError surfaces `retry_after` in the JSON body and "Retry after
+#     <N>s" in text mode.
+#   - AuthError surfaces a re-authentication hint
+#     ("Run 'notebooklm login' to re-authenticate.") in text mode.
+#   - Typed exit codes from error_handler.py:64-67:
+#       1 = library/user error (RateLimit, Auth, Validation, Network, ...)
+#       2 = unexpected/system error (anything else)
+# =============================================================================
+
+
+class TestDownloadTypedErrorPath:
+    """`download <type>` exception paths route through the typed handler."""
+
+    def _list_raises(self, exc: Exception):
+        """Build a mock client whose `artifacts.list` raises ``exc``.
+
+        The exception fires at the first awaited call inside
+        ``_download_artifacts_generic``, which surfaces directly to the outer
+        ``_run_artifact_download`` exception handler — the exact site under
+        test for I14. The single-download / --all per-artifact try/except
+        blocks deliberately swallow API errors into ``{"error": ...}`` rows;
+        forcing the failure on ``list`` exercises the *typed* handler path.
+        """
+        client = create_mock_client()
+        client.artifacts.list = AsyncMock(side_effect=exc)
+        return client
+
+    # ----- RateLimitError --------------------------------------------------
+
+    def test_rate_limit_error_text_exit_code_1(self, runner, mock_auth, mock_fetch_tokens):
+        """RateLimitError surfaces as exit 1 with retry hint in text mode."""
+        from notebooklm.exceptions import RateLimitError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(
+                RateLimitError("Quota exceeded", retry_after=42)
+            )
+            result = runner.invoke(cli, ["download", "audio", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        # Text-mode message routes through error_handler._output_error → safe_echo
+        # to stderr, which CliRunner mixes into result.output.
+        assert "Rate limited" in result.output
+        assert "42" in result.output  # retry_after surfaced
+
+    def test_rate_limit_error_json_includes_retry_after(self, runner, mock_auth, mock_fetch_tokens):
+        """`--json` emits a typed JSON error envelope with retry_after."""
+        from notebooklm.exceptions import RateLimitError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(
+                RateLimitError("Quota exceeded", retry_after=42)
+            )
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "RATE_LIMITED"
+        assert data["retry_after"] == 42
+        assert "Rate limited" in data["message"]
+
+    def test_rate_limit_error_json_no_retry_after_omits_field(
+        self, runner, mock_auth, mock_fetch_tokens
+    ):
+        """No retry_after on the exception → field absent from JSON."""
+        from notebooklm.exceptions import RateLimitError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(RateLimitError("Quota exceeded"))
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["code"] == "RATE_LIMITED"
+        assert "retry_after" not in data
+
+    # ----- AuthError -------------------------------------------------------
+
+    def test_auth_error_text_includes_login_hint(self, runner, mock_auth, mock_fetch_tokens):
+        """AuthError on the download path shows the typed re-auth hint."""
+        from notebooklm.exceptions import AuthError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(AuthError("Token expired"))
+            result = runner.invoke(cli, ["download", "audio", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        assert "Authentication error" in result.output
+        # error_handler.py ships this exact hint for AuthError.
+        assert "notebooklm login" in result.output
+
+    def test_auth_error_json_emits_typed_code(self, runner, mock_auth, mock_fetch_tokens):
+        """`--json` emits {"error": true, "code": "AUTH_ERROR", ...} for AuthError."""
+        from notebooklm.exceptions import AuthError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(AuthError("Token expired"))
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "AUTH_ERROR"
+        assert "Token expired" in data["message"]
+
+    # ----- Unexpected exceptions (typed exit code 2) ------------------------
+
+    def test_unexpected_exception_exits_with_code_2(self, runner, mock_auth, mock_fetch_tokens):
+        """Unknown exceptions exit 2 per error_handler.py:64-67 policy."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(RuntimeError("kaboom"))
+            result = runner.invoke(cli, ["download", "audio", "-n", "nb_123"])
+
+        # Legacy helpers.handle_error always exited 1; the typed handler must
+        # distinguish user errors (1) from system bugs (2).
+        assert result.exit_code == 2, result.output
+        assert "Unexpected error" in result.output
+
+    def test_unexpected_exception_json_envelope(self, runner, mock_auth, mock_fetch_tokens):
+        """`--json` emits {"code": "UNEXPECTED_ERROR"} with exit 2."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(RuntimeError("kaboom"))
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 2, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "UNEXPECTED_ERROR"
+        assert "kaboom" in data["message"]
+
+    # ----- ValidationError / NetworkError sanity (typed dispatch) ----------
+
+    def test_validation_error_typed_envelope(self, runner, mock_auth, mock_fetch_tokens):
+        """ValidationError reaches the typed handler with its own code."""
+        from notebooklm.exceptions import ValidationError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(ValidationError("bad input"))
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["code"] == "VALIDATION_ERROR"
+
+    def test_network_error_typed_envelope(self, runner, mock_auth, mock_fetch_tokens):
+        """NetworkError reaches the typed handler and surfaces its hint in text."""
+        from notebooklm.exceptions import NetworkError
+
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client_cls.return_value = self._list_raises(NetworkError("DNS down"))
+            text_result = runner.invoke(cli, ["download", "audio", "-n", "nb_123"])
+
+        assert text_result.exit_code == 1, text_result.output
+        assert "Network error" in text_result.output
+        assert "internet connection" in text_result.output  # error_handler hint
+
+    # ----- JSON happy-path preservation (must not regress P2.T4 shape) -----
+
+    def test_json_happy_path_shape_unchanged(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
+        """The JSON happy-path envelope is preserved (operation/status/...)."""
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            output_file = tmp_path / "audio.mp3"
+
+            async def fake_download_audio(notebook_id, output_path, artifact_id=None):
+                Path(output_path).write_bytes(b"hello")
+                return output_path
+
+            mock_client.artifacts.list = AsyncMock(
+                return_value=[make_artifact("audio_happy", "Happy Audio", 1)]
+            )
+            mock_client.artifacts.download_audio = fake_download_audio
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(
+                cli, ["download", "audio", str(output_file), "--json", "-n", "nb_123"]
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["operation"] == "download_single"
+        assert data["status"] == "downloaded"
+        assert data["artifact"]["id"] == "audio_happy"
+        # Make sure we did NOT add an "error" envelope on the happy path.
+        assert "error" not in data
+        assert "code" not in data
+
+    def test_json_returned_error_envelope_unchanged_exit_1(
+        self, runner, mock_auth, mock_fetch_tokens
+    ):
+        """The pre-existing "no completed artifacts" → JSON {"error": "..."} + exit 1
+        path (download.py:709-710) is preserved by the typed-handler refactor.
+
+        That branch surfaces a *returned* dict-shaped error from
+        ``_download_artifacts_generic`` (not a raised exception), so it must
+        NOT be re-routed through the typed handler — exit 1 with the legacy
+        ``error: "<msg>"`` JSON shape is the documented behavior.
+        """
+        with patch_client_for_module("download") as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.artifacts.list = AsyncMock(return_value=[])
+            mock_client_cls.return_value = mock_client
+
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        # Legacy returned-dict shape: free-form "error" string, no "code" envelope.
+        assert "error" in data
+        assert "No completed audio artifacts" in data["error"]
+
+    # ----- Missing-storage auth bootstrap (regression guard) ---------------
+
+    def test_missing_storage_routes_to_auth_error_exit_1(self, runner):
+        """A missing ``storage_state.json`` exits 1 via ``handle_auth_error``.
+
+        Regression guard for the integration-test failure that surfaced after
+        the typed-handler swap: ``AuthTokens.from_storage`` raises
+        ``FileNotFoundError`` when no auth file exists, and the typed handler
+        would otherwise classify it as ``UNEXPECTED_ERROR`` (exit 2). The
+        canonical ``with_client`` decorator catches this exact case and routes
+        it through ``handle_auth_error`` — ``download`` must do the same so
+        ``tests/integration/cli_vcr/test_downloads.py`` (which asserts
+        ``exit_code in (0, 1)`` for unauth invocations) keeps passing.
+        """
+        from notebooklm.auth import AuthTokens
+
+        with patch.object(AuthTokens, "from_storage", new_callable=AsyncMock) as mock_from_storage:
+            mock_from_storage.side_effect = FileNotFoundError(
+                "Storage file not found: /tmp/missing/storage_state.json"
+            )
+            result = runner.invoke(cli, ["download", "audio", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        # Rich auth UX (from handle_auth_error) — the literal "Not logged in"
+        # header plus the "notebooklm login" remediation hint.
+        assert "Not logged in" in result.output
+        assert "notebooklm login" in result.output
+
+    def test_missing_storage_json_emits_auth_required_envelope(self, runner):
+        """Missing storage in --json mode emits AUTH_REQUIRED envelope, exit 1."""
+        from notebooklm.auth import AuthTokens
+
+        with patch.object(AuthTokens, "from_storage", new_callable=AsyncMock) as mock_from_storage:
+            mock_from_storage.side_effect = FileNotFoundError("Storage file not found")
+            result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
+
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        # `helpers.json_error_response` ships shape:
+        # {"error": True, "code": "AUTH_REQUIRED", "message": "...", ...}
+        assert data["error"] is True
+        assert data["code"] == "AUTH_REQUIRED"
+        assert "notebooklm login" in data["message"]

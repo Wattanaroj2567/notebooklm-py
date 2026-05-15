@@ -1,7 +1,7 @@
 # Python API Reference
 
 **Status:** Active
-**Last Updated:** 2026-03-12
+**Last Updated:** 2026-05-15
 
 Complete reference for the `notebooklm` Python library.
 
@@ -42,6 +42,27 @@ asyncio.run(main())
 
 ## Core Concepts
 
+### Concurrency model
+
+`NotebookLMClient` is **async re-entrant on a single event loop**. You can freely await multiple operations concurrently via `asyncio.gather` or `asyncio.TaskGroup`:
+
+```python
+notebooks, sources = await asyncio.gather(
+    client.notebooks.list(),
+    client.sources.list(notebook_id),
+)
+```
+
+The client is **not thread-safe**. Do not share a `NotebookLMClient` across threads or across multiple event loops. Create one client per loop.
+
+#### Behavior under concurrent token refresh
+
+The current implementation does not snapshot auth state at the start of each RPC. If a token refresh completes while an RPC is in flight, the in-flight call may observe a mix of pre-refresh and post-refresh credentials between its URL build (`_build_url`), body build (`build_request_body`), and HTTP send (`_http_client.post`). The typical visible symptom is a 401 that triggers a retry — which the client handles transparently.
+
+A consistent `(csrf_token, session_id, cookies)` snapshot per `rpc_call` is planned for a later phase of the remediation work; the snapshot will eliminate the mixed-credential window. Until then, treat the auth-refresh path as best-effort: concurrent RPCs across a refresh boundary may individually fail and retry, but state will not become silently corrupted.
+
+If we ever provide thread-safety, it will be a versioned, opt-in API change. Do not assume it.
+
 ### Async Context Manager
 
 The client must be used as an async context manager to properly manage HTTP connections:
@@ -81,13 +102,13 @@ auth = AuthTokens(
 )
 client = NotebookLMClient(auth)
 
-# AuthTokens also supports profiles
-auth = AuthTokens.from_storage(profile="work")
+# AuthTokens also supports profiles (from_storage is async)
+auth = await AuthTokens.from_storage(profile="work")
 ```
 
 **Building a storage state from existing browser cookies (`[cookies]` extra):**
 
-Install with the optional `cookies` extra to pull cookies from a locally installed browser via [rookiepy](https://pypi.org/project/rookiepy/) — useful for headless environments where you cannot run Playwright:
+Install with the optional `cookies` extra to pull cookies from a locally installed browser via [rookiepy](https://pypi.org/project/rookiepy/) — useful for headless environments where you cannot run Playwright (full extras matrix: [docs/installation.md#optional-extras-matrix](installation.md#optional-extras-matrix)):
 
 ```bash
 pip install "notebooklm-py[cookies]"
@@ -98,10 +119,15 @@ import json
 import os
 import rookiepy
 from notebooklm import NotebookLMClient
-from notebooklm.auth import convert_rookiepy_cookies_to_storage_state
+from notebooklm.auth import (
+    REQUIRED_COOKIE_DOMAINS,
+    convert_rookiepy_cookies_to_storage_state,
+)
 
-# Pull Google cookies from Chrome (or .firefox(), .edge(), .safari(), .load() for auto-detect)
-raw = rookiepy.chrome(domains=[".google.com", "notebooklm.google.com"])
+# Pull Google cookies from Chrome (or .firefox(), .edge(), .safari(), .load() for auto-detect).
+# REQUIRED_COOKIE_DOMAINS mirrors the CLI's extraction set so rotation, media
+# downloads, and Drive flows all have the cookies they need.
+raw = rookiepy.chrome(domains=list(REQUIRED_COOKIE_DOMAINS))
 storage_state = convert_rookiepy_cookies_to_storage_state(raw)
 
 # Persist for future runs; restrict to owner-only on POSIX since this file holds auth cookies
@@ -115,7 +141,26 @@ async with await NotebookLMClient.from_storage(storage_path) as client:
     notebooks = await client.notebooks.list()
 ```
 
-The helper converts the cookie list returned by `rookiepy` into the storage-state format `NotebookLMClient.from_storage()` expects — the actual cookie extraction (and Google-account selection) happens in the `rookiepy.<browser>(...)` call. As a result, the storage state reflects whichever Google account is currently active in the source browser on `google.com` / `notebooklm.google.com`. The CLI equivalent is `notebooklm login --browser-cookies <browser>`.
+`convert_rookiepy_cookies_to_storage_state(rookiepy_cookies)` converts the
+cookie list returned by `rookiepy` into the storage-state format
+`NotebookLMClient.from_storage()` expects:
+
+- **Key remap:** `http_only` → `httpOnly`, `expires=None` →
+  `expires=-1` (Playwright's session-cookie convention), `sameSite="None"`.
+- **Filtering:** cookies missing `name`/`value`/`domain`, or from domains
+  outside the auth allowlist (regional Google ccTLDs + `REQUIRED_COOKIE_DOMAINS`
+  ∪ `OPTIONAL_COOKIE_DOMAINS`), are silently skipped.
+- **Return:** `{"cookies": [...], "origins": []}` — drop straight into
+  `storage_state.json`.
+
+Cookie extraction (and Google-account selection) happens in the
+`rookiepy.<browser>(...)` call: the storage state reflects whichever Google
+account is currently active in the source browser. To pick up cookies for
+optional surfaces (YouTube, Docs, MyAccount, Mail), extend the rookiepy
+`domains=` argument with `OPTIONAL_COOKIE_DOMAINS` (or a label-specific
+subset via `OPTIONAL_COOKIE_DOMAINS_BY_LABEL`) — both imported from
+`notebooklm.auth` alongside `REQUIRED_COOKIE_DOMAINS`. The CLI equivalent
+is `notebooklm login --browser-cookies <browser> [--include-domains youtube,docs,...]`.
 
 **Environment Variable Support:**
 
@@ -184,6 +229,32 @@ async with await NotebookLMClient.from_storage() as client:
 
 **Note:** If your session cookies have fully expired (not just CSRF tokens), you'll need to re-run `notebooklm login`.
 
+### Idempotency
+
+**Probe-then-retry for create operations.** When a network or server error (5xx / 429 / connection drop) interrupts a create call, the client surfaces the failure immediately rather than blindly retrying. For the methods listed below, the client then probes the server to discover whether the resource was already created before attempting a retry. This prevents duplicate resources when the server accepted the request but the response was lost in transit. The probe runs automatically — no opt-in keyword is required.
+
+The following methods are idempotent under retry:
+
+| Method | Probe |
+|---|---|
+| `client.notebooks.create(title)` | Snapshot notebook IDs *before*, list *after* a transport failure, return the single new notebook with the matching title (or raise on ambiguity). |
+| `client.sources.add_url(notebook_id, url)` | List the notebook's sources, return the existing source whose `url` exactly matches. |
+| `client.sources.add_url(notebook_id, youtube_url)` | Same probe via canonical YouTube URL. |
+
+`client.sources.add_text(notebook_id, title, content)` is **not** retry-safe: text sources lack a reliable server-side dedupe key (titles aren't unique; content isn't exposed in the source list). The default behavior is unchanged from previous releases. If you want explicit failure rather than possible silent duplication on retry, opt in:
+
+```python
+from notebooklm import NonIdempotentRetryError
+
+try:
+    await client.sources.add_text(nb_id, "Title", "Content", idempotent=True)
+except NonIdempotentRetryError:
+    # Embed a UUID in the title and dedupe client-side instead.
+    ...
+```
+
+`client.sources.add_file(...)` and `client.sources.add_drive(...)` are not yet covered by the probe-then-retry wrapper — a transport failure during these calls may produce a duplicate source on retry. Tracked as a separate fix.
+
 ---
 
 ## API Reference
@@ -196,7 +267,7 @@ Main client class providing access to all APIs.
 class NotebookLMClient:
     notebooks: NotebooksAPI    # Notebook operations
     sources: SourcesAPI        # Source management
-    artifacts: ArtifactsAPI    # AI-generated content
+    artifacts: ArtifactsAPI    # Artifact operations (audio, video, reports, etc.)
     chat: ChatAPI              # Conversations
     research: ResearchAPI      # Web/Drive research
     notes: NotesAPI            # User notes
@@ -211,6 +282,9 @@ class NotebookLMClient:
         profile: str | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = 60.0,
+        rate_limit_max_retries: int = 0,
+        server_error_max_retries: int = 3,
+        limits: ConnectionLimits | None = None,
     ) -> "NotebookLMClient"
 
     def __init__(
@@ -218,6 +292,9 @@ class NotebookLMClient:
         storage_path: Path | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = 60.0,
+        rate_limit_max_retries: int = 0,
+        server_error_max_retries: int = 3,
+        limits: ConnectionLimits | None = None,
     )
 
     async def refresh_auth(self) -> AuthTokens
@@ -232,9 +309,40 @@ by default (`keepalive=None`). Values below `keepalive_min_interval` (default
 / unattended use](troubleshooting.md#cookie-freshness-for-long-running--unattended-use)
 for the full layered story.
 
+**Retry behavior:** the client retries transient failures transparently.
+
+- `server_error_max_retries` (default `3`) retries HTTP 5xx and network-layer
+  `httpx.RequestError` (timeouts, connect errors) with exponential backoff
+  capped at 30 seconds (`min(2 ** attempt, 30)`, plus ±20% jitter to
+  desynchronize concurrent retries). Set to `0` to disable.
+- `rate_limit_max_retries` (default `0`) retries HTTP 429 responses when the
+  `Retry-After` header is parseable. The default of `0` preserves the
+  pre-Phase-3 contract of raising `RateLimitError` immediately so callers
+  can implement their own back-off policy; bump to a positive value to opt
+  into automatic retry.
+- `limits` accepts a `ConnectionLimits` dataclass to tune the underlying
+  `httpx` connection pool. The default (`ConnectionLimits()`) sets
+  `max_connections=100`, `max_keepalive_connections=50`,
+  `keepalive_expiry=30.0` — sized for typical batchexecute fan-out. Widen
+  for heavy concurrent workloads such as FastAPI/Django services that share
+  one client across many requests.
+
+```python
+from notebooklm import ConnectionLimits, NotebookLMClient
+
+# Allow up to 3 retries on rate limits, widen the pool for a heavy worker
+async with await NotebookLMClient.from_storage(
+    rate_limit_max_retries=3,
+    limits=ConnectionLimits(max_connections=200, max_keepalive_connections=100),
+) as client:
+    ...
+```
+
 ---
 
 ### NotebooksAPI (`client.notebooks`)
+
+**CLI equivalent:** [Notebook Commands](cli-reference.md#notebook-commands) — `notebooklm list`, `create`, `delete`, `rename`, `summary`.
 
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
@@ -277,7 +385,7 @@ metadata = await client.notebooks.get_metadata(nb.id)
 print(metadata.title)
 
 # Enable public sharing and fetch the URL
-await client.notebooks.share(nb.id, public=True)
+await client.sharing.set_public(nb.id, public=True)
 url = await client.notebooks.get_share_url(nb.id)
 print(url)
 ```
@@ -290,29 +398,52 @@ print(url)
 
 ### SourcesAPI (`client.sources`)
 
+**CLI equivalent:** [Source Commands](cli-reference.md#source-commands-notebooklm-source-cmd) — `notebooklm source add`, `list`, `get`, `fulltext`, `guide`, `rename`, `refresh`, `delete`, `wait`.
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `list(notebook_id)` | `notebook_id: str` | `list[Source]` | List sources |
-| `get(notebook_id, source_id)` | `str, str` | `Source` | Get source details |
-| `get_fulltext(notebook_id, source_id)` | `str, str` | `SourceFulltext` | Get full indexed text content |
+| `get(notebook_id, source_id)` | `str, str` | `Source \| None` | Get source details (returns None if not found) |
+| `get_fulltext(notebook_id, source_id, *, output_format="text")` | `str, str, *, output_format: Literal["text", "markdown"]` | `SourceFulltext` | Get full content; `"markdown"` requires the optional `markdownify` extra |
 | `get_guide(notebook_id, source_id)` | `str, str` | `dict` | Get AI-generated summary and keywords |
-| `add_url(notebook_id, url)` | `str, str` | `Source` | Add URL source |
-| `add_youtube(notebook_id, url)` | `str, str` | `Source` | Add YouTube video |
-| `add_text(notebook_id, title, content)` | `str, str, str` | `Source` | Add text content |
-| `add_file(notebook_id, path, mime_type=None)` | `str, Path, str` | `Source` | Upload file |
+| `add_url(notebook_id, url, wait=False, wait_timeout=120.0)` | `str, str, bool, float` | `Source` | Add URL source (autodetects YouTube URLs and routes them appropriately) |
+| `add_text(notebook_id, title, content, wait=False, wait_timeout=120.0)` | `str, str, str, bool, float` | `Source` | Add text content |
+| `add_file(notebook_id, file_path, mime_type=None, wait=False, wait_timeout=120.0, *, title=None)` | `str, str \| Path, str \| None, bool, float, *, str \| None` | `Source` | Upload file. `mime_type` is **deprecated** and ignored (server infers from filename); passing non-`None` raises `DeprecationWarning`. `title` (keyword-only) sets the display name via a post-upload `UPDATE_SOURCE` and forces a brief registration wait even when `wait=False`. |
 | `add_drive(notebook_id, file_id, title, mime_type)` | `str, str, str, str` | `Source` | Add Google Drive doc |
 | `rename(notebook_id, source_id, new_title)` | `str, str, str` | `Source` | Rename source |
 | `refresh(notebook_id, source_id)` | `str, str` | `bool` | Refresh URL/Drive source |
 | `check_freshness(notebook_id, source_id)` | `str, str` | `bool` | Check if source needs refresh |
 | `delete(notebook_id, source_id)` | `str, str` | `bool` | Delete source |
+| `wait_until_ready(notebook_id, source_id, timeout=120.0, ...)` | `str, str, float, ...` | `Source` | Poll until `status == READY` (fully processed). Raises `SourceTimeoutError`/`SourceProcessingError`/`SourceNotFoundError`. |
+| `wait_until_registered(notebook_id, source_id, timeout=30.0, ...)` | `str, str, float, ...` | `Source` | Poll until the source is visible server-side (any non-ERROR status). Completes quickly (seconds for typical sources); intended for narrow follow-up RPCs (e.g. `UPDATE_SOURCE`) that only require registration, not full processing. |
+| `wait_for_sources(notebook_id, source_ids, timeout=120.0, **kwargs)` | `str, list[str], float, ...` | `list[Source]` | Wait for multiple sources to become ready **in parallel**. Per-source timeout; `**kwargs` are forwarded to `wait_until_ready`. |
 
 **Example:**
 ```python
+from pathlib import Path
+
 # Add various source types
 await client.sources.add_url(nb_id, "https://example.com/article")
-await client.sources.add_youtube(nb_id, "https://youtube.com/watch?v=...")
+await client.sources.add_url(nb_id, "https://youtube.com/watch?v=...")  # YouTube URLs autodetected
 await client.sources.add_text(nb_id, "My Notes", "Content here...")
 await client.sources.add_file(nb_id, Path("./document.pdf"))
+
+# Upload a file with a custom display title (rename happens after upload via
+# UPDATE_SOURCE — a brief registration wait runs even when wait=False so the
+# rename can land). The mime_type kwarg is deprecated; the server infers
+# MIME type from the filename extension.
+await client.sources.add_file(nb_id, Path("./document.pdf"), title="Q4 Strategy Memo")
+
+# Wait for several uploads to finish processing in parallel
+ids = [
+    (await client.sources.add_url(nb_id, "https://example.com/a")).id,
+    (await client.sources.add_url(nb_id, "https://example.com/b")).id,
+]
+ready = await client.sources.wait_for_sources(nb_id, ids, timeout=180)
+
+# Narrow wait: only block until the source is visible server-side (not fully
+# processed). Use this before follow-up RPCs like UPDATE_SOURCE.
+registered = await client.sources.wait_until_registered(nb_id, ids[0])
 
 # List and manage
 sources = await client.sources.list(nb_id)
@@ -341,18 +472,22 @@ print(f"Keywords: {guide['keywords']}")
 
 ### ArtifactsAPI (`client.artifacts`)
 
+**CLI equivalent:** [Artifact Commands](cli-reference.md#artifact-commands-notebooklm-artifact-cmd) — `notebooklm artifact list`, `get`, `rename`, `delete`, `export`, `poll`, `wait`. Generation methods map to [Generate Commands](cli-reference.md#generate-commands-notebooklm-generate-type) (`notebooklm generate <type>`); download methods map to [Download Commands](cli-reference.md#download-commands-notebooklm-download-type) (`notebooklm download <type>`).
+
 #### Core Methods
 
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `list(notebook_id, type=None)` | `str, int` | `list[Artifact]` | List artifacts |
-| `get(notebook_id, artifact_id)` | `str, str` | `Artifact` | Get artifact details |
+| `get(notebook_id, artifact_id)` | `str, str` | `Artifact \| None` | Get artifact details (returns None if not found) |
 | `delete(notebook_id, artifact_id)` | `str, str` | `bool` | Delete artifact |
 | `rename(notebook_id, artifact_id, new_title)` | `str, str, str` | `None` | Rename artifact |
 | `poll_status(notebook_id, task_id)` | `str, str` | `GenerationStatus` | Check generation status |
 | `wait_for_completion(notebook_id, task_id, ...)` | `str, str, ...` | `GenerationStatus` | Wait for generation |
 
 #### Type-Specific List Methods
+
+**CLI equivalent:** `notebooklm artifact list --type <audio|video|slide-deck|quiz|flashcard|infographic|data-table|mind-map|report>` (see [Artifact Commands](cli-reference.md#artifact-commands-notebooklm-artifact-cmd)).
 
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
@@ -366,6 +501,8 @@ print(f"Keywords: {guide['keywords']}")
 | `list_data_tables(notebook_id)` | `str` | `list[Artifact]` | List data table artifacts |
 
 #### Generation Methods
+
+**CLI equivalent:** [Generate Commands](cli-reference.md#generate-commands-notebooklm-generate-type) — `notebooklm generate audio`, `video`, `slide-deck`, `quiz`, `flashcards`, `infographic`, `data-table`, `mind-map`, `report`.
 
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
@@ -381,12 +518,14 @@ print(f"Keywords: {guide['keywords']}")
 
 #### Downloading Artifacts
 
+**CLI equivalent:** [Download Commands](cli-reference.md#download-commands-notebooklm-download-type) — `notebooklm download audio`, `video`, `slide-deck`, `infographic`, `report`, `mind-map`, `data-table`, `quiz`, `flashcards`.
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `download_audio(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download audio to file (MP4/MP3) |
 | `download_video(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download video to file (MP4) |
 | `download_infographic(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download infographic to file (PNG) |
-| `download_slide_deck(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download slide deck as PDF |
+| `download_slide_deck(notebook_id, output_path, artifact_id=None, output_format="pdf")` | `str, str, str, str` | `str` | Download slide deck as PDF or PPTX (`output_format`: `"pdf"` or `"pptx"`) |
 | `download_report(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download report as Markdown (.md) |
 | `download_mind_map(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download mind map as JSON (.json) |
 | `download_data_table(notebook_id, output_path, artifact_id=None)` | `str, str, str` | `str` | Download data table as CSV (.csv) |
@@ -451,11 +590,13 @@ path = await client.artifacts.download_flashcards(nb_id, "cards.md", output_form
 
 Export artifacts to Google Docs or Google Sheets.
 
+**CLI equivalent:** `notebooklm artifact export <id> --title TEXT --type [docs|sheets]` (see [Artifact Commands](cli-reference.md#artifact-commands-notebooklm-artifact-cmd)).
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
-| `export_report(notebook_id, artifact_id, title, export_type)` | `str, str, str, ExportType` | `Any` | Export report to Google Docs/Sheets |
-| `export_data_table(notebook_id, artifact_id, title)` | `str, str, str` | `Any` | Export data table to Google Sheets |
-| `export(notebook_id, artifact_id, content, title, export_type)` | `str, str, str, str, ExportType` | `Any` | Generic export to Docs/Sheets |
+| `export_report(notebook_id, artifact_id, title="Export", export_type=ExportType.DOCS)` | `str, str, str, ExportType` | `Any` | Export report to Google Docs/Sheets |
+| `export_data_table(notebook_id, artifact_id, title="Export")` | `str, str, str` | `Any` | Export data table to Google Sheets |
+| `export(notebook_id, artifact_id=None, content=None, title="Export", export_type=ExportType.DOCS)` | `str, str \| None, str \| None, str, ExportType` | `Any` | Generic export to Docs/Sheets. All trailing parameters are optional with defaults; pass `content=...` to export inline content without a pre-existing artifact. |
 
 **Export Types (ExportType enum):**
 - `ExportType.DOCS` (1): Export to Google Docs
@@ -481,7 +622,11 @@ result = await client.artifacts.export_data_table(
 )
 # result contains the Google Sheets URL
 
-# Generic export (e.g., export any artifact to Sheets)
+# Generic export (e.g., export any artifact to Sheets). All trailing
+# parameters have defaults: `artifact_id=None`, `content=None`,
+# `title="Export"`, `export_type=ExportType.DOCS`. Supply `content=...`
+# instead of `artifact_id=...` to export inline text without a pre-existing
+# artifact.
 result = await client.artifacts.export(
     nb_id,
     artifact_id="artifact_789",
@@ -493,6 +638,16 @@ result = await client.artifacts.export(
 **Generation Methods:**
 
 ```python
+from notebooklm import (
+    AudioFormat,
+    AudioLength,
+    VideoFormat,
+    VideoStyle,
+    ReportFormat,
+    QuizQuantity,
+    QuizDifficulty,
+)
+
 # Audio (podcast)
 status = await client.artifacts.generate_audio(
     notebook_id,
@@ -508,7 +663,7 @@ status = await client.artifacts.generate_video(
     notebook_id,
     source_ids=None,
     instructions="...",
-    video_format=VideoFormat.EXPLAINER,  # EXPLAINER, BRIEF
+    video_format=VideoFormat.EXPLAINER,  # EXPLAINER, BRIEF, CINEMATIC
     video_style=VideoStyle.AUTO_SELECT,  # AUTO_SELECT, CLASSIC, WHITEBOARD, KAWAII, ANIME, etc.
     language="en"
 )
@@ -558,10 +713,12 @@ else:
 
 ### ChatAPI (`client.chat`)
 
+**CLI equivalent:** [Chat Commands](cli-reference.md#chat-commands) — `notebooklm ask`, `configure`, `history`.
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `ask(notebook_id, question, ...)` | `str, str, ...` | `AskResult` | Ask a question |
-| `configure(notebook_id, ...)` | `str, ...` | `bool` | Set chat persona |
+| `configure(notebook_id, ...)` | `str, ...` | `None` | Set chat persona |
 | `get_history(notebook_id, limit=100, conversation_id=None)` | `str, int, str` | `list[tuple[str, str]]` | Get Q&A pairs from most recent conversation |
 | `get_conversation_id(notebook_id)` | `str` | `str \| None` | Get most recent conversation ID from server |
 
@@ -577,6 +734,8 @@ async def ask(
 
 **Example:**
 ```python
+from notebooklm import ChatGoal, ChatResponseLength
+
 # Ask questions (uses all sources)
 result = await client.chat.ask(nb_id, "What are the main themes?")
 print(result.answer)
@@ -612,9 +771,11 @@ await client.chat.configure(
 
 ### ResearchAPI (`client.research`)
 
+**CLI equivalent:** [Research Commands](cli-reference.md#research-commands-notebooklm-research-cmd) (`notebooklm research status`, `wait`) plus `notebooklm source add-research` ([Source: `add-research`](cli-reference.md#source-add-research)) for the combined start-and-import workflow.
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
-| `start(notebook_id, query, source, mode)` | `str, str, str="web", str="fast"` | `dict` | Start research (mode: "fast" or "deep") |
+| `start(notebook_id, query, source, mode)` | `str, str, str="web", str="fast"` | `dict \| None` | Start research (mode: "fast" or "deep"); raises `ValidationError` on invalid source/mode |
 | `poll(notebook_id)` | `str` | `dict` | Check research status |
 | `import_sources(notebook_id, task_id, sources)` | `str, str, list` | `list[dict]` | Import findings |
 
@@ -626,22 +787,50 @@ async def start(
     query: str,
     source: str = "web",   # "web" or "drive"
     mode: str = "fast",    # "fast" or "deep" (deep only for web)
-) -> dict:
+) -> dict | None:
     """
-    Returns: {"task_id": str, "report_id": str, "notebook_id": str, "query": str, "mode": str}
-    Raises: ValueError if source/mode combination is invalid
+    Returns: {"task_id": str, "report_id": str, "notebook_id": str, "query": str, "mode": str},
+        or None if the RPC returns an empty/unexpected payload
+    Raises: ValidationError if source/mode combination is invalid
     """
 
 async def poll(notebook_id: str) -> dict:
     """
-    Returns: {"task_id": str, "status": str, "query": str, "sources": list, "summary": str}
-    Status is "completed", "in_progress", or "no_research"
+    Returns a dict for the LATEST research task. Top-level keys:
+      - task_id:   str       — task/report identifier
+      - status:    str       — "completed" | "in_progress" | "no_research"
+      - query:     str       — original research query
+      - sources:   list[dict]
+      - summary:   str       — summary text when present
+      - report:    str       — deep-research report markdown when present
+      - tasks:     list[dict] — ALL parsed tasks (same shape as the top-level
+                                latest-task fields), additive across polls
+
+    Each source dict may include:
+      - url, title
+      - result_type:        int — 1=web, 2=drive, 5=deep-research report entry
+      - research_task_id:   str — task/report ID that produced this source
+      - report_markdown:    str — deep-research report markdown (for type-5 entries)
     """
 
 async def import_sources(notebook_id: str, task_id: str, sources: list[dict]) -> list[dict]:
     """
-    sources: List of dicts with 'url' and 'title' keys
-    Returns: List of imported sources with 'id' and 'title'
+    sources: list of dicts with 'url' and 'title' keys. Deep-research entries
+        from poll() may also include 'report_markdown', 'result_type', and
+        'research_task_id'.
+    Returns: list of imported sources with 'id' and 'title'.
+
+    Raises:
+      - ValidationError if `sources` contains entries from more than one
+        research task (`research_task_id` mismatch). Import each task's
+        sources in a separate call.
+
+    Caveats:
+      - The API response can under-report — fewer items may come back than
+        were actually imported. After this call, re-list with
+        `client.sources.list(notebook_id)` to verify the final source set.
+      - Entries without a `url` and without a complete report (`title` +
+        `report_markdown` + `result_type == 5`) are skipped with a warning.
     """
 ```
 
@@ -649,14 +838,20 @@ async def import_sources(notebook_id: str, task_id: str, sources: list[dict]) ->
 ```python
 # Start fast web research (default)
 result = await client.research.start(nb_id, "AI safety regulations")
+if result is None:
+    raise RuntimeError("Research start returned None")
 task_id = result["task_id"]
 
 # Start deep web research
 result = await client.research.start(nb_id, "quantum computing", source="web", mode="deep")
+if result is None:
+    raise RuntimeError("Research start returned None")
 task_id = result["task_id"]
 
 # Start fast Drive research
 result = await client.research.start(nb_id, "project docs", source="drive", mode="fast")
+if result is None:
+    raise RuntimeError("Research start returned None")
 
 # Poll until complete
 import asyncio
@@ -674,6 +869,8 @@ print(f"Imported {len(imported)} sources")
 ---
 
 ### NotesAPI (`client.notes`)
+
+**CLI equivalent:** [Note Commands](cli-reference.md#note-commands-notebooklm-note-cmd) — `notebooklm note list`, `create`, `get`, `save`, `rename`, `delete`.
 
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
@@ -719,6 +916,8 @@ await client.notes.delete_mind_map(nb_id, mind_map_id)
 
 ### SettingsAPI (`client.settings`)
 
+**CLI equivalent:** [Language Commands](cli-reference.md#language-commands-notebooklm-language-cmd) — `notebooklm language get`, `set`, `list`. Account limits and tier do not yet have a dedicated CLI surface; use `notebooklm status` for context.
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `get_output_language()` | none | `Optional[str]` | Get current output language setting |
@@ -754,11 +953,13 @@ print(f"Language set to: {result}")
 
 ### SharingAPI (`client.sharing`)
 
+**CLI equivalent:** [Share Commands](cli-reference.md#share-status-public-view-level-add-update-remove) — `notebooklm share status`, `public`, `view-level`, `add`, `update`, `remove`.
+
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `get_status(notebook_id)` | `str` | `ShareStatus` | Get current sharing configuration |
 | `set_public(notebook_id, public)` | `str, bool` | `ShareStatus` | Enable/disable public link sharing |
-| `set_view_level(notebook_id, level)` | `str, ShareViewLevel` | `None` | Set what viewers can access |
+| `set_view_level(notebook_id, level)` | `str, ShareViewLevel` | `ShareStatus` | Set what viewers can access |
 | `add_user(notebook_id, email, permission, notify, welcome_message)` | `str, str, SharePermission, bool, str` | `ShareStatus` | Share with a user |
 | `update_user(notebook_id, email, permission)` | `str, str, SharePermission` | `ShareStatus` | Update user's permission |
 | `remove_user(notebook_id, email)` | `str, str` | `ShareStatus` | Remove user's access |
@@ -836,11 +1037,26 @@ class Source:
     title: Optional[str]
     url: Optional[str]
     created_at: Optional[datetime]
+    status: int                          # 1=processing, 2=ready, 3=error, 5=preparing (defaults to READY)
 
     @property
     def kind(self) -> SourceType:
         """Get source type as SourceType enum."""
+
+    @property
+    def is_ready(self) -> bool:
+        """status == SourceStatus.READY"""
+
+    @property
+    def is_processing(self) -> bool:
+        """status == SourceStatus.PROCESSING"""
+
+    @property
+    def is_error(self) -> bool:
+        """status == SourceStatus.ERROR"""
 ```
+
+> **Deprecated:** `Source.source_type` emits `DeprecationWarning` and will be removed in v0.5.0 — use `Source.kind` instead. See [stability.md → Currently Deprecated](stability.md#currently-deprecated) for the full migration table.
 
 **Type Identification:**
 
@@ -868,9 +1084,11 @@ print(f"Type: {source.kind}")  # "Type: pdf"
 class Artifact:
     id: str
     title: str
-    status: int                     # 1=processing, 2=pending, 3=completed
+    _artifact_type: int             # Internal type code; field order matters. Access via .kind.
+    status: int                     # 1=processing, 2=pending, 3=completed, 4=failed
     created_at: Optional[datetime]
     url: Optional[str]
+    _variant: int | None = None     # Internal variant for type-4 artifacts (1=flashcards, 2=quiz).
 
     @property
     def kind(self) -> ArtifactType:
@@ -887,7 +1105,18 @@ class Artifact:
     @property
     def is_flashcards(self) -> bool:
         """Check if this is a flashcards artifact."""
+
+    @property
+    def report_subtype(self) -> str | None:
+        """Title-derived report subtype: 'briefing_doc', 'study_guide',
+        'blog_post', or 'report' for type-2 artifacts; None otherwise.
+        Use this instead of parsing titles in caller code.
+        """
 ```
+
+**Note on `_artifact_type` / `_variant`:** these are private (leading-underscore) fields with `repr=False` and are part of the dataclass for `from_api_response()` round-tripping. Always consume them via the public `.kind`, `.is_quiz`, `.is_flashcards`, and `.report_subtype` accessors — the underscore prefix signals that direct access is unsupported and subject to change without notice.
+
+> **Deprecated:** `Artifact.artifact_type` and `Artifact.variant` emit `DeprecationWarning` and will be removed in v0.5.0 — use `Artifact.kind` (plus `.is_quiz` / `.is_flashcards`) instead. See [stability.md → Currently Deprecated](stability.md#currently-deprecated) for the full migration table.
 
 **Type Identification:**
 
@@ -909,6 +1138,59 @@ if artifact.is_quiz:
     print("This is a quiz")
 elif artifact.is_flashcards:
     print("This is a flashcard deck")
+```
+
+### GenerationStatus
+
+Returned by `poll_status`, `wait_for_completion`, and most artifact generation methods (`generate_audio`, `generate_video`, `generate_report`, `generate_quiz`, `generate_flashcards`, `generate_slide_deck`, `generate_infographic`, `generate_data_table`). Note that `generate_mind_map` returns a `dict[str, Any]` instead — the mind map is delivered as JSON inline rather than polled.
+
+```python
+@dataclass
+class GenerationStatus:
+    task_id: str                          # Same value as Artifact.id once complete
+    status: str                           # "pending" | "in_progress" | "completed" | "failed" | "not_found"
+    url: str | None = None                # Populated for media artifacts when status == "completed"
+    error: str | None = None
+    error_code: str | None = None         # e.g. "USER_DISPLAYABLE_ERROR" for rate limits
+    metadata: dict[str, Any] | None = None
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if generation is complete."""
+
+    @property
+    def is_failed(self) -> bool:
+        """Check if generation failed."""
+
+    @property
+    def is_pending(self) -> bool:
+        """Check if generation is pending."""
+
+    @property
+    def is_not_found(self) -> bool:
+        """Check if the artifact is absent from the poll response.
+
+        Distinct from ``is_pending``: a *pending* artifact exists in the
+        artifact list and is queued, while *not_found* means the artifact
+        has either not yet appeared (brief lag after creation) or was
+        silently removed server-side (e.g. after a daily-quota rejection).
+        ``wait_for_completion`` treats a sustained run of ``not_found``
+        responses as a failure — see its ``max_not_found`` parameter.
+        """
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Check if generation failed due to rate limiting."""
+```
+
+**`url` semantics:** `poll_status` populates `url` for media artifact types (audio, video, infographic, slide-deck PDF) as soon as the server reports the asset as ready. Slide decks expose the PDF URL here; for the editable PowerPoint, use `client.artifacts.download_slide_deck(..., output_format="pptx")` instead.
+
+```python
+status = await client.artifacts.generate_audio(notebook_id)
+final = await client.artifacts.wait_for_completion(notebook_id, status.task_id)
+if final.is_complete and final.url:
+    # Stream the asset directly instead of re-fetching artifact metadata
+    ...
 ```
 
 ### AskResult
@@ -975,6 +1257,39 @@ class SharedUser:
     avatar_url: str | None             # URL to user's avatar image
 ```
 
+### AccountLimits
+
+Returned by `client.settings.get_account_limits()`. Use these fields for
+quota decisions in preference to the raw tier string — the server-reported
+limits are what NotebookLM actually enforces.
+
+```python
+@dataclass(frozen=True)
+class AccountLimits:
+    notebook_limit: int | None = None  # Max notebooks the account can hold
+    source_limit: int | None = None    # Max sources per notebook
+    raw_limits: tuple[Any, ...] = ()   # Untouched RPC payload for forensic use
+```
+
+### AccountTier
+
+Returned by `client.settings.get_account_tier()`. Raw tier metadata from
+NotebookLM's homepage tier RPC. `plan_name` is the user-facing label when
+available (e.g. `"NotebookLM Pro"`); `tier` is the internal identifier
+(`"STANDARD"`, `"PLUS"`, `"PRO"`, `"PRO_DASHER_END_USER"`, `"ULTRA"`).
+
+```python
+@dataclass(frozen=True)
+class AccountTier:
+    tier: str | None = None        # Internal tier identifier
+    plan_name: str | None = None   # User-facing plan label
+```
+
+```python
+tier = await client.settings.get_account_tier()
+label = tier.plan_name or tier.tier or "unknown"
+```
+
 ### SourceFulltext
 
 ```python
@@ -997,6 +1312,8 @@ class SourceFulltext:
     ) -> list[tuple[str, int]]:
         """Search for citation text, return list of (context, position) tuples."""
 ```
+
+> **Deprecated:** `SourceFulltext.source_type` emits `DeprecationWarning` and will be removed in v0.5.0 — use `SourceFulltext.kind` instead. See [stability.md → Currently Deprecated](stability.md#currently-deprecated) for the full migration table.
 
 **Type Identification:**
 
@@ -1032,6 +1349,7 @@ class AudioLength(Enum):
 class VideoFormat(Enum):
     EXPLAINER = 1
     BRIEF = 2
+    CINEMATIC = 3
 
 class VideoStyle(Enum):
     AUTO_SELECT = 1
@@ -1063,11 +1381,11 @@ class QuizDifficulty(Enum):
 ### Reports
 
 ```python
-class ReportFormat(Enum):
-    BRIEFING_DOC = 1
-    STUDY_GUIDE = 2
-    BLOG_POST = 3
-    CUSTOM = 4
+class ReportFormat(str, Enum):
+    BRIEFING_DOC = "briefing_doc"
+    STUDY_GUIDE = "study_guide"
+    BLOG_POST = "blog_post"
+    CUSTOM = "custom"
 ```
 
 ### Infographics
@@ -1143,6 +1461,7 @@ class SourceType(str, Enum):
     MARKDOWN = "markdown"
     DOCX = "docx"
     CSV = "csv"
+    EPUB = "epub"
     IMAGE = "image"
     MEDIA = "media"
     UNKNOWN = "unknown"
@@ -1235,11 +1554,12 @@ For undocumented features, you can make raw RPC calls:
 from notebooklm.rpc import RPCMethod
 
 async with await NotebookLMClient.from_storage() as client:
-    # Access the core client for raw RPC
+    # Access the core client for raw RPC. Each RPCMethod member has its own
+    # params shape (a nested list) and `source_path`; mirror the call sites in
+    # the higher-level APIs (e.g. _notebooks.py for CREATE_NOTEBOOK) when in doubt.
     result = await client._core.rpc_call(
-        RPCMethod.SOME_METHOD,
-        params=[...],
-        source_path="/notebook/123"
+        RPCMethod.CREATE_NOTEBOOK,
+        params=["My Notebook", None, None, [2], [1]],
     )
 ```
 

@@ -12,6 +12,9 @@ on:
           - testpypi
           - pypi
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     name: Verify from ${{ inputs.source }}
@@ -35,21 +38,24 @@ jobs:
     - name: Create verification venv
       run: python -m venv verify-venv
 
-    - name: Install from TestPyPI
+    - name: Install from TestPyPI (with [browser,dev] extras)
       if: inputs.source == 'testpypi'
       shell: bash
       run: |
         source verify-venv/bin/activate
+        # --extra-index-url lets pip resolve [dev] tooling (pytest, mypy, etc.) from PyPI
+        # since they're not on TestPyPI. [browser,dev] replaces the inline test-deps step
+        # below; must include `browser` because [dev] alone omits playwright.
         pip install --index-url https://test.pypi.org/simple/ \
           --extra-index-url https://pypi.org/simple/ \
-          notebooklm-py==${{ steps.version.outputs.version }}
+          "notebooklm-py[browser,dev]==${{ steps.version.outputs.version }}"
 
-    - name: Install from PyPI
+    - name: Install from PyPI (with [browser,dev] extras)
       if: inputs.source == 'pypi'
       shell: bash
       run: |
         source verify-venv/bin/activate
-        pip install notebooklm-py==${{ steps.version.outputs.version }}
+        pip install "notebooklm-py[browser,dev]==${{ steps.version.outputs.version }}"
 
     - name: Verify version
       shell: bash
@@ -77,13 +83,14 @@ jobs:
         python -c "from notebooklm import NotebookLMClient, Notebook, Source, Artifact"
         echo "Core imports verified"
 
-    - name: Install test dependencies
+    - name: Install Playwright browsers
       shell: bash
       run: |
         source verify-venv/bin/activate
-        pip install pytest pytest-asyncio pytest-httpx pytest-cov pytest-rerunfailures python-dotenv vcrpy playwright
+        # Test deps now come from the `[dev]` extra installed in the source-specific step above.
+        # Just need to provision the Chromium browser binary + Linux system libs.
         playwright install chromium
-        playwright install-deps
+        playwright install-deps chromium
 
     - name: Run unit tests
       shell: bash
@@ -105,7 +112,11 @@ jobs:
         echo "E2E tests were not run because this workflow is executing on a fork." >> $GITHUB_STEP_SUMMARY
 
     - name: Run E2E tests
+      id: e2e
       if: github.repository == 'teng-lin/notebooklm-py'
+      # Don't fail the job here — the retry step below gets a 10-min cool-down
+      # shot at any failures, and its exit code is what marks the job red.
+      continue-on-error: true
       shell: bash
       env:
         NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
@@ -120,4 +131,27 @@ jobs:
           echo "::error::NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID secret is not configured"
           exit 1
         fi
-        pytest tests/e2e -m "not variants" --reruns 2 -v
+        # --reruns 1 --reruns-delay 30 catches sub-minute network blips;
+        # longer chat-throttle recovery is handled by the cool-down retry below.
+        pytest tests/e2e -m "not variants" --reruns 1 --reruns-delay 30 -v
+
+    - name: Retry failed E2E tests after 10-min cool-down
+      # Tests still throttled after the cool-down become skips via the
+      # _install_chat_rate_limit_skip fixture in tests/e2e/conftest.py.
+      if: steps.e2e.outcome == 'failure'
+      shell: bash
+      env:
+        NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
+        NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID: ${{ secrets.NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID }}
+      run: |
+        source verify-venv/bin/activate
+        # Missing lastfailed after a failed e2e step means pytest crashed
+        # before writing the cache (import error, OOM, etc.) — fail the job
+        # rather than silently going green.
+        if [ ! -f .pytest_cache/v/cache/lastfailed ]; then
+          echo "::error::No lastfailed cache from previous step; pytest likely crashed before running tests."
+          exit 1
+        fi
+        echo "Initial E2E run failed. Sleeping 600s before retrying failed tests."
+        sleep 600
+        pytest --last-failed -v

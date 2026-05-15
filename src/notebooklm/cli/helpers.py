@@ -14,30 +14,67 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 import click
+from filelock import FileLock
 from rich.console import Console
 from rich.table import Table
 
 from ..auth import AuthTokens, build_cookie_jar, load_auth_from_storage
-from ..exceptions import NetworkError, NotebookLimitError, RPCError, RPCTimeoutError
+from ..exceptions import NetworkError, RPCError, RPCTimeoutError
+from ..io import atomic_update_json, atomic_write_json
 from ..paths import get_context_path
-from ..types import ArtifactType
+from ..research import select_cited_sources
+from ..types import ArtifactType, CitedSourceSelection
 from ._encoding import safe_echo
 
 if TYPE_CHECKING:
     from ..types import Artifact, Source
 
 console = Console()
+# stderr_console is used for diagnostic / status output when --json mode is
+# active so that stdout stays parseable JSON for automation. See ``emit_status``.
+stderr_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
+
+
+def emit_status(msg: str, *, json_output: bool, style: str | None = None) -> None:
+    """Emit a status / diagnostic line.
+
+    When ``json_output`` is True, the message is written to stderr via a
+    dedicated Rich console so that stdout remains pure JSON for downstream
+    automation. Otherwise the message goes through the regular stdout console.
+
+    Args:
+        msg: The message text. Rich markup is honored by both consoles.
+        json_output: True when the current command is producing JSON on stdout.
+        style: Optional Rich style to apply (e.g., ``"yellow"``, ``"dim"``).
+    """
+    target = stderr_console if json_output else console
+    if style is not None:
+        target.print(msg, style=style)
+    else:
+        target.print(msg)
+
 
 # CLI artifact type name aliases
 _CLI_ARTIFACT_ALIASES = {
     "flashcard": "flashcards",  # CLI uses singular, enum uses plural
 }
+
+
+@dataclass(frozen=True)
+class ResearchImportResult:
+    """Result of importing research sources from CLI commands."""
+
+    imported: list[dict[str, str]]
+    sources: list[dict]
+    cited_selection: CitedSourceSelection | None = None
 
 
 def cli_name_to_artifact_type(name: str) -> ArtifactType | None:
@@ -222,6 +259,12 @@ async def import_with_retry(
                                 f"verified {len(requested_urls_norm)} requested "
                                 f"sources — skipping retry.[/yellow]"
                             )
+                        else:
+                            logger.debug(
+                                "Import RPC timed out, but server-side verified "
+                                "%d requested sources — skipping retry (json mode).",
+                                len(requested_urls_norm),
+                            )
                         # Return only new sources that match a requested URL.
                         # No-URL new sources (research reports, pasted text)
                         # are included only if the request itself had no-URL
@@ -272,6 +315,12 @@ async def import_with_retry(
                                     "requested sources are already present — "
                                     "skipping retry.[/yellow]"
                                 )
+                            else:
+                                logger.debug(
+                                    "Import RPC timed out, but all requested "
+                                    "sources are already present — skipping retry "
+                                    "(json mode)."
+                                )
                             return _merge_imported_sources(
                                 [], verified_imported, verified_imported_ids
                             )
@@ -320,9 +369,82 @@ async def import_with_retry(
                     f"[yellow]Import timed out; retrying in {sleep_for:.0f}s "
                     f"(attempt {attempt + 1})[/yellow]"
                 )
+            else:
+                logger.debug(
+                    "Import timed out; retrying in %.0fs (attempt %d) (json mode).",
+                    sleep_for,
+                    attempt + 1,
+                )
             await asyncio.sleep(sleep_for)
             delay = min(delay * backoff_factor, max_delay)
             attempt += 1
+
+
+def _select_research_sources_for_import(
+    sources: list[dict], report: str, cited_only: bool
+) -> tuple[list[dict], CitedSourceSelection | None]:
+    if not cited_only or not sources:
+        return sources, None
+
+    cited_selection = select_cited_sources(sources, report)
+    return cited_selection.sources, cited_selection
+
+
+def _display_cited_import_selection(cited_selection: CitedSourceSelection | None) -> None:
+    if cited_selection is None:
+        return
+
+    if cited_selection.used_fallback:
+        console.print("[yellow]Could not resolve cited sources; importing all sources.[/yellow]")
+        return
+
+    console.print(
+        f"[dim]Importing {cited_selection.matched_url_source_count} cited source(s)[/dim]"
+    )
+
+
+async def import_research_sources(
+    client,
+    notebook_id: str,
+    task_id: str,
+    sources: list[dict],
+    *,
+    report: str = "",
+    cited_only: bool = False,
+    max_elapsed: float = 1800,
+    json_output: bool = False,
+    status_message: str | None = None,
+) -> ResearchImportResult:
+    """Select and import research sources using shared CLI policy."""
+    sources_to_import, cited_selection = _select_research_sources_for_import(
+        sources, report, cited_only
+    )
+    if not sources_to_import:
+        return ResearchImportResult([], sources_to_import, cited_selection)
+
+    if not json_output:
+        _display_cited_import_selection(cited_selection)
+
+    retry_kwargs: dict[str, Any] = {"max_elapsed": max_elapsed}
+    if json_output:
+        retry_kwargs["json_output"] = True
+
+    async def _import_selected() -> list[dict[str, str]]:
+        return await import_with_retry(
+            client,
+            notebook_id,
+            task_id,
+            sources_to_import,
+            **retry_kwargs,
+        )
+
+    if status_message and not json_output:
+        with console.status(status_message):
+            imported = await _import_selected()
+    else:
+        imported = await _import_selected()
+
+    return ResearchImportResult(imported, sources_to_import, cited_selection)
 
 
 # =============================================================================
@@ -386,12 +508,18 @@ def get_auth_tokens(ctx) -> AuthTokens:
     else:
         jar = build_cookie_jar(cookies=cookies, storage_path=resolved_storage_path)
 
+    # Read persisted account routing so RPC URLs target the same Google
+    # account the tokens were minted for.
+    from ..auth import get_account_email_for_storage, get_authuser_for_storage
+
     return AuthTokens(
         cookies=cookies,
         csrf_token=csrf,
         session_id=session_id,
         storage_path=resolved_storage_path,
         cookie_jar=jar,
+        authuser=get_authuser_for_storage(resolved_storage_path),
+        account_email=get_account_email_for_storage(resolved_storage_path),
     )
 
 
@@ -400,9 +528,35 @@ def get_auth_tokens(ctx) -> AuthTokens:
 # =============================================================================
 
 
+def _current_storage_override() -> Path | None:
+    """Resolve the active ``--storage`` override from the current Click context.
+
+    Returns the explicit storage path stored in ``ctx.obj["storage_path"]`` by
+    the root CLI group (see ``notebooklm_cli.cli``), canonicalized via
+    ``expanduser().resolve()`` so two representations of the same file (e.g.,
+    ``~/foo.json`` and ``/home/user/foo.json``) share one sibling-context
+    namespace. When no Click context is active (library usage) or no override
+    was passed, returns ``None``.
+
+    ``click.get_current_context(silent=True)`` already returns ``None`` outside
+    of a Click invocation, so no try/except is needed.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None or not ctx.obj:
+        return None
+    storage = ctx.obj.get("storage_path")
+    if storage is None:
+        return None
+    # Defensive normalization: ``notebooklm_cli`` already wraps strings via
+    # ``Path(storage)``, but accept either form so future callers (tests,
+    # library wrappers populating ``ctx.obj`` directly) don't get a
+    # string-vs-``Path`` mismatch crash inside ``get_context_path``.
+    return Path(storage).expanduser().resolve()
+
+
 def _get_context_value(key: str) -> str | None:
     """Read a single value from context.json."""
-    context_file = get_context_path()
+    context_file = get_context_path(storage_path=_current_storage_override())
     if not context_file.exists():
         return None
     try:
@@ -421,17 +575,30 @@ def _get_context_value(key: str) -> str | None:
 
 
 def _set_context_value(key: str, value: str | None) -> None:
-    """Set or clear a single value in context.json."""
-    context_file = get_context_path()
+    """Set or clear a single value in context.json.
+
+    Uses ``atomic_update_json`` so concurrent CLI invocations cannot lose
+    updates by interleaving read-modify-write cycles.
+
+    Note: the ``context_file.exists()`` pre-check below is a TOCTOU window —
+    a concurrent ``clear`` could delete the file between this check and the
+    lock acquire, but the worst case is one unnecessary lock + create cycle,
+    not data loss. We accept the minor inefficiency to keep the early-return
+    fast path: most invocations have no context file at all.
+    """
+    context_file = get_context_path(storage_path=_current_storage_override())
     if not context_file.exists():
         return
-    try:
-        data = json.loads(context_file.read_text(encoding="utf-8"))
+
+    def _mutate(data: dict[str, Any]) -> dict[str, Any]:
         if value is not None:
             data[key] = value
         elif key in data:
             del data[key]
-        context_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        return data
+
+    try:
+        atomic_update_json(context_file, _mutate)
     except json.JSONDecodeError:
         logger.warning(
             "Context file %s is corrupted; cannot update '%s'. Run 'notebooklm clear' to reset.",
@@ -457,31 +624,78 @@ def set_current_notebook(
 
     conversation_id is never preserved — the server owns the canonical ID per
     notebook, and a stale local value would silently use the wrong UUID.
+
+    Uses ``atomic_update_json`` so the account-metadata preservation and the
+    notebook-context overwrite happen as one lock-protected critical section.
     """
-    context_file = get_context_path()
-    context_file.parent.mkdir(parents=True, exist_ok=True)
+    context_file = get_context_path(storage_path=_current_storage_override())
 
-    data: dict[str, str | bool] = {"notebook_id": notebook_id}
-    if title:
-        data["title"] = title
-    if is_owner is not None:
-        data["is_owner"] = is_owner
-    if created_at:
-        data["created_at"] = created_at
+    def _mutate(existing: dict[str, Any]) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        # Preserve account metadata used for multi-account auth routing.
+        if isinstance(existing.get("account"), dict):
+            data["account"] = existing["account"]
+        data["notebook_id"] = notebook_id
+        if title:
+            data["title"] = title
+        if is_owner is not None:
+            data["is_owner"] = is_owner
+        if created_at:
+            data["created_at"] = created_at
+        return data
 
-    context_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    # ``recover_from_corrupt=True`` keeps the empty-dict fallback **inside**
+    # the file lock. An outside-the-lock unlink-and-retry would race a
+    # concurrent process that wrote a valid payload between our raise and
+    # our retry, causing us to delete their good write (see PR #465 review).
+    atomic_update_json(context_file, _mutate, recover_from_corrupt=True)
 
 
-def clear_context() -> bool:
+def clear_context(*, clear_account: bool = False) -> bool:
     """Clear the current context.
 
-    Returns True if a context file was removed, False if none existed.
+    By default, only notebook/conversation fields are cleared; account
+    metadata used for multi-account auth routing is preserved. ``auth logout``
+    passes ``clear_account=True`` to remove the whole file.
+
+    Holds the same sibling ``.lock`` file used by :func:`atomic_update_json`
+    so concurrent writers don't lose updates against our clear-and-delete.
+
+    Returns True if a context file was changed or removed, False if none existed.
     """
-    context_file = get_context_path()
-    if context_file.exists():
-        context_file.unlink()
-        return True
-    return False
+    context_file = get_context_path(storage_path=_current_storage_override())
+    if not context_file.exists():
+        return False
+    lock_path = context_file.with_suffix(context_file.suffix + ".lock")
+    context_file.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(lock_path), timeout=10.0):
+        # Re-check existence under the lock — another writer may have
+        # removed it between the early-return check and the lock acquire.
+        if not context_file.exists():
+            return False
+        if clear_account:
+            context_file.unlink()
+            return True
+        try:
+            data = json.loads(context_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            context_file.unlink()
+            return True
+        if not isinstance(data, dict):
+            context_file.unlink()
+            return True
+        original = dict(data)
+        for key in ("notebook_id", "title", "is_owner", "created_at", "conversation_id"):
+            data.pop(key, None)
+        if not data:
+            context_file.unlink()
+            return True
+        if data != original:
+            # atomic_update_json would re-acquire the lock; instead use the
+            # atomic write directly since we already hold the lock here.
+            atomic_write_json(context_file, data)
+            return True
+        return False
 
 
 def get_current_conversation() -> str | None:
@@ -513,25 +727,48 @@ def validate_id(entity_id: str, entity_name: str = "ID") -> str:
 
 
 def require_notebook(notebook_id: str | None) -> str:
-    """Get notebook ID from argument or context, raise if neither.
+    """Get notebook ID from argument, env var, or active context.
+
+    Resolution order (P7.T3 / M4 — env-var precedence):
+
+    1. ``notebook_id`` argument (the resolved value of the ``-n/--notebook``
+       Click flag — already env-var-aware via ``cli/options.py:notebook_option``,
+       which declares ``envvar="NOTEBOOKLM_NOTEBOOK"``).
+    2. ``NOTEBOOKLM_NOTEBOOK`` environment variable. Re-checked here so direct
+       callers that don't pass through the Click flag (programmatic usage,
+       legacy code paths, tests) honor the same precedence ladder.
+    3. The persisted active-notebook context written by ``notebooklm use``.
+    4. Hard error → ``SystemExit(1)`` with a discoverability hint listing all
+       three resolution paths.
 
     Args:
-        notebook_id: Optional notebook ID from command argument
+        notebook_id: Optional notebook ID from command argument. When the
+            Click flag was omitted AND the env var was unset, this is ``None``.
 
     Returns:
-        Notebook ID (from argument or context), validated and stripped
+        Notebook ID (from argument, env var, or context), validated and stripped.
 
     Raises:
-        SystemExit: If no notebook ID available
-        click.ClickException: If notebook ID is empty/whitespace
+        SystemExit: If no notebook ID can be resolved from any source.
+        click.ClickException: If the resolved notebook ID is empty/whitespace
+            after stripping.
     """
     if notebook_id:
         return validate_id(notebook_id, "Notebook")
+    # Env-var fallback runs BEFORE the active-context lookup so per-shell
+    # overrides (e.g. ``NOTEBOOKLM_NOTEBOOK=other notebooklm ask "..."``)
+    # compose without clobbering the persisted ``notebooklm use`` selection.
+    # Empty / whitespace-only values are treated as unset (consistent with
+    # ``NOTEBOOKLM_HL``'s same-shape handling) — the next fallback wins.
+    env_value = os.environ.get("NOTEBOOKLM_NOTEBOOK")
+    if env_value and env_value.strip():
+        return validate_id(env_value, "Notebook")
     current = get_current_notebook()
     if current:
         return validate_id(current, "Notebook")
     console.print(
-        "[red]No notebook specified. Use 'notebooklm use <id>' to set context or provide notebook_id.[/red]"
+        "[red]No notebook specified. Use 'notebooklm use <id>' to set context, "
+        "pass -n/--notebook, or set NOTEBOOKLM_NOTEBOOK.[/red]"
     )
     raise SystemExit(1)
 
@@ -541,6 +778,8 @@ async def _resolve_partial_id(
     list_fn,
     entity_name: str,
     list_command: str,
+    *,
+    json_output: bool = False,
 ) -> str:
     """Generic partial ID resolver.
 
@@ -552,6 +791,8 @@ async def _resolve_partial_id(
         list_fn: Async function that returns list of items with id/title attributes
         entity_name: Name for error messages (e.g., "notebook", "source")
         list_command: CLI command to list items (e.g., "list", "source list")
+        json_output: When True, the "Matched..." diagnostic is routed to stderr
+            via ``emit_status`` so stdout stays parseable JSON.
 
     Returns:
         Full ID of the matched item
@@ -572,7 +813,10 @@ async def _resolve_partial_id(
     if len(matches) == 1:
         if matches[0].id != partial_id:
             title = matches[0].title or "(untitled)"
-            console.print(f"[dim]Matched: {matches[0].id[:12]}... ({title})[/dim]")
+            emit_status(
+                f"[dim]Matched: {matches[0].id[:12]}... ({title})[/dim]",
+                json_output=json_output,
+            )
         return matches[0].id
     elif len(matches) == 0:
         raise click.ClickException(
@@ -590,48 +834,78 @@ async def _resolve_partial_id(
         raise click.ClickException("\n".join(lines))
 
 
-async def resolve_notebook_id(client, partial_id: str) -> str:
-    """Resolve partial notebook ID to full ID."""
+async def resolve_notebook_id(client, partial_id: str, *, json_output: bool = False) -> str:
+    """Resolve partial notebook ID to full ID.
+
+    When ``json_output`` is True, the "Matched..." diagnostic for a successful
+    partial match is routed to stderr so stdout stays parseable JSON.
+    """
     return await _resolve_partial_id(
         partial_id,
         list_fn=lambda: client.notebooks.list(),
         entity_name="notebook",
         list_command="list",
+        json_output=json_output,
     )
 
 
-async def resolve_source_id(client, notebook_id: str, partial_id: str) -> str:
-    """Resolve partial source ID to full ID."""
+async def resolve_source_id(
+    client, notebook_id: str, partial_id: str, *, json_output: bool = False
+) -> str:
+    """Resolve partial source ID to full ID.
+
+    When ``json_output`` is True, the "Matched..." diagnostic for a successful
+    partial match is routed to stderr so stdout stays parseable JSON.
+    """
     return await _resolve_partial_id(
         partial_id,
         list_fn=lambda: client.sources.list(notebook_id),
         entity_name="source",
         list_command="source list",
+        json_output=json_output,
     )
 
 
-async def resolve_artifact_id(client, notebook_id: str, partial_id: str) -> str:
-    """Resolve partial artifact ID to full ID."""
+async def resolve_artifact_id(
+    client, notebook_id: str, partial_id: str, *, json_output: bool = False
+) -> str:
+    """Resolve partial artifact ID to full ID.
+
+    When ``json_output`` is True, the "Matched..." diagnostic for a successful
+    partial match is routed to stderr so stdout stays parseable JSON.
+    """
     return await _resolve_partial_id(
         partial_id,
         list_fn=lambda: client.artifacts.list(notebook_id),
         entity_name="artifact",
         list_command="artifact list",
+        json_output=json_output,
     )
 
 
-async def resolve_note_id(client, notebook_id: str, partial_id: str) -> str:
-    """Resolve partial note ID to full ID."""
+async def resolve_note_id(
+    client, notebook_id: str, partial_id: str, *, json_output: bool = False
+) -> str:
+    """Resolve partial note ID to full ID.
+
+    When ``json_output`` is True, the "Matched..." diagnostic for a successful
+    partial match is routed to stderr so stdout stays parseable JSON.
+    """
     return await _resolve_partial_id(
         partial_id,
         list_fn=lambda: client.notes.list(notebook_id),
         entity_name="note",
         list_command="note list",
+        json_output=json_output,
     )
 
 
 async def resolve_source_ids(
-    client, notebook_id: str, source_ids: tuple[str, ...]
+    client,
+    notebook_id: str,
+    source_ids: tuple[str, ...],
+    *,
+    json_output: bool = False,
 ) -> list[str] | None:
     """Resolve multiple partial source IDs to full IDs.
 
@@ -639,6 +913,8 @@ async def resolve_source_ids(
         client: NotebookLM client
         notebook_id: Resolved notebook ID
         source_ids: Tuple of partial source IDs from CLI
+        json_output: When True, "Matched..." diagnostics for partial matches
+            are routed to stderr so stdout stays parseable JSON.
 
     Returns:
         List of resolved source IDs, or None if no source IDs provided
@@ -647,8 +923,86 @@ async def resolve_source_ids(
         return None
     resolved = []
     for sid in source_ids:
-        resolved.append(await resolve_source_id(client, notebook_id, sid))
+        resolved.append(await resolve_source_id(client, notebook_id, sid, json_output=json_output))
     return resolved
+
+
+def read_stdin_text(*, source_label: str = "stdin") -> str:
+    """Read all of stdin as UTF-8 text and strip surrounding whitespace.
+
+    Centralizes the Unix ``-`` (stdin) convention used by ``ask``, ``note
+    create``, ``source add``, and ``--prompt-file -`` (P7.T2 / M3). Uses
+    ``click.get_text_stream("stdin").read()`` so ``CliRunner.invoke(input=...)``
+    in tests is honored without monkey-patching ``sys.stdin``.
+
+    Args:
+        source_label: Label used in error messages (e.g. ``"prompt file"``)
+            so the failure mode tells the user which input was empty.
+
+    Raises:
+        click.ClickException: stdin yields a non-UTF-8 byte sequence.
+    """
+    try:
+        text = click.get_text_stream("stdin").read()
+    except UnicodeDecodeError as e:
+        raise click.ClickException(f"{source_label} (stdin) is not valid UTF-8: {e}") from e
+    return text.strip()
+
+
+def resolve_prompt(
+    argument_value: str | None,
+    prompt_file: str | None,
+    param_name: str = "prompt",
+    *,
+    required: bool = False,
+) -> str:
+    """Resolve prompt text from a positional argument or ``--prompt-file``.
+
+    Exactly one source may be provided. The file is read as UTF-8 with surrounding
+    whitespace stripped. When ``required`` is True and neither source yields
+    text, a ``UsageError`` is raised; otherwise an empty string is returned.
+
+    The literal ``-`` is recognized as "read stdin" for either source
+    (P7.T2 / M3), matching the Unix convention.
+
+    Args:
+        argument_value: Value of the positional CLI argument (may be empty).
+        prompt_file: Path passed via ``--prompt-file`` (may be ``None``).
+        param_name: Name of the positional argument, used in error messages.
+        required: When True, raise ``UsageError`` if both sources are empty.
+
+    Raises:
+        click.UsageError: Both sources provided, or ``required`` and both empty.
+        click.ClickException: Prompt file unreadable or not valid UTF-8.
+    """
+    if argument_value and prompt_file:
+        raise click.UsageError(
+            f"Cannot use both the {param_name} argument and --prompt-file. Choose one."
+        )
+
+    if prompt_file == "-" or argument_value == "-":
+        # Unix ``-`` convention: read text from stdin. The label hints which
+        # input is the empty one if the required check fires below.
+        label = "prompt file" if prompt_file == "-" else param_name
+        text = read_stdin_text(source_label=label)
+    elif prompt_file:
+        path = Path(prompt_file)
+        if not path.is_file():
+            raise click.ClickException(f"Prompt file '{prompt_file}' is not a regular file.")
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise click.ClickException(f"Failed to read prompt file '{prompt_file}': {e}") from e
+        except UnicodeDecodeError as e:
+            raise click.ClickException(
+                f"Prompt file '{prompt_file}' is not valid UTF-8: {e}"
+            ) from e
+    else:
+        text = argument_value or ""
+
+    if required and not text:
+        raise click.UsageError(f"Provide a {param_name} argument or --prompt-file.")
+    return text
 
 
 # =============================================================================
@@ -670,8 +1024,9 @@ def handle_auth_error(json_output: bool = False):
     """Handle authentication errors with helpful context."""
     from ..paths import get_path_info, get_storage_path
 
-    path_info = get_path_info()
-    storage_path = get_storage_path()
+    storage_override = _current_storage_override()
+    path_info = get_path_info(storage_path=storage_override)
+    storage_path = storage_override if storage_override is not None else get_storage_path()
     has_env_var = bool(os.environ.get("NOTEBOOKLM_AUTH_JSON"))
     has_home_env = bool(os.environ.get("NOTEBOOKLM_HOME"))
     storage_source = path_info["home_source"]
@@ -741,11 +1096,20 @@ def with_client(f):
     @wraps(f)
     @click.pass_context
     def wrapper(ctx, *args, **kwargs):
+        from .error_handler import handle_errors
+
         cmd_name = f.__name__
         start = time.monotonic()
         logger.debug("CLI command starting: %s", cmd_name)
 
         json_output = kwargs.get("json_output", False)
+        # Verbose is captured on the root group via Click ``--verbose`` count.
+        # Use ``find_root`` so nested subcommand contexts still see it.
+        try:
+            verbose_count = int(ctx.find_root().params.get("verbose", 0) or 0)
+        except Exception:
+            verbose_count = 0
+        verbose = verbose_count >= 1
 
         def log_result(status: str, detail: str = "") -> float:
             elapsed = time.monotonic() - start
@@ -755,30 +1119,36 @@ def with_client(f):
                 logger.debug("CLI command %s: %s (%.3fs)", status, cmd_name, elapsed)
             return elapsed
 
-        try:
+        with handle_errors(verbose=verbose, json_output=json_output):
+            # Auth bootstrap: FileNotFoundError here means the storage file is
+            # missing — it has a dedicated rich UX via ``handle_auth_error``.
+            # The narrow ``except FileNotFoundError`` ensures a FileNotFoundError
+            # raised *inside* the command body (e.g., a missing ``--source-file``
+            # argument; see issue #153) is NOT misclassified as an auth error —
+            # it propagates to ``handle_errors``' UNEXPECTED_ERROR branch instead.
+            # Any OTHER exception from the auth bootstrap (malformed storage JSON,
+            # AuthError during token extraction, etc.) also reaches ``handle_errors``
+            # so users get typed hints rather than a raw traceback.
             try:
                 auth = get_auth_tokens(ctx)
             except FileNotFoundError:
                 log_result("failed", "not authenticated")
                 handle_auth_error(json_output)
-                return  # unreachable (handle_auth_error raises SystemExit), but keeps mypy happy
-            coro = f(ctx, *args, client_auth=auth, **kwargs)
-            result = run_async(coro)
+                return  # unreachable — handle_auth_error raises SystemExit
+            except Exception as e:
+                # Non-FileNotFoundError bootstrap failures (AuthError, malformed
+                # storage JSON, etc.) still need the structured debug-log entry;
+                # ``handle_errors`` will translate the exception to a typed hint.
+                log_result("failed", str(e))
+                raise
+            try:
+                coro = f(ctx, *args, client_auth=auth, **kwargs)
+                result = run_async(coro)
+            except Exception as e:
+                log_result("failed", str(e))
+                raise
             log_result("completed")
             return result
-        except Exception as e:
-            log_result("failed", str(e))
-            if json_output:
-                if isinstance(e, NotebookLimitError):
-                    json_error_response(
-                        "NOTEBOOK_LIMIT",
-                        str(e),
-                        extra=e.to_error_response_extra(),
-                    )
-                    return
-                json_error_response("ERROR", str(e))
-            else:
-                handle_error(e)
 
     return wrapper
 
@@ -788,9 +1158,9 @@ def with_client(f):
 # =============================================================================
 
 
-def json_output_response(data: dict) -> None:
+def json_output_response(data: dict | list) -> None:
     """Print JSON response (no colors for machine parsing)."""
-    click.echo(json.dumps(data, indent=2, default=str))
+    click.echo(json.dumps(data, indent=2, default=str, ensure_ascii=False))
 
 
 def json_error_response(code: str, message: str, extra: dict | None = None) -> None:
@@ -804,7 +1174,7 @@ def json_error_response(code: str, message: str, extra: dict | None = None) -> N
     response = {"error": True, "code": code, "message": message}
     if extra:
         response.update(extra)
-    click.echo(json.dumps(response, indent=2))
+    click.echo(json.dumps(response, indent=2, default=str, ensure_ascii=False))
     raise SystemExit(1)
 
 

@@ -618,7 +618,9 @@ class TestChatAskErrorHandling:
             url=re.compile(r".*GenerateFreeFormStreamed.*"),
         )
 
-        async with NotebookLMClient(auth_tokens) as client:
+        # ``server_error_max_retries=0`` pins the original immediate-raise
+        # contract; T3.A's default retries 5xx + RequestError 3x.
+        async with NotebookLMClient(auth_tokens, server_error_max_retries=0) as client:
             with pytest.raises(NetworkError, match="timed out"):
                 await client.chat.ask(
                     "nb_123",
@@ -632,19 +634,26 @@ class TestChatAskErrorHandling:
         auth_tokens,
         httpx_mock: HTTPXMock,
     ):
-        """Test ask() raises ChatError on httpx.HTTPStatusError."""
+        """Test ask() raises ChatError on httpx.HTTPStatusError.
+
+        After T2.D, the chat path uses ``core.query_post`` which routes
+        through the shared transport pipeline. Auth-shaped statuses (400/401/
+        403) go through the refresh path before surfacing; this test uses
+        500 to exercise the plain ``HTTPStatusError → ChatError`` mapping
+        without entangling the refresh machinery.
+        """
         import re
 
         from notebooklm.exceptions import ChatError
 
         httpx_mock.add_response(
             url=re.compile(r".*GenerateFreeFormStreamed.*"),
-            status_code=403,
+            status_code=500,
             method="POST",
         )
 
-        async with NotebookLMClient(auth_tokens) as client:
-            with pytest.raises(ChatError, match="403"):
+        async with NotebookLMClient(auth_tokens, server_error_max_retries=0) as client:
+            with pytest.raises(ChatError, match="500"):
                 await client.chat.ask(
                     "nb_123",
                     "What is this?",
@@ -669,7 +678,7 @@ class TestChatAskErrorHandling:
             url=re.compile(r".*GenerateFreeFormStreamed.*"),
         )
 
-        async with NotebookLMClient(auth_tokens) as client:
+        async with NotebookLMClient(auth_tokens, server_error_max_retries=0) as client:
             with pytest.raises(NetworkError, match="connection refused"):
                 await client.chat.ask(
                     "nb_123",
@@ -1808,3 +1817,91 @@ class TestExtractTextPassagesNonIntEndChar:
         cited_text, start_char, end_char = client.chat._extract_text_passages(cite_inner)
         assert start_char == 100
         assert end_char is None  # not set since passage_data[1] was not int
+
+
+class TestChatHL:
+    """ask() must include the NOTEBOOKLM_HL interface language in the URL."""
+
+    @pytest.mark.asyncio
+    async def test_ask_url_contains_hl_from_env(
+        self,
+        auth_tokens,
+        httpx_mock: HTTPXMock,
+        monkeypatch,
+    ):
+        """When NOTEBOOKLM_HL=ja, the chat POST URL carries hl=ja."""
+        import json
+        import re
+
+        monkeypatch.setenv("NOTEBOOKLM_HL", "ja")
+
+        inner_data = [
+            [
+                "answer",
+                None,
+                [12345],
+                None,
+                [[], None, None, [], 1],
+            ]
+        ]
+        inner_json = json.dumps(inner_data)
+        chunk_json = json.dumps([["wrb.fr", None, inner_json]])
+        response_body = f")]}}'\n{len(chunk_json)}\n{chunk_json}\n"
+
+        httpx_mock.add_response(
+            url=re.compile(r".*GenerateFreeFormStreamed.*"),
+            content=response_body.encode(),
+            method="POST",
+        )
+
+        async with NotebookLMClient(auth_tokens) as client:
+            await client.chat.ask(
+                notebook_id="test_nb",
+                question="Q",
+                source_ids=["src_001"],
+            )
+
+        request = httpx_mock.get_requests()[-1]
+        assert "hl=ja" in str(request.url)
+
+    @pytest.mark.asyncio
+    async def test_ask_url_defaults_hl_to_en(
+        self,
+        auth_tokens,
+        httpx_mock: HTTPXMock,
+        monkeypatch,
+    ):
+        """When NOTEBOOKLM_HL is unset, the chat URL carries hl=en."""
+        import json
+        import re
+
+        monkeypatch.delenv("NOTEBOOKLM_HL", raising=False)
+
+        inner_data = [
+            [
+                "answer",
+                None,
+                [12345],
+                None,
+                [[], None, None, [], 1],
+            ]
+        ]
+        inner_json = json.dumps(inner_data)
+        chunk_json = json.dumps([["wrb.fr", None, inner_json]])
+        response_body = f")]}}'\n{len(chunk_json)}\n{chunk_json}\n"
+
+        httpx_mock.add_response(
+            url=re.compile(r".*GenerateFreeFormStreamed.*"),
+            content=response_body.encode(),
+            method="POST",
+        )
+
+        async with NotebookLMClient(auth_tokens) as client:
+            await client.chat.ask(
+                notebook_id="test_nb",
+                question="Q",
+                source_ids=["src_001"],
+            )
+
+        request = httpx_mock.get_requests()[-1]
+        assert "hl=en" in str(request.url)

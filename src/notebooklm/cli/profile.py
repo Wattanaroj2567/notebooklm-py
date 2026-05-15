@@ -12,15 +12,20 @@ import json
 import os
 import re
 import shutil
+import sys
+from pathlib import Path
 
 import click
 from rich.table import Table
 
+from ..auth import read_account_metadata
+from ..io import atomic_update_json
 from ..paths import (
     get_config_path,
     get_profile_dir,
     get_storage_path,
     list_profiles,
+    read_default_profile,
     resolve_profile,
 )
 from .helpers import console, json_output_response
@@ -37,6 +42,74 @@ def _validate_profile_name(name: str) -> str:
             "Use alphanumeric characters, hyphens, and underscores. Must start with a letter or digit."
         )
     return name
+
+
+def email_to_profile_name(email: str, *, fallback: str = "account") -> str:
+    """Derive a valid profile name from an email address.
+
+    Profile names are restricted to ``[a-zA-Z0-9_-]`` (see
+    :data:`_PROFILE_NAME_RE`) and must start with an alphanumeric character.
+    Email local-parts routinely contain ``.``, ``+``, etc. that aren't
+    allowed, so we rewrite them to hyphens.
+
+    Examples::
+
+        alice@example.com         -> "alice"
+        alice.smith@example.com   -> "alice-smith"
+        bob+work@gmail.com        -> "bob-work"
+        teng.lin.9414@gmail.com   -> "teng-lin-9414"
+
+    Args:
+        email: Account email address.
+        fallback: Profile name to use when sanitization yields an empty
+            string or a name that does not start with an alphanum.
+
+    Returns:
+        A profile name guaranteed to satisfy :data:`_PROFILE_NAME_RE`.
+    """
+    local = email.split("@", 1)[0] if "@" in email else email
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]+", "-", local)
+    sanitized = re.sub(r"-{2,}", "-", sanitized).strip("-_")
+    if not sanitized or not _PROFILE_NAME_RE.match(sanitized):
+        # The function's contract is "always returns a valid profile name", so
+        # protect callers that pass a malformed fallback (e.g. "-tmp").
+        return fallback if _PROFILE_NAME_RE.match(fallback) else "account"
+    return sanitized
+
+
+def _read_config(config_path: Path, *, suppress_errors: bool = True) -> dict:
+    """Read global config, optionally tolerating unreadable/corrupt files."""
+    if not config_path.exists():
+        return {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        if not suppress_errors:
+            raise
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _atomic_write_config(config_path: Path, mutator) -> None:
+    """Lock + read-modify-write of the global config with private permissions.
+
+    Wraps :func:`atomic_update_json` so parent dir permissions are 0o700 on
+    POSIX (matching the legacy ``_write_config``). Use this for any code path
+    that reads, mutates, and writes ``config.json`` so concurrent CLI
+    invocations cannot lose updates.
+
+    If the existing config is unparseable (corrupted on disk), the mutator
+    runs on an empty dict instead — recovery happens **inside** the lock via
+    ``recover_from_corrupt=True``. An outside-the-lock unlink-and-retry would
+    race a concurrent process that wrote a valid payload between our raise
+    and our retry, causing us to delete their good write (see PR #465).
+    """
+    if sys.platform == "win32":
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        config_path.parent.chmod(0o700)
+    atomic_update_json(config_path, mutator, recover_from_corrupt=True)
 
 
 @click.group("profile")
@@ -64,12 +137,15 @@ def list_cmd(json_output):
         storage = get_storage_path(profile=name)
         is_active = name == active
         authenticated = storage.exists()
+        account_metadata = read_account_metadata(storage)
+        account_email = account_metadata.get("email")
 
         profile_data.append(
             {
                 "name": name,
                 "active": is_active,
                 "authenticated": authenticated,
+                "account": account_email if isinstance(account_email, str) else None,
             }
         )
 
@@ -80,6 +156,7 @@ def list_cmd(json_output):
     table = Table(title="Profiles")
     table.add_column("", width=2)
     table.add_column("Name", style="cyan")
+    table.add_column("Account", style="dim")
     table.add_column("Auth Status")
 
     for p in profile_data:
@@ -87,7 +164,8 @@ def list_cmd(json_output):
         auth_status = (
             "[green]authenticated[/green]" if p["authenticated"] else "[dim]not authenticated[/dim]"
         )
-        table.add_row(marker, str(p["name"]), auth_status)
+        account = str(p["account"] or "-")
+        table.add_row(marker, str(p["name"]), account, auth_status)
 
     console.print(table)
     console.print(f"\n[dim]Active profile: {active}[/dim]")
@@ -139,21 +217,18 @@ def switch_cmd(name):
         raise click.ClickException(f"Profile '{name}' not found.{hint}")
 
     config_path = get_config_path()
-    data: dict = {}
-    if config_path.exists():
-        try:
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
+    # Capture the previous value for the status message before mutating.
+    # The lock-protected mutator below is the source of truth for the write.
+    old_profile = _read_config(config_path).get("default_profile", "default")
 
-    old_profile = data.get("default_profile", "default")
-    data["default_profile"] = name
-    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    config_path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    config_path.chmod(0o600)
+    def _set_default(data: dict) -> dict:
+        data["default_profile"] = name
+        return data
+
+    try:
+        _atomic_write_config(config_path, _set_default)
+    except OSError as e:
+        raise click.ClickException(f"Failed to update config.json: {e}") from None
 
     console.print(f"[green]Switched default profile: {old_profile} → {name}[/green]")
 
@@ -177,9 +252,7 @@ def delete_cmd(name, confirm):
         raise click.ClickException(str(e)) from None
 
     # Block deletion of active or configured default profile
-    from ..paths import _read_default_profile
-
-    configured_default = _read_default_profile() or "default"
+    configured_default = read_default_profile() or "default"
     effective_active = resolve_profile()
     if name in (configured_default, effective_active):
         raise click.ClickException(
@@ -224,28 +297,37 @@ def rename_cmd(old_name, new_name):
 
     os.rename(old_dir, new_dir)
 
-    # Update config if renamed profile was the effective default.
-    # This handles both: config.json exists with default_profile=old_name,
-    # AND config.json doesn't exist (implicit "default" fallback).
+    # Update config if renamed profile was the effective default. This is
+    # always serialized through the locked mutator — there is NO pre-read
+    # early-return optimization, because a concurrent ``profile switch``
+    # could win between any pre-read and the lock acquire, leading us to
+    # skip the write that was correct at the moment we observed it. The
+    # mutator below is the single source of truth and recovers from a
+    # corrupt config under the same lock (``recover_from_corrupt=True``
+    # inside ``_atomic_write_config``).
     config_path = get_config_path()
+    updated = False
+
+    def _retarget_default(current: dict) -> dict:
+        nonlocal updated
+        # Decide under the lock — this is the only read of
+        # ``default_profile`` that matters. Treat a missing key as the
+        # implicit "default" so a fresh install with no config.json still
+        # picks up the rename when the user renamed the default profile.
+        if (current.get("default_profile") or "default") == old_name:
+            current["default_profile"] = new_name
+            updated = True
+        return current
+
     try:
-        data: dict = {}
-        if config_path.exists():
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-        configured_default = data.get("default_profile") or "default"
-        if configured_default == old_name:
-            data["default_profile"] = new_name
-            config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            config_path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            config_path.chmod(0o600)
-            console.print(f"[dim]Updated default profile in config: {old_name} → {new_name}[/dim]")
-    except (json.JSONDecodeError, OSError) as e:
+        _atomic_write_config(config_path, _retarget_default)
+    except OSError as e:
         console.print(
             f"[yellow]Warning: profile renamed but config.json update failed: {e}[/yellow]\n"
             f"[yellow]Run 'notebooklm profile switch {new_name}' to fix.[/yellow]"
         )
+    else:
+        if updated:
+            console.print(f"[dim]Updated default profile in config: {old_name} → {new_name}[/dim]")
 
     console.print(f"[green]Profile renamed: {old_name} → {new_name}[/green]")

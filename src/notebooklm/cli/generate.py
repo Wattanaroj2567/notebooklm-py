@@ -14,10 +14,14 @@ Commands:
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import contextlib
+import os
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import click
+from click.core import ParameterSource
 
 from ..client import NotebookLMClient
 from ..types import (
@@ -35,17 +39,27 @@ from ..types import (
     VideoFormat,
     VideoStyle,
 )
+from .error_handler import emit_cancelled_and_exit
 from .helpers import (
     console,
     json_error_response,
     json_output_response,
     require_notebook,
     resolve_notebook_id,
+    resolve_prompt,
     resolve_source_ids,
     with_client,
 )
 from .language import SUPPORTED_LANGUAGES, get_language
-from .options import json_option, retry_option
+from .options import (
+    _complete_artifacts,
+    _complete_sources,
+    json_option,
+    notebook_option,
+    prompt_file_option,
+    retry_option,
+    wait_polling_options,
+)
 
 DEFAULT_LANGUAGE = "en"
 
@@ -67,6 +81,99 @@ _INFOGRAPHIC_STYLE_MAP = {
     "kawaii": InfographicStyle.KAWAII,
     "scientific": InfographicStyle.SCIENTIFIC,
 }
+
+
+# Typical-duration hints for the spinner status line (P5.T2 / I7).
+# Empirical observation; the API exposes no progress channel so these are
+# user-facing wall-clock heuristics, not authoritative ETAs. Missing keys fall
+# back to no hint — the spinner still renders kind + elapsed seconds.
+_TYPICAL_DURATIONS: dict[str, str] = {
+    "audio": "typically 2-5 min",
+    "video": "typically 5-15 min",
+    "cinematic-video": "typically 30-40 min",
+    "slide-deck": "typically 1-3 min",
+    "quiz": "typically 30-60 sec",
+    "flashcards": "typically 30-60 sec",
+    "infographic": "typically 1-3 min",
+    "data-table": "typically 30-90 sec",
+    "mind-map": "typically 30-90 sec",
+    "report": "typically 1-3 min",
+}
+
+
+def _format_status_message(artifact_type: str, elapsed: float | None = None) -> str:
+    """Build the spinner status line for a long-running generation.
+
+    Mirrors the format suggested in the audit (I7) — kind + typical-duration
+    hint + optional elapsed timer. ``elapsed`` is ``None`` on first paint and
+    an integer seconds value once the periodic ticker starts updating.
+    """
+    hint = _TYPICAL_DURATIONS.get(artifact_type)
+    suffix = f" ({hint})" if hint else ""
+    base = f"Waiting for {artifact_type} generation{suffix}..."
+    if elapsed is None:
+        return base
+    return f"{base} [{int(elapsed)}s elapsed]"
+
+
+@contextlib.asynccontextmanager
+async def _status_with_elapsed(
+    artifact_type: str,
+    *,
+    json_output: bool = False,
+    resume_hint: str | None = None,
+) -> AsyncIterator[None]:
+    """Show a Rich spinner with a periodically updated elapsed timer.
+
+    No-op (for the spinner) when ``json_output`` is True so stdout stays pure
+    JSON for automation. The spinner is transient — it disappears on exit, so
+    the final ``[green]... ready[/green]`` line is the only persistent output.
+
+    The ticker task updates the status text once per second while the wrapped
+    coroutine awaits the long-running call. Cancellation is best-effort: if
+    the wrapped block raises, the ticker is cancelled in ``finally`` and the
+    exception propagates unchanged.
+
+    SIGINT handling (M2 / P5.T3): when ``resume_hint`` is provided, a
+    ``KeyboardInterrupt`` raised inside the wrapped block is caught and
+    converted into a friendly cancellation message via
+    :func:`emit_cancelled_and_exit`, which prints
+    ``Cancelled. Resume with: <resume_hint>`` to stderr (or a structured
+    ``CANCELLED`` envelope under ``--json``) and exits 130. When
+    ``resume_hint`` is ``None`` the interrupt propagates so the generic
+    handler in ``error_handler.handle_errors`` keeps owning non-wait paths.
+    """
+
+    @contextlib.contextmanager
+    def _sigint_guard() -> Any:
+        try:
+            yield
+        except KeyboardInterrupt:
+            if resume_hint is None:
+                raise
+            emit_cancelled_and_exit(resume_hint, json_output=json_output)
+
+    if json_output:
+        with _sigint_guard():
+            yield
+        return
+    start = time.monotonic()
+    initial = _format_status_message(artifact_type)
+    with console.status(initial) as status:
+
+        async def _ticker() -> None:
+            while True:
+                await asyncio.sleep(1.0)
+                status.update(_format_status_message(artifact_type, time.monotonic() - start))
+
+        ticker_task = asyncio.create_task(_ticker())
+        try:
+            with _sigint_guard():
+                yield
+        finally:
+            ticker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ticker_task
 
 
 def calculate_backoff_delay(
@@ -135,11 +242,11 @@ async def generate_with_retry(
 
 
 def resolve_language(language: str | None) -> str:
-    """Resolve language from CLI flag, config, or default.
+    """Resolve language from CLI flag, NOTEBOOKLM_HL env, config, or default.
 
-    Priority: CLI flag > config file > "en" default.
-    Uses explicit None checks to avoid treating empty string as falsy.
-    Validates that the language code is supported.
+    Priority: ``--language`` flag > ``NOTEBOOKLM_HL`` env var > config file
+    > "en" default. Uses explicit None checks to avoid treating empty
+    string as falsy. Validates each candidate against the supported list.
     """
     if language is not None:
         if language not in SUPPORTED_LANGUAGES:
@@ -149,8 +256,23 @@ def resolve_language(language: str | None) -> str:
                 param_hint="'--language'",
             )
         return language
+    env_lang = os.environ.get("NOTEBOOKLM_HL", "").strip()
+    if env_lang:
+        if env_lang not in SUPPORTED_LANGUAGES:
+            raise click.BadParameter(
+                f"Unknown language code: {env_lang}\n"
+                "Run 'notebooklm language list' to see supported codes.",
+                param_hint="'NOTEBOOKLM_HL'",
+            )
+        return env_lang
     config_lang = get_language()
     if config_lang is not None:
+        if config_lang not in SUPPORTED_LANGUAGES:
+            raise click.BadParameter(
+                f"Unknown language code in config: {config_lang}\n"
+                "Run 'notebooklm language list' to see supported codes.",
+                param_hint="config",
+            )
         return config_lang
     return DEFAULT_LANGUAGE
 
@@ -163,6 +285,7 @@ async def handle_generation_result(
     wait: bool = False,
     json_output: bool = False,
     timeout: float = 300.0,
+    interval: float | None = None,
 ) -> GenerationStatus | None:
     """Handle generation result with optional waiting and output formatting.
 
@@ -179,6 +302,11 @@ async def handle_generation_result(
         wait: Whether to wait for completion.
         json_output: Whether to output as JSON.
         timeout: Timeout for waiting (default: 300s).
+        interval: Polling interval in seconds. ``None`` (default) lets
+            ``wait_for_completion`` use its built-in default
+            (``initial_interval=2.0``); when supplied, the value is forwarded
+            as ``initial_interval`` so callers can tighten or loosen the
+            cadence (P5.T1 / I6).
 
     Returns:
         Final GenerationStatus, or None if generation failed.
@@ -226,7 +354,25 @@ async def handle_generation_result(
     if wait and task_id:
         if not json_output:
             console.print(f"[yellow]Generating {artifact_type}...[/yellow] Task: {task_id}")
-        status = await client.artifacts.wait_for_completion(notebook_id, task_id, timeout=timeout)
+        wait_kwargs: dict[str, Any] = {"timeout": timeout}
+        if interval is not None:
+            wait_kwargs["initial_interval"] = interval
+        # Wrap the blocking poll in a transient spinner so interactive users see
+        # progress feedback during long generations (P5.T2 / I7). The status
+        # line includes the artifact kind, a typical-duration hint, and a
+        # live elapsed-seconds counter. No-op under --json.
+        #
+        # The ``resume_hint`` plumbs the canonical M2 cancellation message
+        # (``Cancelled. Resume with: notebooklm artifact poll <task_id>``)
+        # so Ctrl-C during the wait surfaces the resume command instead of
+        # a Python KeyboardInterrupt traceback. See ``cli/error_handler.py``
+        # ``emit_cancelled_and_exit``.
+        async with _status_with_elapsed(
+            artifact_type,
+            json_output=json_output,
+            resume_hint=f"notebooklm artifact poll {task_id}",
+        ):
+            status = await client.artifacts.wait_for_completion(notebook_id, task_id, **wait_kwargs)
 
     # Output status
     _output_generation_status(status, artifact_type, json_output)
@@ -316,13 +462,8 @@ def generate():
 
 @generate.command("audio")
 @click.argument("description", default="", required=False)
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@prompt_file_option
+@notebook_option
 @click.option(
     "--format",
     "audio_format",
@@ -335,21 +476,36 @@ def generate():
     type=click.Choice(["short", "default", "long"]),
     default="default",
 )
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option(
+    "--language",
+    default=None,
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
+)
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_audio(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     audio_format,
     audio_length,
     language,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -365,6 +521,7 @@ def generate_audio(
       notebooklm generate audio "make it funny and casual" --format debate
       notebooklm generate audio -s src_001 -s src_002 "from specific sources"
     """
+    description = resolve_prompt(description, prompt_file, "description")
     nb_id = require_notebook(notebook_id)
     format_map = {
         "deep-dive": AudioFormat.DEEP_DIVE,
@@ -380,8 +537,10 @@ def generate_audio(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_audio(
@@ -395,7 +554,14 @@ def generate_audio(
 
             result = await generate_with_retry(_generate, max_retries, "audio", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "audio", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "audio",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
@@ -403,13 +569,8 @@ def generate_audio(
 
 @generate.command("video")
 @click.argument("description", default="", required=False)
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@prompt_file_option
+@notebook_option
 @click.option(
     "--format",
     "video_format",
@@ -421,6 +582,7 @@ def generate_audio(
     type=click.Choice(
         [
             "auto",
+            "custom",
             "classic",
             "whiteboard",
             "kawaii",
@@ -433,21 +595,38 @@ def generate_audio(
     ),
     default="auto",
 )
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option("--style-prompt", default=None, help="Custom visual style prompt")
+@click.option(
+    "--language",
+    default=None,
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
+)
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=600, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_video(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     video_format,
     style,
+    style_prompt,
     language,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -464,11 +643,24 @@ def generate_video(
     Example:
       notebooklm generate video "a funny explainer for kids age 5"
       notebooklm generate video "professional presentation" --style classic
+      notebooklm generate video --style custom --style-prompt "hand-drawn diagrams"
       notebooklm generate video --format cinematic "documentary overview"
       notebooklm generate video -s src_001 "from specific source"
     """
-    # Auto-select cinematic format when invoked as 'generate cinematic-video'
+    description = resolve_prompt(description, prompt_file, "description")
+    # The 'generate cinematic-video' alias hard-pins --format to 'cinematic'.
+    # If the user explicitly passed --format with any non-cinematic value, raise
+    # rather than silently overriding (mirrors the --style-prompt rejection
+    # pattern below). When --format was not passed at all, fall through to the
+    # implicit 'cinematic' coercion.
     if ctx.info_name == "cinematic-video":
+        format_source = ctx.get_parameter_source("video_format")
+        format_explicit = format_source == ParameterSource.COMMANDLINE
+        if format_explicit and video_format != "cinematic":
+            raise click.UsageError(
+                "--format must be 'cinematic' for the cinematic-video subcommand "
+                "(use 'generate video --format <other>' for other formats)"
+            )
         video_format = "cinematic"
 
     nb_id = require_notebook(notebook_id)
@@ -479,6 +671,7 @@ def generate_video(
     }
     style_map = {
         "auto": VideoStyle.AUTO_SELECT,
+        "custom": VideoStyle.CUSTOM,
         "classic": VideoStyle.CLASSIC,
         "whiteboard": VideoStyle.WHITEBOARD,
         "kawaii": VideoStyle.KAWAII,
@@ -489,11 +682,20 @@ def generate_video(
         "paper-craft": VideoStyle.PAPER_CRAFT,
     }
     is_cinematic = video_format == "cinematic"
+    normalized_style_prompt = style_prompt.strip() if style_prompt is not None else None
+    if is_cinematic and normalized_style_prompt:
+        raise click.UsageError("--style-prompt cannot be used with cinematic video")
+    if not is_cinematic and style == "custom" and not normalized_style_prompt:
+        raise click.UsageError("--style custom requires --style-prompt")
+    if not is_cinematic and normalized_style_prompt and style != "custom":
+        raise click.UsageError("--style-prompt requires --style custom")
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 if is_cinematic:
@@ -510,12 +712,26 @@ def generate_video(
                     instructions=description or None,
                     video_format=format_map[video_format],
                     video_style=style_map[style],
+                    style_prompt=normalized_style_prompt,
                 )
 
-            timeout = 1800.0 if is_cinematic else 600.0
+            # Cinematic videos default to a longer 1800s ceiling (Veo 3 takes
+            # ~30-40 min). Preserve that default *only* when the user did not
+            # pass --timeout explicitly; an explicit value always wins so
+            # `generate cinematic-video --timeout 60` honors the override.
+            timeout_value = float(timeout)
+            if is_cinematic and ctx.get_parameter_source("timeout") != ParameterSource.COMMANDLINE:
+                timeout_value = 1800.0
             result = await generate_with_retry(_generate, max_retries, "video", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "video", wait, json_output, timeout=timeout
+                client,
+                nb_id_resolved,
+                result,
+                "video",
+                wait,
+                json_output,
+                timeout=timeout_value,
+                interval=float(interval),
             )
 
     return _run()
@@ -531,6 +747,9 @@ _cinematic_video_gen_cmd = click.Command(
         "Generate cinematic video overview (AI-generated documentary footage).\n\n"
         "Alias for 'generate video --format cinematic'. Uses Veo 3 AI to create\n"
         "documentary-style videos. Requires Google AI Ultra.\n\n"
+        "Note: --format is locked to 'cinematic' on this subcommand; passing any\n"
+        "other value (e.g. --format explainer) raises an error. Use\n"
+        "'generate video --format <other>' for non-cinematic formats.\n\n"
         "Example:\n"
         '  notebooklm generate cinematic-video "documentary about quantum physics"'
     ),
@@ -540,13 +759,8 @@ generate.add_command(_cinematic_video_gen_cmd)
 
 @generate.command("slide-deck")
 @click.argument("description", default="", required=False)
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@prompt_file_option
+@notebook_option
 @click.option(
     "--format",
     "deck_format",
@@ -559,21 +773,36 @@ generate.add_command(_cinematic_video_gen_cmd)
     type=click.Choice(["default", "short"]),
     default="default",
 )
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option(
+    "--language",
+    default=None,
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
+)
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_slide_deck(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     deck_format,
     deck_length,
     language,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -588,6 +817,7 @@ def generate_slide_deck(
       notebooklm generate slide-deck "include speaker notes"
       notebooklm generate slide-deck "executive summary" --format presenter --length short
     """
+    description = resolve_prompt(description, prompt_file, "description")
     nb_id = require_notebook(notebook_id)
     format_map = {
         "detailed": SlideDeckFormat.DETAILED_DECK,
@@ -600,8 +830,10 @@ def generate_slide_deck(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_slide_deck(
@@ -615,27 +847,30 @@ def generate_slide_deck(
 
             result = await generate_with_retry(_generate, max_retries, "slide deck", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "slide deck", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "slide deck",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
 
 
 @generate.command("revise-slide")
-@click.argument("description")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@click.argument("description", default="", required=False)
+@prompt_file_option
+@notebook_option
 @click.option(
     "-a",
     "--artifact",
     "artifact_id",
     required=True,
     help="Slide deck artifact ID to revise",
+    shell_complete=_complete_artifacts,
 )
 @click.option(
     "--slide",
@@ -645,16 +880,20 @@ def generate_slide_deck(
     help="Zero-based index of the slide to revise (0 = first slide)",
 )
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_revise_slide(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     artifact_id,
     slide_index,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -669,11 +908,12 @@ def generate_revise_slide(
       notebooklm generate revise-slide "Move the title up" --artifact <id> --slide 0
       notebooklm generate revise-slide "Remove taxonomy" --artifact <id> --slide 3 --wait
     """
+    description = resolve_prompt(description, prompt_file, "description", required=True)
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
 
             async def _generate():
                 return await client.artifacts.revise_slide(
@@ -687,7 +927,14 @@ def generate_revise_slide(
                 _generate, max_retries, "slide revision", json_output
             )
             await handle_generation_result(
-                client, nb_id_resolved, result, "slide revision", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "slide revision",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
@@ -695,28 +942,34 @@ def generate_revise_slide(
 
 @generate.command("quiz")
 @click.argument("description", default="", required=False)
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@prompt_file_option
+@notebook_option
 @click.option("--quantity", type=click.Choice(["fewer", "standard", "more"]), default="standard")
 @click.option("--difficulty", type=click.Choice(["easy", "medium", "hard"]), default="medium")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_quiz(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     quantity,
     difficulty,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -731,6 +984,7 @@ def generate_quiz(
       notebooklm generate quiz "focus on vocabulary terms"
       notebooklm generate quiz "test key concepts" --difficulty hard --quantity more
     """
+    description = resolve_prompt(description, prompt_file, "description")
     nb_id = require_notebook(notebook_id)
     quantity_map = {
         "fewer": QuizQuantity.FEWER,
@@ -745,8 +999,10 @@ def generate_quiz(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_quiz(
@@ -759,7 +1015,14 @@ def generate_quiz(
 
             result = await generate_with_retry(_generate, max_retries, "quiz", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "quiz", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "quiz",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
@@ -767,28 +1030,34 @@ def generate_quiz(
 
 @generate.command("flashcards")
 @click.argument("description", default="", required=False)
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@prompt_file_option
+@notebook_option
 @click.option("--quantity", type=click.Choice(["fewer", "standard", "more"]), default="standard")
 @click.option("--difficulty", type=click.Choice(["easy", "medium", "hard"]), default="medium")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_flashcards(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     quantity,
     difficulty,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -803,6 +1072,7 @@ def generate_flashcards(
       notebooklm generate flashcards "vocabulary terms only"
       notebooklm generate flashcards --quantity more --difficulty easy
     """
+    description = resolve_prompt(description, prompt_file, "description")
     nb_id = require_notebook(notebook_id)
     quantity_map = {
         "fewer": QuizQuantity.FEWER,
@@ -817,8 +1087,10 @@ def generate_flashcards(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_flashcards(
@@ -831,7 +1103,14 @@ def generate_flashcards(
 
             result = await generate_with_retry(_generate, max_retries, "flashcards", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "flashcards", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "flashcards",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
@@ -839,13 +1118,8 @@ def generate_flashcards(
 
 @generate.command("infographic")
 @click.argument("description", default="", required=False)
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@prompt_file_option
+@notebook_option
 @click.option(
     "--orientation",
     type=click.Choice(["landscape", "portrait", "square"]),
@@ -861,15 +1135,28 @@ def generate_flashcards(
     type=click.Choice(list(_INFOGRAPHIC_STYLE_MAP)),
     default="auto",
 )
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option(
+    "--language",
+    default=None,
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
+)
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_infographic(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     orientation,
     detail,
@@ -877,6 +1164,8 @@ def generate_infographic(
     language,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -891,6 +1180,7 @@ def generate_infographic(
       notebooklm generate infographic "include statistics and key findings"
       notebooklm generate infographic --orientation portrait --detail detailed
     """
+    description = resolve_prompt(description, prompt_file, "description")
     nb_id = require_notebook(notebook_id)
     orientation_map = {
         "landscape": InfographicOrientation.LANDSCAPE,
@@ -905,8 +1195,10 @@ def generate_infographic(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_infographic(
@@ -921,34 +1213,51 @@ def generate_infographic(
 
             result = await generate_with_retry(_generate, max_retries, "infographic", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "infographic", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "infographic",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
 
 
 @generate.command("data-table")
-@click.argument("description")
+@click.argument("description", default="", required=False)
+@prompt_file_option
+@notebook_option
 @click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
+    "--language",
     default=None,
-    help="Notebook ID (uses current if not set)",
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
 )
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
+@click.option(
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
+)
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_data_table(
     ctx,
     description,
+    prompt_file,
     notebook_id,
     language,
     source_ids,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -963,12 +1272,15 @@ def generate_data_table(
       notebooklm generate data-table "comparison of key concepts"
       notebooklm generate data-table -s src_001 "timeline of events"
     """
+    description = resolve_prompt(description, prompt_file, "description", required=True)
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_data_table(
@@ -980,22 +1292,34 @@ def generate_data_table(
 
             result = await generate_with_retry(_generate, max_retries, "data table", json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, "data table", wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                "data table",
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()
 
 
 @generate.command("mind-map")
+@notebook_option
 @click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
 )
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
+@click.option(
+    "--language",
+    default=None,
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
+)
 @click.option("--instructions", default=None, help="Custom instructions for the mind map")
 @json_option
 @with_client
@@ -1011,8 +1335,10 @@ def generate_mind_map(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_mind_map(
@@ -1059,6 +1385,7 @@ def _output_mind_map_result(result: Any, json_output: bool) -> None:
 
 @generate.command("report")
 @click.argument("description", default="", required=False)
+@prompt_file_option
 @click.option(
     "--format",
     "report_format",
@@ -1066,15 +1393,20 @@ def _output_mind_map_result(result: Any, json_output: bool) -> None:
     default="briefing-doc",
     help="Report format (default: briefing-doc)",
 )
+@notebook_option
 @click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
+    "--source",
+    "-s",
+    "source_ids",
+    multiple=True,
+    help="Limit to specific source IDs",
+    shell_complete=_complete_sources,
 )
-@click.option("--source", "-s", "source_ids", multiple=True, help="Limit to specific source IDs")
-@click.option("--language", default=None, help="Output language (default: from config or 'en')")
+@click.option(
+    "--language",
+    default=None,
+    help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
+)
 @click.option(
     "--append",
     "append_instructions",
@@ -1082,18 +1414,22 @@ def _output_mind_map_result(result: Any, json_output: bool) -> None:
     help="Append extra instructions to the built-in prompt for non-custom formats. Has no effect with --format custom.",
 )
 @click.option("--wait/--no-wait", default=False, help="Wait for completion (default: no-wait)")
+@wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
 @with_client
 def generate_report_cmd(
     ctx,
     description,
+    prompt_file,
     report_format,
     notebook_id,
     source_ids,
     language,
     append_instructions,
     wait,
+    timeout,
+    interval,
     max_retries,
     json_output,
     client_auth,
@@ -1112,6 +1448,7 @@ def generate_report_cmd(
       notebooklm generate report --format briefing-doc --append "Focus on AI trends"
       notebooklm generate report --format study-guide --append "Target audience: beginners"
     """
+    description = resolve_prompt(description, prompt_file, "description")
     nb_id = require_notebook(notebook_id)
 
     # Smart detection: if description provided without explicit format change, treat as custom
@@ -1148,8 +1485,10 @@ def generate_report_cmd(
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            sources = await resolve_source_ids(
+                client, nb_id_resolved, source_ids, json_output=json_output
+            )
 
             async def _generate():
                 return await client.artifacts.generate_report(
@@ -1163,7 +1502,14 @@ def generate_report_cmd(
 
             result = await generate_with_retry(_generate, max_retries, format_display, json_output)
             await handle_generation_result(
-                client, nb_id_resolved, result, format_display, wait, json_output
+                client,
+                nb_id_resolved,
+                result,
+                format_display,
+                wait,
+                json_output,
+                timeout=float(timeout),
+                interval=float(interval),
             )
 
     return _run()

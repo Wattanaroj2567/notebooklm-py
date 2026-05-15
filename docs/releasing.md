@@ -1,7 +1,7 @@
 # Release Checklist
 
 **Status:** Active
-**Last Updated:** 2026-05-09
+**Last Updated:** 2026-05-14
 
 Checklist for releasing a new version of `notebooklm-py`.
 
@@ -53,7 +53,8 @@ Proceed with release preparation?
   ```
 - [ ] Set up the development environment:
   ```bash
-  uv sync --all-extras
+  # `[all]` excludes the cookies extra (Python 3.13+ rookiepy issue) — see docs/installation.md#all-vs-all-extras
+  uv sync --frozen --extra browser --extra dev --extra markdown
   uv run playwright install chromium
   ```
 
@@ -137,6 +138,11 @@ Proceed with release preparation?
   uv run pre-commit run --all-files && uv run mypy src/notebooklm --ignore-missing-imports && uv run pytest
   ```
 - [ ] Ensure CI runs the same lint gate (`pre-commit run --all-files`) as local release prep
+- [ ] Run documentation drift checks (mirror the CI gates in `.github/workflows/test.yml`):
+  ```bash
+  uv run python scripts/check_ci_install_parity.py
+  uv run python scripts/check_claude_md_freshness.py
+  ```
 - [ ] Fix any issues before proceeding
 
 ### Commit

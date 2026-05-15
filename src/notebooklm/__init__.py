@@ -3,7 +3,7 @@
 Example usage:
     from notebooklm import NotebookLMClient
 
-    async with NotebookLMClient.from_storage() as client:
+    async with await NotebookLMClient.from_storage() as client:
         notebooks = await client.notebooks.list()
         await client.sources.add_url(notebook_id, "https://example.com")
         result = await client.chat.ask(notebook_id, "What is this about?")
@@ -56,6 +56,7 @@ from .exceptions import (
     ArtifactParseError,
     # RPC Protocol
     AuthError,
+    AuthExtractionError,
     # Domain: Chat
     ChatError,
     ClientError,
@@ -64,6 +65,8 @@ from .exceptions import (
     DecodingError,
     # Network
     NetworkError,
+    # Idempotency (T7.B2)
+    NonIdempotentRetryError,
     # Domain: Notebooks
     NotebookError,
     NotebookLimitError,
@@ -97,6 +100,8 @@ from .types import (
     ChatMode,
     ChatReference,
     ChatResponseLength,
+    CitedSourceSelection,
+    ConnectionLimits,
     ConversationTurn,
     DriveMimeType,
     ExportType,
@@ -141,6 +146,7 @@ __all__ = [
     # Types
     "AccountLimits",
     "AccountTier",
+    "ConnectionLimits",
     "Notebook",
     "NotebookDescription",
     "NotebookMetadata",
@@ -156,6 +162,7 @@ __all__ = [
     "ChatReference",
     "AskResult",
     "ChatMode",
+    "CitedSourceSelection",
     "SharedUser",
     "ShareStatus",
     # Base Exceptions
@@ -167,11 +174,14 @@ __all__ = [
     "DecodingError",
     "UnknownRPCMethodError",
     "AuthError",
+    "AuthExtractionError",
     "NetworkError",
     "RPCTimeoutError",
     "RateLimitError",
     "ServerError",
     "ClientError",
+    # Idempotency (T7.B2)
+    "NonIdempotentRetryError",
     # Domain Exceptions: Notebooks
     "NotebookError",
     "NotebookNotFoundError",

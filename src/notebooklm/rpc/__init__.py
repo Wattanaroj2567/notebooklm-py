@@ -9,14 +9,16 @@ from .decoder import (
     RPCErrorCode,
     RPCTimeoutError,
     ServerError,
+    UnknownRPCMethodError,
     collect_rpc_ids,
     decode_response,
     extract_rpc_result,
     get_error_message_for_code,
     parse_chunked_response,
+    safe_index,
     strip_anti_xssi,
 )
-from .encoder import build_request_body, encode_rpc_request
+from .encoder import build_request_body, encode_rpc_request, nest_source_ids
 from .types import (
     BATCHEXECUTE_URL,
     QUERY_URL,
@@ -42,6 +44,10 @@ from .types import (
     VideoFormat,
     VideoStyle,
     artifact_status_to_str,
+    get_batchexecute_url,
+    get_query_url,
+    get_upload_url,
+    resolve_rpc_id,
 )
 
 __all__ = [
@@ -49,6 +55,10 @@ __all__ = [
     "BATCHEXECUTE_URL",
     "QUERY_URL",
     "UPLOAD_URL",
+    "get_batchexecute_url",
+    "get_query_url",
+    "get_upload_url",
+    "resolve_rpc_id",
     "ArtifactTypeCode",
     "StudioContentType",  # Deprecated alias
     "ArtifactStatus",
@@ -71,11 +81,13 @@ __all__ = [
     "ExportType",
     "encode_rpc_request",
     "build_request_body",
+    "nest_source_ids",
     "strip_anti_xssi",
     "parse_chunked_response",
     "extract_rpc_result",
     "collect_rpc_ids",
     "decode_response",
+    "safe_index",
     # Exceptions
     "RPCError",
     "AuthError",
@@ -84,6 +96,7 @@ __all__ = [
     "RateLimitError",
     "ServerError",
     "ClientError",
+    "UnknownRPCMethodError",
     # Error handling utilities
     "RPCErrorCode",
     "get_error_message_for_code",

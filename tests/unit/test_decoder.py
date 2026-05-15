@@ -4,11 +4,13 @@ import json
 
 import pytest
 
+from notebooklm.exceptions import DecodingError
 from notebooklm.rpc.decoder import (
     AuthError,
     ClientError,
     RateLimitError,
     RPCError,
+    UnknownRPCMethodError,
     collect_rpc_ids,
     decode_response,
     extract_rpc_result,
@@ -45,6 +47,11 @@ class TestStripAntiXSSI:
 
 
 class TestParseChunkedResponse:
+    @staticmethod
+    def _chunk_record(data):
+        chunk_json = json.dumps(data)
+        return f"{len(chunk_json.encode('utf-8'))}\n{chunk_json}"
+
     def test_parses_single_chunk(self):
         """Test parsing response with single chunk."""
         chunk_data = ["chunk", "data"]
@@ -93,7 +100,8 @@ class TestParseChunkedResponse:
 
     def test_ignores_malformed_chunks(self):
         """Test malformed chunks are ignored when below 10% threshold."""
-        # Add 10 valid chunks and 1 malformed = 9% error rate (below 10% threshold)
+        # Add 10 valid chunk records and 1 malformed record, keeping the record-based
+        # error rate below the 10% threshold.
         valid_chunks = [json.dumps([f"valid{i}"]) for i in range(10)]
         valid_parts = "\n".join([f"{len(c)}\n{c}" for c in valid_chunks])
         response = f"{valid_parts}\n99\nnot-json\n"
@@ -103,6 +111,65 @@ class TestParseChunkedResponse:
         assert len(chunks) == 10
         assert chunks[0] == ["valid0"]
         assert chunks[9] == ["valid9"]
+
+    def test_warns_but_parses_mismatched_byte_count_with_valid_json(self, caplog):
+        """Mismatched byte counts are tolerated when the payload is valid JSON."""
+        valid_parts = "\n".join(self._chunk_record([f"valid{i}"]) for i in range(10))
+        payload = json.dumps(["wrong-size"])
+        response = f"{valid_parts}\n{len(payload) + 1}\n{payload}\n"
+
+        chunks = parse_chunked_response(response)
+
+        assert chunks == [[f"valid{i}"] for i in range(10)] + [["wrong-size"]]
+        assert "declares" in caplog.text
+        assert "payload is" in caplog.text
+
+    def test_skips_byte_count_without_payload_below_threshold(self, caplog):
+        """A trailing byte-count line without a payload is malformed and skipped."""
+        valid_parts = "\n".join(self._chunk_record([f"valid{i}"]) for i in range(10))
+        response = f"{valid_parts}\n42\n"
+
+        chunks = parse_chunked_response(response)
+
+        assert chunks == [[f"valid{i}"] for i in range(10)]
+        assert "without payload" in caplog.text
+
+    def test_skips_payload_split_across_lines_below_threshold(self):
+        """A payload split across lines is treated as truncated malformed input."""
+        valid_parts = "\n".join(self._chunk_record([f"valid{i}"]) for i in range(20))
+        payload = json.dumps(["split"])
+        first_part, second_part = payload[:4], payload[4:]
+        response = f"{valid_parts}\n{len(payload)}\n{first_part}\n{second_part}\n"
+
+        chunks = parse_chunked_response(response)
+
+        assert chunks == [[f"valid{i}"] for i in range(20)]
+
+    def test_skips_extra_non_json_lines_before_and_after_valid_chunk(self):
+        """Standalone non-JSON lines are skipped while valid chunks are preserved."""
+        valid_parts = "\n".join(self._chunk_record([f"valid{i}"]) for i in range(20))
+        response = f"noise-before\n{valid_parts}\nnoise-after\n"
+
+        chunks = parse_chunked_response(response)
+
+        assert chunks == [[f"valid{i}"] for i in range(20)]
+
+    def test_error_rate_exactly_ten_percent_is_tolerated(self):
+        """The malformed-record threshold is exclusive: exactly 10% does not raise."""
+        valid_lines = "\n".join(json.dumps([f"valid{i}"]) for i in range(9))
+        response = f"{valid_lines}\nnot-json\n"
+
+        chunks = parse_chunked_response(response)
+
+        assert chunks == [[f"valid{i}"] for i in range(9)]
+
+    def test_error_rate_just_above_ten_percent_raises(self):
+        """The parser raises once malformed records exceed 10%."""
+        valid_lines = "\n".join(json.dumps([f"valid{i}"]) for i in range(8))
+        response = f"{valid_lines}\nnot-json\n"
+
+        with pytest.raises(RPCError, match="Response parsing failed"):
+            parse_chunked_response(response)
 
 
 class TestExtractRPCResult:
@@ -654,3 +721,88 @@ class TestAuthError:
         error = AuthError("Token expired", method_id="abc123")
         assert str(error) == "Token expired"
         assert error.method_id == "abc123"
+
+
+class TestUnknownRPCMethodErrorRouting:
+    """The 'requested rpc_id missing but other IDs found' branch routes to
+    ``UnknownRPCMethodError`` (a ``DecodingError`` subclass), not plain
+    ``RPCError``. Other null-result branches must keep raising ``RPCError``.
+    """
+
+    def _build_raw_missing(self) -> tuple[str, str, list[str]]:
+        """Build a response where requested ID is missing but another is present."""
+        requested = "OldMethodId"
+        actual = "NewMethodId"
+        inner = json.dumps([])
+        chunk = json.dumps(["wrb.fr", actual, inner, None, None])
+        raw = f")]}}'\n{len(chunk)}\n{chunk}\n"
+        return raw, requested, [actual]
+
+    def test_missing_id_raises_unknown_rpc_method_error(self):
+        raw, requested, found = self._build_raw_missing()
+        with pytest.raises(UnknownRPCMethodError) as exc_info:
+            decode_response(raw, requested)
+        err = exc_info.value
+        assert err.method_id == requested
+        assert err.found_ids == found
+        # raw_response must match the legacy RPCError preview semantics.
+        assert err.raw_response is not None
+        assert isinstance(err.raw_response, str)
+        # Message text unchanged.
+        assert "may have changed" in str(err)
+        assert requested in str(err)
+
+    def test_unknown_method_error_catchable_as_rpc_error(self):
+        raw, requested, _ = self._build_raw_missing()
+        with pytest.raises(RPCError):
+            decode_response(raw, requested)
+
+    def test_unknown_method_error_catchable_as_decoding_error(self):
+        raw, requested, _ = self._build_raw_missing()
+        with pytest.raises(DecodingError):
+            decode_response(raw, requested)
+
+    def test_unknown_method_error_catchable_as_specific_type(self):
+        raw, requested, _ = self._build_raw_missing()
+        with pytest.raises(UnknownRPCMethodError):
+            decode_response(raw, requested)
+
+    def test_status_code_branch_still_plain_rpc_error(self):
+        """Negative test: status-code [13] branch must NOT reroute."""
+        rpc_id = RPCMethod.GET_NOTEBOOK.value
+        chunk = json.dumps(["wrb.fr", rpc_id, None, None, None, [13], "generic"])
+        raw = f")]}}'\n{len(chunk)}\n{chunk}\n"
+        with pytest.raises(RPCError) as exc_info:
+            decode_response(raw, rpc_id)
+        # Must be plain RPCError (or ClientError for 5/7), but NEVER UnknownRPCMethodError.
+        assert not isinstance(exc_info.value, UnknownRPCMethodError)
+
+    def test_null_result_branch_still_plain_rpc_error(self):
+        """Negative test: null-result-no-status branch must NOT reroute."""
+        rpc_id = RPCMethod.GET_NOTEBOOK.value
+        chunk = json.dumps(["wrb.fr", rpc_id, None, None, None, None])
+        raw = f")]}}'\n{len(chunk)}\n{chunk}\n"
+        with pytest.raises(RPCError) as exc_info:
+            decode_response(raw, rpc_id)
+        assert not isinstance(exc_info.value, UnknownRPCMethodError)
+
+    def test_no_rpc_data_branch_still_plain_rpc_error(self):
+        """Negative test: empty-chunks branch must NOT reroute."""
+        raw = ")]}'\n"
+        with pytest.raises(RPCError) as exc_info:
+            decode_response(raw, "AnyId")
+        assert not isinstance(exc_info.value, UnknownRPCMethodError)
+
+    def test_preserves_byte_for_byte_payload_of_legacy_branch(self):
+        """raw_response, method_id, and found_ids match legacy RPCError shape."""
+        raw, requested, found = self._build_raw_missing()
+        with pytest.raises(UnknownRPCMethodError) as exc_info:
+            decode_response(raw, requested)
+        err = exc_info.value
+        # Same fields legacy RPCError populated.
+        assert err.method_id == requested
+        assert err.found_ids == found
+        assert err.raw_response is not None
+        # raw_response preview cap (80 chars + "..." = 83) preserved by the
+        # base RPCError contract (NOTEBOOKLM_DEBUG=1 opts into full body).
+        assert len(err.raw_response) <= 83

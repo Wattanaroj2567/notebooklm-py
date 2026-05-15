@@ -11,6 +11,8 @@ Commands:
 Note: Sharing commands moved to 'share' command group.
 """
 
+from typing import Literal
+
 import click
 from rich.table import Table
 
@@ -22,8 +24,10 @@ from .helpers import (
     json_output_response,
     require_notebook,
     resolve_notebook_id,
+    set_current_notebook,
     with_client,
 )
+from .options import list_options, notebook_option
 
 
 def register_notebook_commands(cli):
@@ -31,13 +35,27 @@ def register_notebook_commands(cli):
 
     @cli.command("list")
     @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+    @list_options
     @with_client
-    def list_cmd(ctx, json_output, client_auth):
-        """List all notebooks."""
+    def list_cmd(ctx, json_output, limit, no_truncate, client_auth):
+        """List all notebooks.
+
+        \b
+        Pagination & display:
+          --limit N         Show at most N notebooks (default: unlimited).
+          --no-truncate     Do not truncate the Title column in the table view.
+        """
 
         async def _run():
             async with NotebookLMClient(client_auth) as client:
                 notebooks = await client.notebooks.list()
+
+                # P6.T1 / I16: client-side offset slicing. No server-side
+                # cursors in scope for this phase — `client.notebooks.list()`
+                # always returns the full result set, we just trim before
+                # rendering / counting.
+                if limit is not None and limit >= 0:
+                    notebooks = notebooks[:limit]
 
                 if json_output:
                     data = {
@@ -58,7 +76,12 @@ def register_notebook_commands(cli):
 
                 table = Table(title="Notebooks")
                 table.add_column("ID", style="cyan")
-                table.add_column("Title", style="green")
+                # P6.T1 / I16: keep the legacy unconstrained Title rendering
+                # by default and rely on the explicit --no-truncate to also
+                # disable Rich's auto-ellipsis at narrow terminals via
+                # overflow="fold".
+                title_overflow: Literal["fold", "ellipsis"] = "fold" if no_truncate else "ellipsis"
+                table.add_column("Title", style="green", overflow=title_overflow)
                 table.add_column("Owner")
                 table.add_column("Created", style="dim")
 
@@ -73,38 +96,60 @@ def register_notebook_commands(cli):
 
     @cli.command("create")
     @click.argument("title")
+    @click.option(
+        "--use",
+        "-u",
+        "switch_context",
+        is_flag=True,
+        help="Set the new notebook as the current context (like 'notebooklm use <id>').",
+    )
     @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
     @with_client
-    def create_cmd(ctx, title, json_output, client_auth):
-        """Create a new notebook."""
+    def create_cmd(ctx, title, switch_context, json_output, client_auth):
+        """Create a new notebook.
+
+        By default, creates the notebook without changing the active context.
+        Pass --use (or -u) to make the new notebook the current context, so
+        subsequent commands like 'source add' target it.
+        """
 
         async def _run():
             async with NotebookLMClient(client_auth) as client:
                 nb = await client.notebooks.create(title)
 
+                if switch_context:
+                    created_str = nb.created_at.strftime("%Y-%m-%d") if nb.created_at else None
+                    set_current_notebook(nb.id, nb.title, nb.is_owner, created_str)
+
                 if json_output:
-                    data = {
+                    data: dict = {
                         "notebook": {
                             "id": nb.id,
                             "title": nb.title,
                             "created_at": nb.created_at.isoformat() if nb.created_at else None,
                         }
                     }
+                    # I12: when --use switched the active context, surface the
+                    # new active notebook id at the top level so callers can
+                    # branch on the field without scraping the "Context set
+                    # to ..." prose or round-tripping through `status --json`.
+                    if switch_context:
+                        data["active_notebook_id"] = nb.id
                     json_output_response(data)
                     return
 
                 console.print(f"[green]Created notebook:[/green] {nb.id} - {nb.title}")
+                if switch_context:
+                    console.print("[dim]Context set to new notebook[/dim]")
+                else:
+                    console.print(
+                        f"[dim]Tip: pass --use next time, or run 'notebooklm use {nb.id}'.[/dim]"
+                    )
 
         return _run()
 
     @cli.command("delete")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set). Supports partial IDs.",
-    )
+    @notebook_option
     @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
     @with_client
     def delete_cmd(ctx, notebook_id, yes, client_auth):
@@ -137,13 +182,7 @@ def register_notebook_commands(cli):
 
     @cli.command("rename")
     @click.argument("new_title")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set). Supports partial IDs.",
-    )
+    @notebook_option
     @with_client
     def rename_cmd(ctx, new_title, notebook_id, client_auth):
         """Rename a notebook.
@@ -162,13 +201,7 @@ def register_notebook_commands(cli):
         return _run()
 
     @cli.command("summary")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set). Supports partial IDs.",
-    )
+    @notebook_option
     @click.option("--topics", is_flag=True, help="Include suggested topics")
     @with_client
     def summary_cmd(ctx, notebook_id, topics, client_auth):
@@ -201,13 +234,7 @@ def register_notebook_commands(cli):
         return _run()
 
     @cli.command("metadata")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set). Supports partial IDs.",
-    )
+    @notebook_option
     @click.option(
         "--json",
         "json_output",
@@ -237,7 +264,9 @@ def register_notebook_commands(cli):
         async def _run():
             async with NotebookLMClient(client_auth) as client:
                 # Resolve partial ID
-                resolved_id = await resolve_notebook_id(client, notebook_id)
+                resolved_id = await resolve_notebook_id(
+                    client, notebook_id, json_output=json_output
+                )
 
                 # Get metadata (use notebooks.get_metadata)
                 metadata = await client.notebooks.get_metadata(resolved_id)

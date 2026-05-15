@@ -7,9 +7,13 @@ and importing discovered sources into notebooks.
 import logging
 from typing import Any
 
+from . import research as _research_pub
 from ._core import ClientCore
 from .exceptions import ValidationError
 from .rpc import RPCMethod
+from .types import CitedSourceSelection
+
+__all__ = ["CitedSourceSelection", "ResearchAPI"]
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +31,7 @@ class ResearchAPI:
     importing discovered sources into notebooks.
 
     Usage:
-        async with NotebookLMClient.from_storage() as client:
+        async with await NotebookLMClient.from_storage() as client:
             # Start research
             task = await client.research.start(notebook_id, "quantum computing")
 
@@ -80,6 +84,37 @@ class ResearchAPI:
             return ""
         chunks = [chunk for chunk in src[6] if isinstance(chunk, str) and chunk]
         return "\n\n".join(chunks)
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Normalize source/report URLs for citation matching.
+
+        Thin wrapper retained for backward compatibility. Delegates to
+        :func:`notebooklm.research.normalize_url`.
+        """
+        return _research_pub.normalize_url(url)
+
+    @classmethod
+    def extract_report_urls(cls, report: str) -> set[str]:
+        """Extract normalized URLs from research report markdown/text.
+
+        Thin wrapper retained for backward compatibility. Delegates to
+        :func:`notebooklm.research.extract_report_urls`.
+        """
+        return _research_pub.extract_report_urls(report)
+
+    @classmethod
+    def select_cited_sources(
+        cls,
+        sources: list[dict[str, Any]],
+        report: str,
+    ) -> CitedSourceSelection:
+        """Return research sources cited by the completed report.
+
+        Thin wrapper retained for backward compatibility. Delegates to
+        :func:`notebooklm.research.select_cited_sources`.
+        """
+        return _research_pub.select_cited_sources(sources, report)
 
     async def start(
         self,

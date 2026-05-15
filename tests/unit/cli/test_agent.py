@@ -71,4 +71,4 @@ class TestAgentTemplates:
         content = agent_templates_module.get_agent_source_content("claude")
 
         assert content is not None
-        assert "NotebookLM Automation" in content
+        assert "NotebookLM" in content

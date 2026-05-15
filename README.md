@@ -55,7 +55,7 @@
 | **Research** | Web and Drive research agents (fast/deep modes) with auto-import |
 | **Sharing** | Public/private links, user permissions (viewer/editor), view level control |
 
-### Content Generation (All NotebookLM Studio Types)
+### Content Generation (All Artifact Types)
 
 | Type | Options | Download Format |
 |------|---------|-----------------|
@@ -88,29 +88,24 @@ These features are available via API/CLI but not exposed in NotebookLM's web int
 
 ## Installation
 
-```bash
-# Basic installation
-pip install notebooklm-py
+The full install guide — six personas (agent, end-user, library, headless, contributor, power-user), optional extras matrix, platform notes — lives in **[docs/installation.md](docs/installation.md)**.
 
-# With browser login support (required for first-time setup)
-pip install "notebooklm-py[browser]"
-playwright install chromium
-
-# Optional: import cookies from your existing browser instead of running Playwright
-pip install "notebooklm-py[cookies]"
-```
-
-If `playwright install chromium` fails with `TypeError: onExit is not a function`, see the Linux workaround in [Troubleshooting](docs/troubleshooting.md#linux).
-
-### Development Installation
-
-For contributors or testing unreleased features:
+**Quickest start** (CLI users and AI agents):
 
 ```bash
-pip install git+https://github.com/teng-lin/notebooklm-py@main
+pip install "notebooklm-py[browser]"   # core + Playwright
+playwright install chromium             # ~170 MB; no progress bar — be patient (30–90 s)
+notebooklm login                        # opens browser for Google sign-in
+notebooklm auth check --test --json     # verify: expect "status": "ok"
 ```
 
-⚠️ The main branch may contain unstable changes. Use PyPI releases for production.
+**As a library** (embedded in your app — no Playwright, no Chromium):
+
+```bash
+pip install notebooklm-py               # ~10 MB; ship a pre-acquired storage_state.json
+```
+
+If `playwright install chromium` fails on Linux with `TypeError: onExit is not a function`, see the [Linux workaround](docs/troubleshooting.md#linux). **Contributors:** see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick Start
 
@@ -143,8 +138,9 @@ notebooklm source add "./paper.pdf"
 
 # 3. Chat with your sources
 notebooklm ask "What are the key themes?"
+notebooklm ask --prompt-file ./long_question.txt  # Read question from file
 
-# 4. Generate content
+# 4. Generate content (use --prompt-file for long prompts)
 notebooklm generate audio "make it engaging" --wait
 notebooklm generate video --style whiteboard --wait
 notebooklm generate cinematic-video "documentary-style summary" --wait
@@ -171,6 +167,8 @@ Other useful CLI commands:
 
 ```bash
 notebooklm auth check --test         # Diagnose auth/cookie issues
+notebooklm auth refresh --quiet      # One-shot cookie keepalive (for cron / launchd / systemd)
+notebooklm auth refresh --browser-cookies chrome  # Re-extract and repair account routing
 notebooklm agent show codex          # Print bundled Codex instructions
 notebooklm agent show claude         # Print bundled Claude Code skill template
 notebooklm language list             # List supported output languages
@@ -181,6 +179,8 @@ notebooklm skill status              # Check local agent skill installation
 notebooklm profile list              # List all Google account profiles
 notebooklm profile switch work       # Switch active account profile
 ```
+
+Use `--prompt-file PATH` with `ask`, prompt-based `generate` commands, and `source add-research` when the text is too long for the shell command line. This reads prompt/query text from a file and is separate from `source add ./file.pdf`, which still uploads that file as a NotebookLM source.
 
 ### Python API
 

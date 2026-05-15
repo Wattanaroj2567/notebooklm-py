@@ -1,9 +1,13 @@
 # Contributing Guide
 
 **Status:** Active
-**Last Updated:** 2026-03-12
+**Last Updated:** 2026-05-14
 
 This guide covers everything you need to contribute to `notebooklm-py`: architecture overview, testing, and releasing.
+
+> **New contributor?** Start with [CONTRIBUTING.md](../CONTRIBUTING.md) at the
+> repo root for the install/lint/test workflow and PR conventions, then come
+> back here for architectural context once you're ready to write code.
 
 ---
 
@@ -101,15 +105,68 @@ src/notebooklm/
 
 ---
 
+## Concurrency Model
+
+Multiple `notebooklm` processes (parallel CLI runs, an in-process keepalive
+beside a cron-driven `notebooklm auth refresh`, container start-up races,
+`xargs -P` fan-outs) can target the same `NOTEBOOKLM_HOME` simultaneously.
+The library coordinates with **cross-process file locks** (POSIX `flock` /
+Windows `LockFileEx`, via the [`filelock`](https://pypi.org/project/filelock/)
+package) so reads and writes against shared on-disk state never tear or
+clobber a sibling's update.
+
+All locks are sibling files next to the resource they guard (zero-byte,
+left on disk after release — `filelock` reuses them).
+
+| Lock file | Owner | Scope | Acquisition |
+|---|---|---|---|
+| `<profile>/storage_state.json.lock` | `auth.save_cookies_to_storage` (`auth.py:1935`) | Read-merge-write of `storage_state.json` (cookie sync after a rotation or 302) | Blocking exclusive |
+| `<profile>/.storage_state.json.rotate.lock` | `auth._poke_session` (`auth.py:2817`) | Cross-process dedup of the `accounts.google.com/RotateCookies` keepalive POST | Non-blocking exclusive (`LOCK_NB`); skip on contention |
+| `<home>/.migration.lock` | `migration.migrate_to_profiles` (`migration.py:28`) | One-shot legacy→profile layout migration on startup | Blocking exclusive, 30s timeout (raises `MigrationLockTimeoutError`) |
+| `<profile>/context.json.lock` | `cli.helpers.set_context` / `clear_context` via `_atomic_io.atomic_update_json` (`_atomic_io.py:136`) | Read-modify-write of the active-notebook/account-routing context for a profile | Blocking exclusive, 10s timeout |
+
+Design notes:
+
+- **Two layered storage locks (not one).** The `.lock` and `.rotate.lock`
+  files protect the *same* `storage_state.json` but serve different access
+  patterns: a long-running save must not block — or be blocked by — a
+  best-effort rotation poke. Keeping them separate prevents the keepalive
+  from queueing behind a slow cookie write (and vice-versa).
+- **Fail-open on lock infrastructure failure.** When the lock file itself
+  cannot be created (read-only home dir, NFS without `flock`, permission
+  denied), `_poke_session` proceeds *without* coordination rather than
+  wedging forever. A duplicate rotation across processes is bounded and
+  harmless; a permanently-suppressed rotation is not.
+- **Locks are sibling files, never the resource itself.** `filelock` reuses
+  the sentinel across invocations, so cleanup is not required — and a
+  TOCTOU race between unlink and reacquire is avoided.
+- **In-process serializers complement, not replace, file locks.**
+  `auth._poke_session` also takes an `asyncio.Lock` keyed on
+  `(event_loop, profile)` to dedupe an `asyncio.gather` fan-out before
+  reaching the cross-process flock — the file lock only sees one
+  contender per process per rate-limit window.
+
+Path resolution for all locked resources flows through `paths.py`
+(`get_storage_path`, `get_context_path`, `get_home_dir`), so a `--storage`
+override or a different `NOTEBOOKLM_PROFILE` automatically yields a distinct
+lock sibling and the two invocations never contend.
+
+---
+
 ## Testing
 
 ### Prerequisites
 
-1. **Install dependencies:**
+1. **Install dependencies** (canonical contributor flow — see [docs/installation.md#e-contributor](installation.md#e-contributor) for details):
    ```bash
-   uv sync --extra dev --extra browser
+   uv sync --frozen --extra browser --extra dev --extra markdown
+   uv run playwright install chromium
    uv run pre-commit install
    ```
+
+   The `browser` extra is required for the default `uv run pytest` suite because
+   several unit tests import and patch `playwright.sync_api`. The command
+   `uv sync --frozen --extra dev` installs the test tools, but not Playwright.
 
    CI runs the same lint gate with `uv run pre-commit run --all-files`, so local hook results should match the `quality` job.
 
@@ -174,12 +231,35 @@ NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID=<work-nb-id> \
 
 ```
 tests/
-├── unit/               # No network, fast, mock everything
-├── integration/        # Mocked HTTP responses + VCR cassettes
-│   ├── test_vcr_*.py   # Client-level VCR tests
-│   └── cli_vcr/        # CLI integration tests with VCR
-└── e2e/                # Real API calls (requires auth)
+├── unit/                            # No network, fast, mock everything
+├── integration/                     # Mocked HTTP responses + VCR cassettes
+│   ├── test_artifacts.py            # ArtifactsAPI integration
+│   ├── test_artifacts_drift.py      # CREATE_ARTIFACT payload drift guard
+│   ├── test_auto_refresh.py         # Keepalive/refresh integration
+│   ├── test_chat.py                 # ChatAPI integration
+│   ├── test_cli_source_delete.py    # CLI source-delete path
+│   ├── test_core.py                 # ClientCore + RPC plumbing
+│   ├── test_download_multi_artifact.py
+│   ├── test_get_summary_drift.py    # GET_NOTEBOOK_SUMMARY drift guard
+│   ├── test_notebooks.py            # NotebooksAPI integration
+│   ├── test_notes.py                # NotesAPI integration
+│   ├── test_research_api.py         # ResearchAPI integration
+│   ├── test_settings.py             # SettingsAPI integration
+│   ├── test_sharing.py              # SharingAPI integration
+│   ├── test_skill_packaging.py      # Packaging smoke (skills, entry-points)
+│   ├── test_sources.py              # SourcesAPI integration
+│   ├── test_vcr_comprehensive.py    # End-to-end VCR walkthrough
+│   ├── test_vcr_example.py          # VCR pattern reference
+│   ├── test_vcr_real_api.py         # VCR against real-API cassettes
+│   ├── cli_vcr/                     # CLI → Client → RPC VCR tests
+│   └── concurrency/                 # Cross-process / asyncio races
+└── e2e/                             # Real API calls (requires auth)
 ```
+
+The `*_drift.py` tests are payload-shape canaries: they decode a recorded
+RPC response (or assemble a synthetic one) and assert the live decoder still
+produces the expected dataclass. They fail loudly when Google changes a
+payload field, so the failure shows up here before users hit it.
 
 ### VCR Testing (Recorded HTTP)
 
@@ -200,12 +280,60 @@ uv run pytest tests/integration/
 
 # Run only CLI VCR tests
 uv run pytest tests/integration/cli_vcr/
-
-# Record new cassettes (sensitive data auto-scrubbed)
-NOTEBOOKLM_VCR_RECORD=1 uv run pytest tests/integration/test_vcr_*.py -v
 ```
 
 Sensitive data (cookies, tokens, emails) is automatically scrubbed from cassettes.
+
+### Cassette recording
+
+Maintainers re-record cassettes against the live API when an RPC payload
+shape changes. Recording is opt-in (`NOTEBOOKLM_VCR_RECORD=1`) and requires
+a valid `notebooklm login` session.
+
+Two notebook env vars steer which notebook the recording session targets.
+**Neither UUID is committed** — both are per-maintainer secrets (notebook IDs
+are linkable to a Google account):
+
+| Env var | Used by | Notebook role |
+|---------|---------|---------------|
+| `NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID` | read-heavy cassettes (`list`, `download`, `get`) | A maintainer-owned notebook pre-populated with sources + artifacts. Tests only READ from it. |
+| `NOTEBOOKLM_GENERATION_NOTEBOOK_ID` | mutation/generation cassettes (`add source`, `generate`, `delete`) | A **separate** maintainer-owned notebook used only for destructive/generation flows, so the read-only notebook stays pristine. |
+
+#### One-time setup — generation notebook
+
+Run the setup script once per Google account that records cassettes:
+
+```bash
+uv run python tests/scripts/setup-generation-notebook.py
+```
+
+The script is idempotent: it reuses an existing notebook titled
+`VCR Generation Notebook (Tier 8)` if one already exists, otherwise creates it.
+It prints the notebook UUID and an `export` line. Copy the export line into
+your maintainer environment (e.g. `~/.zshrc` or a profile-specific `.env`
+file you do NOT commit):
+
+```bash
+export NOTEBOOKLM_GENERATION_NOTEBOOK_ID=<printed-uuid>
+```
+
+The script is a manual maintainer helper — CI never runs it.
+
+#### Recording a cassette
+
+```bash
+# Re-record (or record-new) cassettes; sensitive data auto-scrubbed
+NOTEBOOKLM_VCR_RECORD=1 uv run pytest tests/integration/test_vcr_*.py -v
+```
+
+The scrubbing pipeline (`tests/vcr_config.py`) redacts cookies, CSRF tokens,
+emails, and other sensitive patterns before the cassette hits disk. Verify
+the result with the cassette guard before committing:
+
+```bash
+# Current guard (a Python replacement is landing in the Tier 8 arc)
+tests/check_cassettes_clean.sh
+```
 
 ### E2E Fixtures
 
@@ -235,6 +363,81 @@ Need network?
         └── Generation → generation_notebook_id
             └── Parameter variant? → add @pytest.mark.variants
 ```
+
+---
+
+## Logging and observability
+
+### Levels — when to emit what
+
+- **WARNING** — data loss, protocol drift, schema mismatch, unexpected non-2xx that isn't auth-recoverable. Actionable.
+- **INFO** — coarse-grained lifecycle events (login complete, profile switched). Rare in library code; CLI uses INFO for user-facing progress.
+- **DEBUG** — expected fallbacks, hot-path parser branches, polling status, request/response metadata. Off by default; enable via `NOTEBOOKLM_LOG_LEVEL=DEBUG` or `notebooklm -vv`.
+- **Silent + comment** — best-effort discovery loops (browser cookie scan, alternative profile locations). `except` body is `pass` or `continue` with a single-line `# best-effort: <what we tried>` comment.
+
+### Credential redaction
+
+The package handler installed by `configure_logging()` has a `RedactingFilter` attached. It runs for every record reaching the handler, including records originating in child loggers (`notebooklm._core`, `notebooklm._chat`, etc.) via Python logging's default propagation. The filter scrubs:
+
+- CSRF tokens (`at=...`)
+- Session IDs (`f.sid=...`)
+- Google session cookies (`SAPISID`, `SID`, `HSID`, `SSID`, `__Secure-1PSID`, `__Secure-3PSID`)
+- `Authorization: Bearer <token>` headers
+- `Cookie: <jar>` headers
+
+The filter pre-renders `record.exc_info` traceback into a scrubbed `record.exc_text` while preserving `record.exc_info` itself. The live exception object is not mutated.
+
+To add a new secret pattern: edit `_REDACT_PATTERNS` in `src/notebooklm/_logging.py` and add a unit test in `tests/unit/test__logging.py` before merging.
+
+### Attaching your own handler
+
+`notebooklm` propagates to root by default, so `caplog`, `basicConfig`, and similar workflows work without configuration. To capture notebooklm logs in a dedicated handler:
+
+```python
+import logging
+from notebooklm._logging import apply_redaction
+
+handler = logging.handlers.SysLogHandler(...)
+apply_redaction(handler)
+logging.getLogger("notebooklm").addHandler(handler)
+```
+
+`apply_redaction()` attaches the `RedactingFilter` and wraps the formatter so your handler also benefits from credential scrubbing.
+
+### Style — always lazy formatting
+
+Use `%`-style log calls, not f-strings:
+
+```python
+logger.warning("Failed for %s in %.2fs", name, elapsed)  # OK
+logger.warning(f"Failed for {name} in {elapsed:.2f}s")    # BAD
+```
+
+f-string eager evaluation defeats lazy formatting and (although the filter would still scrub via `record.getMessage()`) makes profile-time cost unconditional.
+
+### Third-party loggers
+
+`httpx`, `urllib3`, and `asyncio` can emit at DEBUG with full URLs and headers containing notebooklm-py credentials. The CLI calls `install_redaction` automatically when `-vv` is set:
+
+```python
+from notebooklm._logging import install_redaction
+install_redaction("httpx", "urllib3")
+```
+
+Library consumers must do the same if they enable DEBUG on these loggers. If a third-party library sets `propagate=False` on its internal loggers (rare), pass child names explicitly:
+
+```python
+install_redaction("httpx._client", "urllib3.connectionpool")
+```
+
+### Trade-offs
+
+The `RedactingFilter` preserves `record.exc_info` (the live exception object) so handlers like Sentry can still access it. However:
+
+- Standard `logging.Formatter` uses `record.exc_text` (scrubbed by our filter) and does NOT re-render from `exc_info`. Safe.
+- Custom formatters that ignore `exc_text` and read `exc_info` directly may render an unredacted traceback. **Mitigation**: wrap such handlers with `apply_redaction()` so the formatter is decorated and post-scrubs the final output regardless of which exception attribute it reads.
+- Records propagate to root by default (`notebooklm.propagate = True`) so `caplog` and `basicConfig` work without changes. Our filter mutates the record before propagation, so downstream handlers (including root's) see the scrubbed version. **Caveat**: if a user attaches an unredacted handler directly to a child logger (`notebooklm._core`), that handler fires *before* propagation reaches our parent handler. Mitigation: `apply_redaction(child_handler)`.
+- Applications that want notebooklm logs *isolated* from root can set `logging.getLogger('notebooklm').propagate = False` themselves.
 
 ---
 
@@ -362,4 +565,5 @@ The `auth check --json` output shows:
 - Check existing implementations in `_*.py` files
 - Look at test files for expected structures
 - See [RPC Development Guide](rpc-development.md) for protocol details
+- See [CONTRIBUTING.md](../CONTRIBUTING.md) for install, lint, and PR workflow
 - Open an issue with captured request/response (sanitized)

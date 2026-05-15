@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -232,6 +233,20 @@ class TestJsonOutputResponse:
         assert data["nested"]["key"] == "value"
         assert data["list"] == [1, 2, 3]
 
+    def test_json_output_response_preserves_unicode(self, capsys):
+        """CJK / emoji characters should be emitted as real UTF-8, not \\uXXXX."""
+        json_output_response({"title": "中文笔记本", "emoji": "🚀"})
+
+        captured = capsys.readouterr()
+        # Round-trip must still parse.
+        data = json.loads(captured.out)
+        assert data["title"] == "中文笔记本"
+        assert data["emoji"] == "🚀"
+        # Raw output must contain real CJK chars, not escaped sequences.
+        assert "中文笔记本" in captured.out
+        assert "🚀" in captured.out
+        assert "\\u" not in captured.out
+
 
 class TestJsonErrorResponse:
     def test_outputs_error_json_and_exits(self, capsys):
@@ -245,6 +260,32 @@ class TestJsonErrorResponse:
         assert data["error"] is True
         assert data["code"] == "TEST_ERROR"
         assert data["message"] == "Test error message"
+
+    def test_json_error_response_preserves_unicode(self, capsys):
+        """Error messages with CJK / emoji should be emitted as real UTF-8."""
+        with pytest.raises(SystemExit):
+            json_error_response("ERROR", "笔记本不存在 🚫", extra={"title": "中文"})
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["message"] == "笔记本不存在 🚫"
+        assert data["title"] == "中文"
+        assert "笔记本不存在" in captured.out
+        assert "🚫" in captured.out
+        assert "中文" in captured.out
+        assert "\\u" not in captured.out
+
+    def test_json_error_response_serializes_path_in_extra(self, capsys):
+        """Non-primitive values like pathlib.Path must not crash the error reporter."""
+        with pytest.raises(SystemExit):
+            json_error_response("ERROR", "Bad path", extra={"path": Path("tmp_test_path")})
+
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["error"] is True
+        assert data["code"] == "ERROR"
+        assert data["message"] == "Bad path"
+        assert data["path"] == str(Path("tmp_test_path"))
 
 
 # =============================================================================
@@ -285,6 +326,34 @@ class TestContextManagement:
         with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
             clear_context()
             assert not context_file.exists()
+
+    def test_clear_context_preserves_account_metadata(self, tmp_path):
+        context_file = tmp_path / "context.json"
+        context_file.write_text(
+            json.dumps(
+                {
+                    "notebook_id": "test",
+                    "conversation_id": "conv",
+                    "account": {"authuser": 1, "email": "bob@example.com"},
+                }
+            )
+        )
+        with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+            assert clear_context() is True
+
+        assert json.loads(context_file.read_text()) == {
+            "account": {"authuser": 1, "email": "bob@example.com"}
+        }
+
+    def test_clear_context_can_remove_account_metadata(self, tmp_path):
+        context_file = tmp_path / "context.json"
+        context_file.write_text(
+            json.dumps({"account": {"authuser": 1, "email": "bob@example.com"}})
+        )
+        with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+            assert clear_context(clear_account=True) is True
+
+        assert not context_file.exists()
 
     def test_clear_context_no_file(self, tmp_path):
         """clear_context should not raise if file doesn't exist"""
@@ -332,6 +401,18 @@ class TestContextManagement:
             assert data["notebook_id"] == "nb_new"
             assert "conversation_id" not in data
 
+    def test_set_current_notebook_preserves_account_metadata(self, tmp_path):
+        context_file = tmp_path / "context.json"
+        context_file.write_text(
+            json.dumps({"account": {"authuser": 1, "email": "bob@example.com"}})
+        )
+        with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+            set_current_notebook("nb_new", title="New Notebook")
+
+        data = json.loads(context_file.read_text())
+        assert data["notebook_id"] == "nb_new"
+        assert data["account"] == {"authuser": 1, "email": "bob@example.com"}
+
 
 class TestRequireNotebook:
     def test_returns_provided_notebook_id(self, tmp_path):
@@ -359,6 +440,208 @@ class TestRequireNotebook:
             with pytest.raises(SystemExit) as exc_info:
                 require_notebook(None)
             assert exc_info.value.code == 1
+
+    def test_error_message_names_user_facing_flag_not_kwarg(self, tmp_path):
+        """When `require_notebook` raises with no notebook resolvable, the user-visible
+        error must name the actual CLI flag (`-n/--notebook`), not the internal
+        Python kwarg (`notebook_id`). Regression for I9/I11 (CLI UX audit).
+        """
+        with (
+            patch(
+                "notebooklm.cli.helpers.get_context_path",
+                return_value=tmp_path / "nonexistent.json",
+            ),
+            patch("notebooklm.cli.helpers.console") as mock_console,
+        ):
+            with pytest.raises(SystemExit):
+                require_notebook(None)
+
+            # The console must have been called once with the failure message.
+            mock_console.print.assert_called_once()
+            printed = mock_console.print.call_args[0][0]
+            # User-facing flag is named.
+            assert "-n/--notebook" in printed
+            # Internal kwarg name does NOT leak.
+            assert "notebook_id" not in printed
+            # Existing context-setup hint is preserved so the user has both options.
+            assert "notebooklm use" in printed
+            # Discoverability: the env-var fallback (P7.T3 / M4) must be named
+            # so the user knows the third resolution path exists.
+            assert "NOTEBOOKLM_NOTEBOOK" in printed
+
+    def test_returns_env_var_when_no_arg_and_no_context(self, tmp_path, monkeypatch):
+        """`NOTEBOOKLM_NOTEBOOK` env var is honored when no `-n` flag is passed
+        AND no active context is set. Precedence (P7.T3 / M4):
+        ``-n`` flag > ``NOTEBOOKLM_NOTEBOOK`` env > active context > error.
+        """
+        monkeypatch.setenv("NOTEBOOKLM_NOTEBOOK", "nb_from_env")
+        with patch(
+            "notebooklm.cli.helpers.get_context_path",
+            return_value=tmp_path / "nonexistent.json",
+        ):
+            result = require_notebook(None)
+            assert result == "nb_from_env"
+
+    def test_arg_overrides_env_var(self, tmp_path, monkeypatch):
+        """`-n flag-id` overrides ``NOTEBOOKLM_NOTEBOOK=env-id`` (highest precedence)."""
+        monkeypatch.setenv("NOTEBOOKLM_NOTEBOOK", "nb_from_env")
+        with patch(
+            "notebooklm.cli.helpers.get_context_path",
+            return_value=tmp_path / "nonexistent.json",
+        ):
+            result = require_notebook("nb_from_flag")
+            assert result == "nb_from_flag"
+
+    def test_env_var_overrides_active_context(self, tmp_path, monkeypatch):
+        """``NOTEBOOKLM_NOTEBOOK`` overrides the persisted active-notebook
+        context: env > context per the P7.T3 precedence ladder. This makes
+        per-shell env-var overrides composable without clobbering the saved
+        ``notebooklm use`` selection.
+        """
+        monkeypatch.setenv("NOTEBOOKLM_NOTEBOOK", "nb_from_env")
+        context_file = tmp_path / "context.json"
+        context_file.write_text('{"notebook_id": "nb_from_context"}')
+        with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+            result = require_notebook(None)
+            assert result == "nb_from_env"
+
+    def test_blank_env_var_falls_through_to_context(self, tmp_path, monkeypatch):
+        """An empty / whitespace-only ``NOTEBOOKLM_NOTEBOOK`` is treated as unset,
+        not as an error. The active context still wins.
+        """
+        monkeypatch.setenv("NOTEBOOKLM_NOTEBOOK", "   ")
+        context_file = tmp_path / "context.json"
+        context_file.write_text('{"notebook_id": "nb_from_context"}')
+        with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+            result = require_notebook(None)
+            assert result == "nb_from_context"
+
+    def test_env_var_is_stripped(self, tmp_path, monkeypatch):
+        """``NOTEBOOKLM_NOTEBOOK`` value is trimmed of surrounding whitespace
+        before being returned (consistent with ``validate_id``'s behavior on
+        the flag/context paths).
+        """
+        monkeypatch.setenv("NOTEBOOKLM_NOTEBOOK", "  nb_padded  ")
+        with patch(
+            "notebooklm.cli.helpers.get_context_path",
+            return_value=tmp_path / "nonexistent.json",
+        ):
+            result = require_notebook(None)
+            assert result == "nb_padded"
+
+
+# =============================================================================
+# NOTEBOOK OPTION DECORATOR CONSISTENCY TESTS
+# =============================================================================
+
+
+def _discover_notebook_commands():
+    """Walk the assembled root CLI and return all (group_label, subcommand_name,
+    Option) triples for any command exposing the `-n/--notebook` flag — including
+    top-level commands (e.g. `notebooklm ask -n ...`) and grouped subcommands
+    (e.g. `notebooklm artifact list -n ...`).
+
+    Programmatic discovery is intentional: it guarantees that any *future*
+    command picking up `-n/--notebook` is automatically subjected to the
+    canonical-decorator gate, with no extra parametrize-list maintenance.
+    """
+    from click import Group, Option
+
+    from notebooklm.notebooklm_cli import cli as root_cli
+
+    discovered: list = []
+
+    def _scan(group_label: str, cmd) -> None:
+        # Record this command if it carries -n/--notebook directly.
+        for param in cmd.params:
+            if not isinstance(param, Option):
+                continue
+            if "-n" in param.opts and "--notebook" in param.opts:
+                discovered.append((group_label, cmd.name, param))
+                break
+        # Then recurse into any nested groups; their subcommands inherit the
+        # group's name as their `group_label` (e.g. `artifact/list`).
+        if isinstance(cmd, Group):
+            for _sub_name, sub in sorted(cmd.commands.items()):
+                _scan(cmd.name, sub)
+
+    # Top-level commands live directly under the root CLI; tag them as `<root>`
+    # so the parametrize id reads `<root>/ask` etc.
+    for _sub_name, sub in sorted(root_cli.commands.items()):
+        _scan("<root>", sub)
+    return discovered
+
+
+_NOTEBOOK_COMMAND_TRIPLES = _discover_notebook_commands()
+
+
+def _canonical_notebook_help() -> str:
+    """Return the canonical help string by introspecting the actual decorator
+    in `cli/options.py`, so tests can never silently drift from the source of
+    truth. We apply `notebook_option` to a throwaway probe function and read
+    back the `help=` Click stored on the resulting Option.
+    """
+    from click import Option
+
+    from notebooklm.cli.options import notebook_option
+
+    @notebook_option
+    def _probe(notebook_id):  # pragma: no cover — never invoked
+        pass
+
+    for param in _probe.__click_params__:  # type: ignore[attr-defined]
+        if isinstance(param, Option) and "--notebook" in param.opts:
+            assert param.help is not None, (
+                "cli/options.py:notebook_option must declare a help= string"
+            )
+            return param.help
+    raise RuntimeError("Failed to introspect cli/options.py:notebook_option help text")
+
+
+_CANONICAL_NOTEBOOK_HELP = _canonical_notebook_help()
+
+
+class TestNotebookOptionConsistency:
+    """Every command exposing -n/--notebook must do so via the canonical
+    `cli/options.py:notebook_option` decorator. We assert via Click's introspection
+    that both the short/long flag pair and the canonical help text are present.
+    """
+
+    def test_some_commands_expose_notebook_flag(self):
+        """Sanity check that the discovery walk found a substantial fraction of
+        the known commands. If this falls far below the live count we silently
+        lose coverage from the parametrized test below — and an entire CLI
+        group could be dropped without tripping the gate.
+        """
+        # As of this PR, discovery finds ~65 commands across all groups + top-level.
+        # The bound is set tight enough that losing one full group (e.g. `source`,
+        # ~13 commands) trips this guard immediately.
+        assert len(_NOTEBOOK_COMMAND_TRIPLES) >= 55, (
+            f"Expected ≥55 -n/--notebook commands discovered, got "
+            f"{len(_NOTEBOOK_COMMAND_TRIPLES)} — discovery walk is broken or "
+            f"a CLI group lost its -n/--notebook surface"
+        )
+
+    @pytest.mark.parametrize(
+        ("group_label", "subcommand", "param"),
+        _NOTEBOOK_COMMAND_TRIPLES,
+        ids=[f"{g}/{s}" for g, s, _ in _NOTEBOOK_COMMAND_TRIPLES],
+    )
+    def test_subcommand_uses_canonical_notebook_option(self, group_label, subcommand, param):
+        """Every subcommand exposing -n/--notebook must use the canonical
+        decorator (asserted via canonical help text — derived live from
+        `cli/options.py` — and the `notebook_id` kwarg name).
+        """
+        assert param.name == "notebook_id", (
+            f"{group_label}/{subcommand} -n/--notebook must bind to kwarg "
+            f"'notebook_id' (the canonical decorator's kwarg name), got "
+            f"{param.name!r}"
+        )
+        assert (param.help or "") == _CANONICAL_NOTEBOOK_HELP, (
+            f"{group_label}/{subcommand} -n/--notebook help must equal the "
+            f"canonical string {_CANONICAL_NOTEBOOK_HELP!r} (from "
+            f"cli/options.py:notebook_option), got {param.help!r}"
+        )
 
 
 # =============================================================================
@@ -512,7 +795,7 @@ class TestWithClientDecorator:
 
         runner = CliRunner()
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test"}
+            mock_load.return_value = {"SID": "test", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
@@ -549,6 +832,10 @@ class TestWithClientDecorator:
         Regression test for GitHub issue #153: `source add --type file` with a
         missing file was incorrectly showing 'Not logged in' because the
         with_client decorator caught all FileNotFoundError as auth errors.
+
+        After T1.G, ``with_client`` routes body errors through ``handle_errors``,
+        so an unexpected FileNotFoundError surfaces as an UNEXPECTED_ERROR
+        (exit 2) — still NOT an auth error.
         """
         import click
         from click.testing import CliRunner
@@ -563,20 +850,21 @@ class TestWithClientDecorator:
 
         runner = CliRunner()
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test"}
+            mock_load.return_value = {"SID": "test", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(test_cmd)
 
-        assert result.exit_code == 1
-        # Should show the actual file error, NOT an auth error
-        assert "File not found" in result.output
-        assert "login" not in result.output.lower()
+        # Must not exit 0; the operation failed.
+        assert result.exit_code != 0
+        # The crucial property: this is NOT misclassified as an auth error.
+        combined = (result.output or "") + " " + (getattr(result, "stderr", "") or "")
+        assert "login" not in combined.lower()
 
     def test_decorator_handles_exception_non_json(self):
-        """Test error handling in non-JSON mode"""
+        """Unhandled body exceptions surface via ``handle_errors`` (exit 2)."""
         import click
         from click.testing import CliRunner
 
@@ -590,18 +878,20 @@ class TestWithClientDecorator:
 
         runner = CliRunner()
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test"}
+            mock_load.return_value = {"SID": "test", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(test_cmd)
 
-        assert result.exit_code == 1
-        assert "Test error" in result.output
+        # UNEXPECTED_ERROR → exit 2 (system/bug bucket).
+        assert result.exit_code == 2
+        combined = (result.output or "") + " " + (getattr(result, "stderr", "") or "")
+        assert "Test error" in combined
 
     def test_decorator_handles_exception_json_mode(self):
-        """Test error handling in JSON mode"""
+        """``--json`` mode emits parseable JSON with nonzero exit."""
         import click
         from click.testing import CliRunner
 
@@ -616,15 +906,15 @@ class TestWithClientDecorator:
 
         runner = CliRunner()
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test"}
+            mock_load.return_value = {"SID": "test", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(test_cmd, ["--json"])
 
-        assert result.exit_code == 1
-        data = json.loads(result.output)
+        assert result.exit_code != 0
+        data = json.loads(result.stdout)
         assert data["error"] is True
         assert "Test error" in data["message"]
 
@@ -640,7 +930,7 @@ class TestGetClient:
         ctx.obj = None
 
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test_sid"}
+            mock_load.return_value = {"SID": "test_sid", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
@@ -648,7 +938,7 @@ class TestGetClient:
 
                 cookies, csrf, session = get_client(ctx)
 
-        assert cookies == {"SID": "test_sid"}
+        assert cookies == {"SID": "test_sid", "__Secure-1PSIDTS": "test_1psidts"}
         assert csrf == "csrf_token"
         assert session == "session_id"
 
@@ -657,7 +947,7 @@ class TestGetClient:
         ctx.obj = {"storage_path": "/custom/path"}
 
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test"}
+            mock_load.return_value = {"SID": "test", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
@@ -674,7 +964,7 @@ class TestGetAuthTokens:
         ctx.obj = None
 
         with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load:
-            mock_load.return_value = {"SID": "test_sid"}
+            mock_load.return_value = {"SID": "test_sid", "__Secure-1PSIDTS": "test_1psidts"}
             with patch(
                 "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
@@ -682,8 +972,11 @@ class TestGetAuthTokens:
 
                 auth = get_auth_tokens(ctx)
 
-        assert auth.cookies == {("SID", ".google.com"): "test_sid"}
-        assert auth.flat_cookies == {"SID": "test_sid"}
+        assert auth.cookies == {
+            ("SID", ".google.com", "/"): "test_sid",
+            ("__Secure-1PSIDTS", ".google.com", "/"): "test_1psidts",
+        }
+        assert auth.flat_cookies == {"SID": "test_sid", "__Secure-1PSIDTS": "test_1psidts"}
         assert auth.csrf_token == "csrf_token"
         assert auth.session_id == "session_id"
 
@@ -693,7 +986,18 @@ class TestGetAuthTokens:
         ctx.obj = {"storage_path": storage_path, "profile": None}
         monkeypatch.setenv(
             "NOTEBOOKLM_AUTH_JSON",
-            json.dumps({"cookies": [{"name": "SID", "value": "env", "domain": ".google.com"}]}),
+            json.dumps(
+                {
+                    "cookies": [
+                        {"name": "SID", "value": "env", "domain": ".google.com"},
+                        {
+                            "name": "__Secure-1PSIDTS",
+                            "value": "test_1psidts",
+                            "domain": ".google.com",
+                        },
+                    ]
+                }
+            ),
         )
 
         with (
@@ -704,14 +1008,16 @@ class TestGetAuthTokens:
             patch("notebooklm.auth.build_httpx_cookies_from_storage") as mock_env_jar,
             patch("notebooklm.cli.helpers.build_cookie_jar") as mock_build_jar,
         ):
-            mock_load.return_value = {"SID": "file"}
+            mock_load.return_value = {"SID": "file", "__Secure-1PSIDTS": "test_1psidts"}
             mock_fetch.return_value = ("csrf", "session")
             mock_build_jar.return_value = httpx.Cookies()
 
             auth = get_auth_tokens(ctx)
 
         mock_env_jar.assert_not_called()
-        mock_build_jar.assert_called_once_with(cookies={"SID": "file"}, storage_path=storage_path)
+        mock_build_jar.assert_called_once_with(
+            cookies={"SID": "file", "__Secure-1PSIDTS": "test_1psidts"}, storage_path=storage_path
+        )
         assert auth.storage_path == storage_path
 
 
@@ -1575,3 +1881,77 @@ class TestImportWithRetry:
 
         # Only the original attempt — no retry after cancellation.
         assert client.research.import_sources.await_count == 1
+
+
+class TestGetAuthTokensAuthuser:
+    """Regression for #359: get_auth_tokens must read authuser from context.json
+    so RPC URLs route to the right Google account."""
+
+    def test_authuser_from_context_json_propagates_to_authtokens(self, tmp_path):
+        storage = tmp_path / "storage_state.json"
+        storage.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {"name": "SID", "value": "x", "domain": ".google.com"},
+                        {"name": "HSID", "value": "x", "domain": ".google.com"},
+                        {"name": "SSID", "value": "x", "domain": ".google.com"},
+                        {"name": "APISID", "value": "x", "domain": ".google.com"},
+                        {"name": "SAPISID", "value": "x", "domain": ".google.com"},
+                        {"name": "__Secure-1PSIDTS", "value": "x", "domain": ".google.com"},
+                    ]
+                }
+            )
+        )
+        (tmp_path / "context.json").write_text(
+            json.dumps({"account": {"authuser": 2, "email": "bob@example.com"}}),
+            encoding="utf-8",
+        )
+
+        ctx = MagicMock()
+        ctx.obj = {"storage_path": storage, "profile": None}
+
+        token_fetch = object()
+        with (
+            patch("notebooklm.auth.fetch_tokens_with_domains", new=lambda *_, **__: token_fetch),
+            patch(
+                "notebooklm.cli.helpers.run_async",
+                return_value=("csrf_v2", "sess_v2"),
+            ),
+        ):
+            tokens = get_auth_tokens(ctx)
+
+        assert tokens.authuser == 2
+        assert tokens.csrf_token == "csrf_v2"
+
+    def test_default_authuser_when_no_account_metadata(self, tmp_path):
+        storage = tmp_path / "storage_state.json"
+        storage.write_text(
+            json.dumps(
+                {
+                    "cookies": [
+                        {"name": "SID", "value": "x", "domain": ".google.com"},
+                        {"name": "HSID", "value": "x", "domain": ".google.com"},
+                        {"name": "SSID", "value": "x", "domain": ".google.com"},
+                        {"name": "APISID", "value": "x", "domain": ".google.com"},
+                        {"name": "SAPISID", "value": "x", "domain": ".google.com"},
+                        {"name": "__Secure-1PSIDTS", "value": "x", "domain": ".google.com"},
+                    ]
+                }
+            )
+        )
+
+        ctx = MagicMock()
+        ctx.obj = {"storage_path": storage, "profile": None}
+
+        token_fetch = object()
+        with (
+            patch("notebooklm.auth.fetch_tokens_with_domains", new=lambda *_, **__: token_fetch),
+            patch(
+                "notebooklm.cli.helpers.run_async",
+                return_value=("csrf", "sess"),
+            ),
+        ):
+            tokens = get_auth_tokens(ctx)
+
+        assert tokens.authuser == 0

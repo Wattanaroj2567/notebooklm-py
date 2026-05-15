@@ -17,7 +17,8 @@ import pytest
 from notebooklm._artifacts import ArtifactsAPI
 from notebooklm._chat import ChatAPI
 from notebooklm.auth import AuthTokens
-from notebooklm.rpc import InfographicStyle
+from notebooklm.exceptions import ValidationError
+from notebooklm.rpc import InfographicStyle, VideoFormat, VideoStyle
 
 
 @pytest.fixture
@@ -31,29 +32,70 @@ def auth_tokens():
 
 @pytest.fixture
 def mock_core():
-    """Create a mock ClientCore."""
+    """Create a mock ClientCore.
+
+    After Tier-2 T2.D, ``ChatAPI.ask`` goes through ``core.query_post`` and
+    ``core.next_reqid`` instead of the legacy direct ``post`` / counter
+    mutation. Tests that need to assert on URL or body now drive
+    ``query_post`` via its ``build_request`` factory rather than poking the
+    raw httpx client.
+    """
+    from notebooklm._core import _AuthSnapshot
+
     core = MagicMock()
     core.rpc_call = AsyncMock()
     core.get_source_ids = AsyncMock(return_value=[])
     core.auth = MagicMock()
     core.auth.csrf_token = "test_csrf"
     core.auth.session_id = "test_session"
+    core.auth.authuser = 0
+    core.auth.account_email = None
+    # Reqid counter is now bumped via ``await core.next_reqid()``; the
+    # ``_reqid_counter`` attribute remains for backwards-compat assertions.
     core._reqid_counter = 0
+    core.next_reqid = AsyncMock(return_value=100000)
     core.get_http_client = MagicMock()
     core.get_cached_conversation = MagicMock(return_value=[])
     core.cache_conversation_turn = MagicMock()
+
+    # Default ``query_post`` stub: invokes the caller-supplied
+    # ``build_request`` factory with a frozen snapshot (so the URL/body the
+    # test wants to assert on actually gets assembled) and returns a stock
+    # answer response. Individual tests that need to inspect the URL/body
+    # can read ``core._last_chat_request`` after calling ``ChatAPI.ask``.
+    async def _query_post_default(*, build_request, parse_label):
+        snapshot = _AuthSnapshot(
+            csrf_token=core.auth.csrf_token,
+            session_id=core.auth.session_id,
+            authuser=core.auth.authuser,
+            account_email=core.auth.account_email,
+        )
+        url, body, headers = build_request(snapshot)
+        core._last_chat_request = {"url": url, "body": body, "headers": headers}
+        resp = MagicMock()
+        inner = json.dumps([["Default answer long enough to be valid.", None, None, None, [1]]])
+        chunk = json.dumps([["wrb.fr", None, inner]])
+        resp.text = f")]}}'\n{len(chunk)}\n{chunk}\n"
+        return resp
+
+    core.query_post = AsyncMock(side_effect=_query_post_default)
     return core
 
 
 @pytest.fixture
 def mock_notes_api():
-    """Create a mock NotesAPI."""
-    notes = MagicMock()
-    notes.list_mind_maps = AsyncMock(return_value=[])
-    mock_note = MagicMock()
-    mock_note.id = "created_note_123"
-    notes.create = AsyncMock(return_value=mock_note)
-    return notes
+    """Placeholder for the legacy ``ArtifactsAPI(core, notes_api)`` signature.
+
+    After T6.F, ``ArtifactsAPI`` no longer reads ``notes_api`` (it consumes
+    the shared ``_mind_map`` module directly). The arg is still accepted for
+    backward compatibility and immediately discarded inside ``__init__``, so
+    this fixture intentionally returns a bare mock — no method stubs, since
+    none of the downstream code paths under test invoke any methods on it.
+    Future readers: if you find yourself adding ``AsyncMock`` setup here,
+    you probably want to drop the second positional arg from the call sites
+    instead.
+    """
+    return MagicMock()
 
 
 class TestChatSourceSelection:
@@ -64,30 +106,17 @@ class TestChatSourceSelection:
         """Test ask() with explicitly provided source_ids."""
         api = ChatAPI(mock_core)
 
-        # Mock HTTP response for ask
-        mock_response = MagicMock()
-        inner_json = json.dumps(
-            [["Answer text here that is definitely long enough.", None, None, None, [1]]]
-        )
-        chunk_json = json.dumps([["wrb.fr", None, inner_json]])
-        mock_response.text = f")]}}'\n{len(chunk_json)}\n{chunk_json}\n"
-        mock_response.raise_for_status = MagicMock()
-
-        mock_http_client = MagicMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_core.get_http_client.return_value = mock_http_client
-
         result = await api.ask(
             notebook_id="nb_123",
             question="Test question?",
             source_ids=["src_001", "src_002"],
         )
 
-        assert result.answer == "Answer text here that is definitely long enough."
+        assert result.answer == "Default answer long enough to be valid."
 
-        # Verify HTTP call was made with correct source encoding
-        call_args = mock_http_client.post.call_args
-        body = call_args.kwargs.get("content", call_args.args[1] if len(call_args.args) > 1 else "")
+        # query_post is the transport entry point; the request body is
+        # captured into ``_last_chat_request`` by the mock_core fixture.
+        body = mock_core._last_chat_request["body"]
 
         # The body should contain the encoded sources_array
         # sources_array = [[[sid]] for sid in source_ids]
@@ -103,26 +132,13 @@ class TestChatSourceSelection:
         # Mock get_source_ids to return source IDs
         mock_core.get_source_ids.return_value = ["src_001", "src_002", "src_003"]
 
-        # Mock HTTP response for ask
-        mock_response = MagicMock()
-        inner_json = json.dumps(
-            [["Answer from all sources with enough length.", None, None, None, [1]]]
-        )
-        chunk_json = json.dumps([["wrb.fr", None, inner_json]])
-        mock_response.text = f")]}}'\n{len(chunk_json)}\n{chunk_json}\n"
-        mock_response.raise_for_status = MagicMock()
-
-        mock_http_client = MagicMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_core.get_http_client.return_value = mock_http_client
-
         result = await api.ask(
             notebook_id="nb_123",
             question="Test question?",
             source_ids=None,  # Should fetch all sources
         )
 
-        assert result.answer == "Answer from all sources with enough length."
+        assert result.answer == "Default answer long enough to be valid."
 
         # Verify get_source_ids was called on core
         mock_core.get_source_ids.assert_called_once_with("nb_123")
@@ -132,31 +148,16 @@ class TestChatSourceSelection:
         """Verify the correct encoding format for source IDs in ask()."""
         api = ChatAPI(mock_core)
 
-        # Mock HTTP response
-        mock_response = MagicMock()
-        inner_json = json.dumps(
-            [["Valid answer with sufficient characters.", None, None, None, [1]]]
-        )
-        chunk_json = json.dumps([["wrb.fr", None, inner_json]])
-        mock_response.text = f")]}}'\n{len(chunk_json)}\n{chunk_json}\n"
-        mock_response.raise_for_status = MagicMock()
-
-        mock_http_client = MagicMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_core.get_http_client.return_value = mock_http_client
-
         await api.ask(
             notebook_id="nb_123",
             question="Test?",
             source_ids=["s1", "s2", "s3"],
         )
 
-        # Verify the post was called
-        mock_http_client.post.assert_called_once()
-
-        # Get the body and decode it
-        call_args = mock_http_client.post.call_args
-        body = call_args.kwargs.get("content", "")
+        # query_post should have been called once with a build_request factory
+        # that produces the URL-encoded body with the triple-nested sources.
+        mock_core.query_post.assert_called_once()
+        body = mock_core._last_chat_request["body"]
 
         # The body contains URL-encoded f.req parameter
         # sources_array should be [[["s1"]], [["s2"]], [["s3"]]]
@@ -166,16 +167,16 @@ class TestChatSourceSelection:
         from urllib.parse import unquote
 
         match = re.search(r"f\.req=([^&]+)", body)
-        if match:
-            f_req_encoded = match.group(1)
-            f_req_decoded = unquote(f_req_encoded)
-            f_req_data = json.loads(f_req_decoded)
-            # f_req is [None, params_json]
-            params = json.loads(f_req_data[1])
-            sources_array = params[0]
+        assert match, f"f.req= missing from body: {body!r}"
+        f_req_encoded = match.group(1)
+        f_req_decoded = unquote(f_req_encoded)
+        f_req_data = json.loads(f_req_decoded)
+        # f_req is [None, params_json]
+        params = json.loads(f_req_data[1])
+        sources_array = params[0]
 
-            # Verify the triple-nested format
-            assert sources_array == [[["s1"]], [["s2"]], [["s3"]]]
+        # Verify the triple-nested format
+        assert sources_array == [[["s1"]], [["s2"]], [["s3"]]]
 
 
 class TestArtifactsSourceSelection:
@@ -280,6 +281,89 @@ class TestArtifactsSourceSelection:
 
         assert source_ids_triple == [[["src_a"]], [["src_b"]]]
         assert source_ids_double == [["src_a"], ["src_b"]]
+
+    @pytest.mark.asyncio
+    async def test_generate_video_custom_style_prompt_encoding(self, mock_core, mock_notes_api):
+        """Test custom video style prompt is encoded after the style code."""
+        api = ArtifactsAPI(mock_core, mock_notes_api)
+        mock_core.rpc_call.return_value = [["artifact_456", "Video", 3, None, 1]]
+
+        await api.generate_video(
+            notebook_id="nb_123",
+            source_ids=["src_a"],
+            video_style=VideoStyle.CUSTOM,
+            style_prompt="  Use hand-drawn diagrams  ",
+        )
+
+        params = mock_core.rpc_call.call_args.args[1]
+        video_config = params[2][8][2]
+        assert video_config[5] == VideoStyle.CUSTOM.value
+        assert video_config[6] == "Use hand-drawn diagrams"
+
+    @pytest.mark.asyncio
+    async def test_generate_video_custom_style_requires_prompt(self, mock_core, mock_notes_api):
+        api = ArtifactsAPI(mock_core, mock_notes_api)
+
+        with pytest.raises(ValidationError, match="style_prompt is required"):
+            await api.generate_video(
+                notebook_id="nb_123",
+                source_ids=["src_a"],
+                video_style=VideoStyle.CUSTOM,
+            )
+
+    @pytest.mark.asyncio
+    async def test_generate_video_custom_style_rejects_empty_prompt(
+        self, mock_core, mock_notes_api
+    ):
+        api = ArtifactsAPI(mock_core, mock_notes_api)
+
+        with pytest.raises(ValidationError, match="style_prompt is required"):
+            await api.generate_video(
+                notebook_id="nb_123",
+                source_ids=["src_a"],
+                video_style=VideoStyle.CUSTOM,
+                style_prompt="",
+            )
+
+    @pytest.mark.asyncio
+    async def test_generate_video_custom_style_rejects_blank_prompt(
+        self, mock_core, mock_notes_api
+    ):
+        api = ArtifactsAPI(mock_core, mock_notes_api)
+
+        with pytest.raises(ValidationError, match="style_prompt is required"):
+            await api.generate_video(
+                notebook_id="nb_123",
+                source_ids=["src_a"],
+                video_style=VideoStyle.CUSTOM,
+                style_prompt="   ",
+            )
+
+    @pytest.mark.asyncio
+    async def test_generate_video_style_prompt_requires_custom_style(
+        self, mock_core, mock_notes_api
+    ):
+        api = ArtifactsAPI(mock_core, mock_notes_api)
+
+        with pytest.raises(ValidationError, match="style_prompt requires"):
+            await api.generate_video(
+                notebook_id="nb_123",
+                source_ids=["src_a"],
+                video_style=VideoStyle.ANIME,
+                style_prompt="Use hand-drawn diagrams",
+            )
+
+    @pytest.mark.asyncio
+    async def test_generate_video_cinematic_rejects_style_prompt(self, mock_core, mock_notes_api):
+        api = ArtifactsAPI(mock_core, mock_notes_api)
+
+        with pytest.raises(ValidationError, match="cinematic"):
+            await api.generate_video(
+                notebook_id="nb_123",
+                source_ids=["src_a"],
+                video_format=VideoFormat.CINEMATIC,
+                style_prompt="Use hand-drawn diagrams",
+            )
 
     @pytest.mark.asyncio
     async def test_generate_report_source_encoding(self, mock_core, mock_notes_api):
@@ -499,10 +583,14 @@ class TestArtifactsSourceSelection:
         # Verify get_source_ids was called
         mock_core.get_source_ids.assert_called_once_with("nb_123")
 
-        # Verify GENERATE_MIND_MAP RPC was called with correct source encoding
-        mock_core.rpc_call.assert_called_once()
-        call_args = mock_core.rpc_call.call_args
-        params = call_args.args[1]
+        # After T6.F, ``generate_mind_map`` also drives the CREATE_NOTE +
+        # UPDATE_NOTE calls itself (previously delegated to NotesAPI), so
+        # rpc_call is invoked three times. The source-encoding assertion
+        # targets the GENERATE_MIND_MAP call specifically.
+        generate_call = next(
+            c for c in mock_core.rpc_call.call_args_list if c.args[0].name == "GENERATE_MIND_MAP"
+        )
+        params = generate_call.args[1]
 
         # Mind map uses source_ids_nested = [[[sid]] for sid]
         source_ids_nested = params[0]
@@ -526,8 +614,12 @@ class TestArtifactsSourceSelection:
             instructions="Focus on key themes",
         )
 
-        call_args = mock_core.rpc_call.call_args
-        params = call_args.args[1]
+        # Pick the GENERATE_MIND_MAP call specifically — CREATE_NOTE and
+        # UPDATE_NOTE are now invoked alongside it.
+        generate_call = next(
+            c for c in mock_core.rpc_call.call_args_list if c.args[0].name == "GENERATE_MIND_MAP"
+        )
+        params = generate_call.args[1]
 
         # params[5] should contain the mind map config with language and instructions
         mind_map_config = params[5]
@@ -591,18 +683,6 @@ class TestEmptySourceIds:
         """Test ask with empty source_ids list."""
         api = ChatAPI(mock_core)
 
-        mock_response = MagicMock()
-        inner_json = json.dumps(
-            [["Response with empty sources, long enough.", None, None, None, [1]]]
-        )
-        chunk_json = json.dumps([["wrb.fr", None, inner_json]])
-        mock_response.text = f")]}}'\n{len(chunk_json)}\n{chunk_json}\n"
-        mock_response.raise_for_status = MagicMock()
-
-        mock_http_client = MagicMock()
-        mock_http_client.post = AsyncMock(return_value=mock_response)
-        mock_core.get_http_client.return_value = mock_http_client
-
         await api.ask(
             notebook_id="nb_123",
             question="Test?",
@@ -610,21 +690,20 @@ class TestEmptySourceIds:
         )
 
         # Verify the sources_array is empty in the request
-        call_args = mock_http_client.post.call_args
-        body = call_args.kwargs.get("content", "")
+        body = mock_core._last_chat_request["body"]
 
         import re
         from urllib.parse import unquote
 
         match = re.search(r"f\.req=([^&]+)", body)
-        if match:
-            f_req_encoded = match.group(1)
-            f_req_decoded = unquote(f_req_encoded)
-            f_req_data = json.loads(f_req_decoded)
-            params = json.loads(f_req_data[1])
-            sources_array = params[0]
+        assert match, f"f.req= missing from body: {body!r}"
+        f_req_encoded = match.group(1)
+        f_req_decoded = unquote(f_req_encoded)
+        f_req_data = json.loads(f_req_decoded)
+        params = json.loads(f_req_data[1])
+        sources_array = params[0]
 
-            assert sources_array == []
+        assert sources_array == []
 
 
 class TestGetSourceIds:

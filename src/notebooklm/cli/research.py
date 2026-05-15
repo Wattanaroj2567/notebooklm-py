@@ -14,12 +14,21 @@ from .helpers import (
     console,
     display_report,
     display_research_sources,
-    import_with_retry,
+    import_research_sources,
     json_output_response,
     require_notebook,
     resolve_notebook_id,
     with_client,
 )
+from .options import notebook_option
+
+# UI-only cap for the research summary preview shown in `research status` /
+# `research wait`. Unlike RPC error previews (see
+# :func:`notebooklm.exceptions._truncate_response_preview`), this is a
+# user-facing display cap — not a leak-prevention truncation — and intentionally
+# does not respect ``NOTEBOOKLM_DEBUG`` (users can re-fetch the full summary
+# with the underlying API or with `research wait --import-all`).
+_SUMMARY_PREVIEW_CHARS = 500
 
 
 @click.group()
@@ -45,13 +54,7 @@ def research():
 
 
 @research.command("status")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
 def research_status(ctx, notebook_id, json_output, client_auth):
@@ -68,7 +71,7 @@ def research_status(ctx, notebook_id, json_output, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             status = await client.research.poll(nb_id_resolved)
 
             if json_output:
@@ -91,7 +94,7 @@ def research_status(ctx, notebook_id, json_output, client_auth):
                 display_research_sources(sources)
 
                 if summary:
-                    console.print(f"\n[bold]Summary:[/bold]\n{summary[:500]}")
+                    console.print(f"\n[bold]Summary:[/bold]\n{summary[:_SUMMARY_PREVIEW_CHARS]}")
 
                 display_report(status.get("report", ""))
 
@@ -103,13 +106,7 @@ def research_status(ctx, notebook_id, json_output, client_auth):
 
 
 @research.command("wait")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option(
     "--timeout",
     default=300,
@@ -123,9 +120,12 @@ def research_status(ctx, notebook_id, json_output, client_auth):
     help="Seconds between status checks (default: 5)",
 )
 @click.option("--import-all", is_flag=True, help="Import all found sources when done")
+@click.option("--cited-only", is_flag=True, help="With --import-all, import only cited sources")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
-def research_wait(ctx, notebook_id, timeout, interval, import_all, json_output, client_auth):
+def research_wait(
+    ctx, notebook_id, timeout, interval, import_all, cited_only, json_output, client_auth
+):
     """Wait for research to complete.
 
     Blocks until research is completed or timeout is reached.
@@ -135,25 +135,31 @@ def research_wait(ctx, notebook_id, timeout, interval, import_all, json_output, 
     Examples:
       notebooklm research wait
       notebooklm research wait --timeout 600 --import-all
+      notebooklm research wait --import-all --cited-only
       notebooklm research wait --json
     """
+    if cited_only and not import_all:
+        raise click.UsageError("--cited-only requires --import-all")
+
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             max_iterations = max(1, timeout // interval)
             status = None
             task_id = None
 
-            with console.status("Waiting for research to complete..."):
+            async def _poll_loop() -> bool:
+                """Poll until completion or terminal state; returns True on success."""
+                nonlocal status, task_id
                 for _ in range(max_iterations):
                     status = await client.research.poll(nb_id_resolved)
                     status_val = status.get("status", "unknown")
 
                     if status_val == "completed":
                         task_id = status.get("task_id")
-                        break
+                        return True
                     elif status_val == "no_research":
                         if json_output:
                             json_output_response(
@@ -164,16 +170,24 @@ def research_wait(ctx, notebook_id, timeout, interval, import_all, json_output, 
                         raise SystemExit(1)
 
                     await asyncio.sleep(interval)
-                else:
-                    if json_output:
-                        json_output_response(
-                            {"status": "timeout", "error": f"Timed out after {timeout}s"}
-                        )
-                    else:
-                        console.print(f"[yellow]Timed out after {timeout} seconds[/yellow]")
-                    raise SystemExit(1)
 
-            # Research completed
+                if json_output:
+                    json_output_response(
+                        {"status": "timeout", "error": f"Timed out after {timeout}s"}
+                    )
+                else:
+                    console.print(f"[yellow]Timed out after {timeout} seconds[/yellow]")
+                raise SystemExit(1)
+
+            if json_output:
+                await _poll_loop()
+            else:
+                with console.status("Waiting for research to complete..."):
+                    await _poll_loop()
+
+            # Research completed — _poll_loop either populated `status` or
+            # raised SystemExit, so a non-None status is guaranteed here.
+            assert status is not None
             sources = status.get("sources", [])
             query = status.get("query", "")
 
@@ -188,16 +202,22 @@ def research_wait(ctx, notebook_id, timeout, interval, import_all, json_output, 
                     "report": report,
                 }
                 if import_all and sources and task_id:
-                    imported = await import_with_retry(
+                    import_result = await import_research_sources(
                         client,
                         nb_id_resolved,
                         task_id,
                         sources,
+                        report=report,
+                        cited_only=cited_only,
                         max_elapsed=timeout,
                         json_output=True,
                     )
-                    result["imported"] = len(imported)
-                    result["imported_sources"] = imported
+                    if import_result.cited_selection is not None:
+                        result["cited_only"] = True
+                        result["cited_sources_selected"] = len(import_result.sources)
+                        result["cited_only_fallback"] = import_result.cited_selection.used_fallback
+                    result["imported"] = len(import_result.imported)
+                    result["imported_sources"] = import_result.imported
                 json_output_response(result)
             else:
                 console.print(f"[green]✓ Research completed:[/green] {query}")
@@ -206,14 +226,16 @@ def research_wait(ctx, notebook_id, timeout, interval, import_all, json_output, 
                 display_report(report)
 
                 if import_all and sources and task_id:
-                    with console.status("Importing sources..."):
-                        imported = await import_with_retry(
-                            client,
-                            nb_id_resolved,
-                            task_id,
-                            sources,
-                            max_elapsed=timeout,
-                        )
-                    console.print(f"[green]Imported {len(imported)} sources[/green]")
+                    import_result = await import_research_sources(
+                        client,
+                        nb_id_resolved,
+                        task_id,
+                        sources,
+                        report=report,
+                        cited_only=cited_only,
+                        max_elapsed=timeout,
+                        status_message="Importing sources...",
+                    )
+                    console.print(f"[green]Imported {len(import_result.imported)} sources[/green]")
 
     return _run()

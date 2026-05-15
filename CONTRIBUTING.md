@@ -5,19 +5,42 @@
 ### Getting Started
 
 ```bash
-# Install in development mode
-pip install -e ".[all]"
-playwright install chromium
-
-# Run tests
-pytest
-
-# Run linter
-ruff check src/ tests/
-
-# Run formatter
-ruff format src/ tests/
+# Canonical contributor install (respects uv.lock)
+uv sync --frozen --extra browser --extra dev --extra markdown
+source .venv/bin/activate
+uv run playwright install chromium
+pre-commit install
 ```
+
+**Run the full pre-commit suite** (matches what CI runs). IMPORTANT: use the
+broad `.` scope, not `src/ tests/` — the pre-commit hook in CI invokes
+ruff-format on the whole tree and is stricter than a narrow scope.
+
+```bash
+uv run ruff format --check . && \
+    uv run ruff check . && \
+    uv run mypy src/notebooklm --ignore-missing-imports && \
+    uv run pytest --cov=src/notebooklm --cov-report=term-missing --cov-fail-under=90
+```
+
+**No uv?** Plain pip works as a fallback (won't enforce the lockfile, so you may resolve newer dep versions than CI):
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[all]"   # [all] = browser + dev + markdown (no cookies; see installation.md)
+playwright install chromium
+pre-commit install
+```
+
+For full prerequisites, headless setup, optional extras (`[cookies]`, `[markdown]`), and platform notes, see [docs/installation.md#e-contributor](docs/installation.md#e-contributor).
+
+> **Install-doc parity.** `docs/installation.md` is the canonical install guide; this file mirrors a small contributor-focused subset. Every fenced ``bash`` block in `installation.md` must EITHER appear verbatim in `CONTRIBUTING.md`, OR be marked with `<!-- not mirrored: <reason> -->` on the line directly before its opening fence. CI enforces this via `scripts/check_ci_install_parity.py` so a stale block can't drift in unnoticed. When you edit `installation.md`, decide on the spot whether the new content also belongs in this file.
+
+The `browser` extra is part of the contributor install because the default unit
+suite imports and patches `playwright.sync_api`. The command
+`uv sync --frozen --extra dev` is only the test/lint toolchain; it is not enough
+for `uv run pytest`.
+
+> **Architecture & testing context.** Once installed, read [docs/development.md](docs/development.md) for the layered RPC/Core/Client/CLI design, test-tree layout, and release workflow before touching `src/notebooklm/`.
 
 ### Code Quality
 
@@ -25,31 +48,35 @@ This project uses **ruff** for linting and formatting:
 
 ```bash
 # Check for lint issues
-ruff check src/ tests/
+ruff check .
 
 # Auto-fix lint issues
-ruff check --fix src/ tests/
+ruff check --fix .
 
 # Check formatting
-ruff format --check src/ tests/
+ruff format --check .
 
 # Apply formatting
-ruff format src/ tests/
+ruff format .
 ```
 
-**Pre-commit hooks** (optional but recommended):
+**Pre-commit hooks** (included in the `[dev]` extra; install once after the canonical setup):
 ```bash
-pip install pre-commit
-pre-commit install
+pre-commit install                              # one-time, after the canonical install
+pre-commit run --all-files                      # manual run on the whole tree (matches the CI lint gate)
 ```
+
+> **Caveat:** if `pre-commit install` errors with `Cowardly refusing to install hooks with core.hooksPath set`, your git is configured to use a custom hooks directory (common with Husky / nx / shared dev configs). Workaround: `git config --unset core.hooksPath` then re-run `pre-commit install`, or run `pre-commit run --all-files` manually before each commit. CI runs the same hook either way, so a clean local hook is convenience, not correctness.
+
+> **CI parity.** The local pre-commit one-liner above matches the CI **lint gate** (`uv run pre-commit run --all-files` in `.github/workflows/test.yml`). CI additionally runs the full test matrix on multiple Python versions (3.10–3.14) and asserts a 90% coverage floor (`pytest --cov=src/notebooklm --cov-report=term-missing --cov-fail-under=90`). The lint+test failure modes are caught locally; the multi-Python-version drift is not — `uv run pytest --cov=src/notebooklm --cov-report=term-missing --cov-fail-under=90` here uses your local Python version only.
 
 ### Pull Request Process
 
 1. Create a feature branch from `main`
 2. Make your changes with clear commit messages
 3. Ensure tests pass: `pytest`
-4. Ensure lint passes: `ruff check src/ tests/`
-5. Ensure formatting: `ruff format --check src/ tests/`
+4. Ensure lint passes: `ruff check .`
+5. Ensure formatting: `ruff format --check .`
 6. Submit a PR with a description of changes
 
 ### Pull Request Quality Expectations
@@ -59,6 +86,18 @@ pre-commit install
 - **No duplicates**: Check existing open PRs before submitting. Duplicate PRs for the same issue will be closed in favor of the first or best submission.
 - **Accurate severity**: Claims of "critical" bugs must include evidence (stack trace, reproduction steps, affected users). Routine edge cases are not critical.
 - **Tested locally**: All PRs must include evidence of local testing. The PR template includes a checklist for this.
+
+### Dependency upper bounds
+
+Every runtime and `[project.optional-dependencies]` entry in `pyproject.toml` must have an upper bound — typically `<currentmajor + 1` (or `<currentminor + 1` for pre-1.0 packages like `httpx`). The bound protects downstream installs from a breaking new release that lands before we have time to test it.
+
+When you bump a cap (e.g. moving `pytest>=8.0,<10` to `pytest>=8.0,<11`):
+
+1. Run `uv lock --refresh` and `uv sync --frozen --extra browser --extra dev --extra markdown` locally.
+2. Run the full pre-commit one-liner above.
+3. Mention the upgrade rationale in the PR description.
+
+The `dependency-audit` workflow (`.github/workflows/dependency-audit.yml`) runs `pip-audit --strict` against the locked env on every push to `main` and nightly. It is currently in soft-launch mode (`continue-on-error: true`) and will be flipped to a hard merge gate after the first release cycle. New deps should still pass `pip-audit` cleanly when introduced.
 
 ---
 
@@ -146,7 +185,9 @@ Agents should ignore files marked `Deprecated`.
 
 ```
 docs/
+├── installation.md        # Canonical install guide (personas, extras, platform notes)
 ├── cli-reference.md       # CLI command reference
+├── cli-exit-codes.md      # CLI exit-code convention (binding contract for scripts/CI)
 ├── python-api.md          # Python API reference
 ├── configuration.md       # Storage and settings
 ├── troubleshooting.md     # Common issues and solutions
@@ -157,3 +198,5 @@ docs/
 ├── rpc-reference.md       # RPC payload structures
 └── examples/              # Runnable example scripts
 ```
+
+> When adding or modifying a CLI command, follow the [CLI Exit-Code Convention](docs/cli-exit-codes.md) — the policy table and the two intentional exceptions (`source stale`, `source wait`) are binding.

@@ -1,6 +1,6 @@
 [project]
 name = "notebooklm-py"
-version = "0.4.0"
+version = "0.4.1"
 description = "Unofficial Python library for automating Google NotebookLM"
 dynamic = ["readme"]
 requires-python = ">=3.10"
@@ -21,10 +21,16 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+# Upper bounds protect downstream installs from a breaking new major
+# release. ``httpx`` is pre-1.0, so we cap on the next minor instead of
+# the next major. Bump caps in a follow-up PR after the new major has
+# been smoke-tested locally — see CONTRIBUTING.md "Dependency upper
+# bounds" for the policy.
 dependencies = [
-    "httpx>=0.27.0",
-    "click>=8.0.0",
-    "rich>=13.0.0",
+    "httpx>=0.27.0,<0.29",
+    "click>=8.0.0,<9",
+    "rich>=13.0.0,<15",
+    "filelock>=3.13,<4",
     "fastapi>=0.95.0",
     "uvicorn[standard]>=0.22.0",
     "mcp>=1.2.0",
@@ -38,22 +44,26 @@ Documentation = "https://github.com/teng-lin/notebooklm-py#readme"
 Issues = "https://github.com/teng-lin/notebooklm-py/issues"
 
 [project.optional-dependencies]
-browser = ["playwright>=1.40.0"]
-cookies = ["rookiepy>=0.1.0"]
+markdown = ["markdownify>=0.14.1,<2"]
+browser = ["playwright>=1.40.0,<2"]
+cookies = ["rookiepy>=0.1.0,<1"]
 dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-httpx>=0.30.0",
-    "pytest-cov>=4.0.0",
-    "pytest-rerunfailures>=14.0",
-    "pytest-timeout>=2.3.0",
-    "python-dotenv>=1.0.0",
-    "mypy>=1.0.0",
-    "pre-commit>=4.5.1",
-    "ruff==0.8.6",
-    "vcrpy>=6.0.0",
+    "pytest>=8.0.0,<10",
+    "pytest-asyncio>=0.23.0,<2",
+    "pytest-httpx>=0.30.0,<0.37",
+    "pytest-cov>=4.0.0,<8",
+    "pytest-rerunfailures>=14.0,<17",
+    "pytest-timeout>=2.3.0,<3",
+    "python-dotenv>=1.0.0,<2",
+    "mypy>=1.0.0,<2",
+    "pre-commit>=4.5.1,<5",
+    "ruff==0.15.12",
+    "tomli>=2.0.0,<3; python_version < '3.11'",  # for tests/unit/test_install_docs.py on Python 3.10 (tomllib is 3.11+)
+    "vcrpy>=6.0.0,<9",
 ]
-all = ["notebooklm-py[browser,dev]"]
+# `all` deliberately excludes `cookies` — rookiepy has install issues on Python 3.13+
+# (see CHANGELOG [0.4.1]). Opt in explicitly via `pip install "notebooklm-py[cookies]"`.
+all = ["notebooklm-py[browser,dev,markdown]"]
 
 [project.scripts]
 notebooklm = "notebooklm.notebooklm_cli:main"
@@ -117,6 +127,24 @@ branch = true
 show_missing = true
 fail_under = 90
 
+# Per-file coverage floors enforced by ``scripts/check_coverage_thresholds.py
+# --coverage-json``. The coverage.py ``[tool.coverage.report]`` table only
+# supports a global ``fail_under``, so individual files that historically lag
+# the project-wide 90% are guarded here. Keys are the source paths exactly as
+# they appear in ``coverage.json`` (run ``uv run pytest --cov=src/notebooklm
+# --cov-report=json:coverage.json`` to confirm). Values are the minimum
+# acceptable percent_covered. To bump a floor: run the full suite locally,
+# read the new percentage from ``coverage.json``, and round down by ~2% so
+# transient flakes don't trip CI on unrelated PRs. To delete a file from the
+# guard: drop the line. Adding a new file requires a separate PR with a
+# rationale in the commit message.
+[tool.notebooklm.per_file_coverage_floors]
+"src/notebooklm/__main__.py" = 0
+"src/notebooklm/cli/_firefox_containers.py" = 75
+"src/notebooklm/cli/doctor.py" = 63
+"src/notebooklm/cli/profile.py" = 74
+"src/notebooklm/cli/session.py" = 83
+
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = false
@@ -131,6 +159,12 @@ exclude = ["tests/"]
 [[tool.mypy.overrides]]
 module = "notebooklm.cli.*"
 warn_return_any = false
+strict_optional = true
+
+[[tool.mypy.overrides]]
+module = "notebooklm.rpc.*"
+disallow_untyped_defs = true
+warn_return_any = true
 strict_optional = true
 
 [tool.ruff]

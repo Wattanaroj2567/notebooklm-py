@@ -21,6 +21,11 @@ def mock_artifacts_api():
     mock_core = MagicMock()
     mock_core.rpc_call = AsyncMock()
     mock_core.get_source_ids = AsyncMock(return_value=[])
+    # ClientCore._pending_polls (T7.E2) — real dict so the leader/follower
+    # dedupe in ``wait_for_completion`` can ``dict.get(key)`` against it.
+    # A MagicMock attribute would return a child Mock and confuse the
+    # ``existing is not None`` branch.
+    mock_core._pending_polls = {}
     mock_notes = MagicMock()
     mock_notes.list_mind_maps = AsyncMock(return_value=[])
     mock_note = MagicMock()
@@ -66,9 +71,11 @@ class TestDownloadUrlsBatch:
 
             result = await api._download_urls_batch(urls_and_paths)
 
-        assert len(result) == 2
-        assert str(tmp_path / "file1.mp4") in result
-        assert str(tmp_path / "file2.mp4") in result
+        assert result.all_succeeded
+        assert len(result.succeeded) == 2
+        assert str(tmp_path / "file1.mp4") in result.succeeded
+        assert str(tmp_path / "file2.mp4") in result.succeeded
+        assert result.failed == []
 
     @pytest.mark.asyncio
     async def test_batch_download_html_response_rejected(self, mock_artifacts_api, tmp_path):
@@ -126,9 +133,14 @@ class TestDownloadUrlsBatch:
 
             result = await api._download_urls_batch(urls_and_paths)
 
-        # Only first file should succeed
-        assert len(result) == 1
-        assert str(tmp_path / "file1.mp4") in result
+        # Only first file should succeed; second is recorded in failed.
+        assert not result.all_succeeded
+        assert result.partial
+        assert result.succeeded == [str(tmp_path / "file1.mp4")]
+        assert len(result.failed) == 1
+        failed_url, failed_exc = result.failed[0]
+        assert failed_url == "https://storage.googleapis.com/file2.mp4"
+        assert isinstance(failed_exc, httpx.HTTPError)
 
 
 # =============================================================================
@@ -291,7 +303,7 @@ class TestParseGenerationResult:
         """Test parsing None result returns failed status."""
         api, _ = mock_artifacts_api
 
-        result = api._parse_generation_result(None)
+        result = api._parse_generation_result(None, method_id="R7cb6c")
 
         assert result.status == "failed"
         assert result.task_id == ""
@@ -301,7 +313,7 @@ class TestParseGenerationResult:
         """Test parsing empty list returns failed status."""
         api, _ = mock_artifacts_api
 
-        result = api._parse_generation_result([])
+        result = api._parse_generation_result([], method_id="R7cb6c")
 
         assert result.status == "failed"
         assert result.task_id == ""
@@ -312,7 +324,9 @@ class TestParseGenerationResult:
         api, _ = mock_artifacts_api
 
         # Valid result with status code 1 (in_progress)
-        result = api._parse_generation_result([["artifact_001", "Title", 1, None, 1]])
+        result = api._parse_generation_result(
+            [["artifact_001", "Title", 1, None, 1]], method_id="R7cb6c"
+        )
 
         assert result.task_id == "artifact_001"
         assert result.status == "in_progress"
@@ -321,7 +335,9 @@ class TestParseGenerationResult:
         """Test parsing valid completed status (code 3)."""
         api, _ = mock_artifacts_api
 
-        result = api._parse_generation_result([["artifact_002", "Title", 1, None, 3]])
+        result = api._parse_generation_result(
+            [["artifact_002", "Title", 1, None, 3]], method_id="R7cb6c"
+        )
 
         assert result.task_id == "artifact_002"
         assert result.status == "completed"
@@ -330,7 +346,9 @@ class TestParseGenerationResult:
         """Test parsing unknown status code returns unknown."""
         api, _ = mock_artifacts_api
 
-        result = api._parse_generation_result([["artifact_003", "Title", 1, None, 99]])
+        result = api._parse_generation_result(
+            [["artifact_003", "Title", 1, None, 99]], method_id="R7cb6c"
+        )
 
         assert result.task_id == "artifact_003"
         assert result.status == "unknown"  # Unknown codes return "unknown"

@@ -4,7 +4,7 @@ This module provides the NotebookLMClient class, a modern async client
 for interacting with Google NotebookLM using undocumented RPC APIs.
 
 Example:
-    async with NotebookLMClient.from_storage() as client:
+    async with await NotebookLMClient.from_storage() as client:
         # List notebooks
         notebooks = await client.notebooks.list()
 
@@ -22,12 +22,17 @@ Example:
 import dataclasses
 import logging
 import os
-import re
 from pathlib import Path
+from types import TracebackType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .types import ConnectionLimits
 
 from ._artifacts import ArtifactsAPI
 from ._chat import ChatAPI
 from ._core import DEFAULT_KEEPALIVE_MIN_INTERVAL, DEFAULT_TIMEOUT, ClientCore
+from ._env import get_base_url
 from ._notebooks import NotebooksAPI
 from ._notes import NotesAPI
 from ._research import ResearchAPI
@@ -35,7 +40,8 @@ from ._settings import SettingsAPI
 from ._sharing import SharingAPI
 from ._sources import SourcesAPI
 from ._url_utils import is_google_auth_redirect
-from .auth import AuthTokens
+from .auth import AuthTokens, authuser_query, extract_wiz_field
+from .exceptions import AuthExtractionError
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +61,7 @@ class NotebookLMClient:
 
     Usage:
         # Create from saved authentication
-        async with NotebookLMClient.from_storage() as client:
+        async with await NotebookLMClient.from_storage() as client:
             notebooks = await client.notebooks.list()
 
         # Create from AuthTokens directly
@@ -82,6 +88,9 @@ class NotebookLMClient:
         storage_path: Path | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = DEFAULT_KEEPALIVE_MIN_INTERVAL,
+        rate_limit_max_retries: int = 0,
+        server_error_max_retries: int = 3,
+        limits: "ConnectionLimits | None" = None,
     ):
         """Initialize the NotebookLM client.
 
@@ -98,6 +107,21 @@ class NotebookLMClient:
             keepalive_min_interval: Lower bound for ``keepalive`` (defaults to
                 60 s) to avoid accidentally rate-limiting Google's identity
                 surface.
+            rate_limit_max_retries: Max automatic retries on HTTP 429 with a
+                parseable ``Retry-After``. ``0`` (default) preserves the
+                pre-Phase-3 contract of raising immediately. See
+                :class:`ClientCore` for the per-attempt sleep semantics.
+            server_error_max_retries: Max automatic retries for retryable
+                transient failures: HTTP 5xx and network-layer
+                ``httpx.RequestError`` (timeouts, connect errors). Defaults to
+                ``3``. Uses exponential backoff ``min(2 ** attempt, 30)``
+                seconds. Set to ``0`` to disable.
+            limits: HTTP connection-pool tuning (``ConnectionLimits``). ``None``
+                (default) uses ``ConnectionLimits()`` defaults sized for typical
+                batchexecute fan-out (max_connections=100,
+                max_keepalive_connections=50, keepalive_expiry=30.0s). Widen
+                for heavy batch workloads (FastAPI/Django services sharing one
+                client across many concurrent requests).
         """
         # Normalize the effective storage path onto the auth object so every
         # downstream code path (refresh_auth, ClientCore.close on-close save,
@@ -120,14 +144,19 @@ class NotebookLMClient:
             keepalive=keepalive,
             keepalive_min_interval=keepalive_min_interval,
             keepalive_storage_path=auth.storage_path,
+            rate_limit_max_retries=rate_limit_max_retries,
+            server_error_max_retries=server_error_max_retries,
+            limits=limits,
         )
 
-        # Initialize sub-client APIs
-        # Note: notes must be initialized before artifacts (artifacts uses notes API)
+        # Initialize sub-client APIs.
+        # ArtifactsAPI and NotesAPI both consume the shared ``_mind_map``
+        # module for mind-map primitives, so their construction order is
+        # not significant (see T6.F).
         self.notebooks = NotebooksAPI(self._core)
         self.sources = SourcesAPI(self._core)
+        self.artifacts = ArtifactsAPI(self._core, storage_path=storage_path)
         self.notes = NotesAPI(self._core)
-        self.artifacts = ArtifactsAPI(self._core, notes_api=self.notes, storage_path=storage_path)
         self.chat = ChatAPI(self._core)
         self.research = ResearchAPI(self._core)
         self.settings = SettingsAPI(self._core)
@@ -144,10 +173,32 @@ class NotebookLMClient:
         await self._core.open()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Close the client connection."""
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Close the client connection.
+
+        Exception arbitration (T7.B4 / audit §25): if the ``async with``
+        body raised, prefer that exception and demote any ``close()``
+        failure to a WARNING log so the original cause isn't masked.
+        If the body succeeded, propagate ``close()`` failures normally.
+        ``BaseException`` is caught so ``CancelledError`` /
+        ``KeyboardInterrupt`` mid-close also flow through arbitration.
+        """
         logger.debug("Closing NotebookLM client")
-        await self._core.close()
+        try:
+            await self._core.close()
+        except BaseException as close_exc:
+            if exc_val is not None:
+                logger.warning(
+                    "Suppressing close() error to preserve original exception: %s",
+                    close_exc,
+                )
+                return
+            raise
 
     @property
     def is_connected(self) -> bool:
@@ -162,6 +213,9 @@ class NotebookLMClient:
         profile: str | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = DEFAULT_KEEPALIVE_MIN_INTERVAL,
+        rate_limit_max_retries: int = 0,
+        server_error_max_retries: int = 3,
+        limits: "ConnectionLimits | None" = None,
     ) -> "NotebookLMClient":
         """Create a client from Playwright storage state file.
 
@@ -177,6 +231,16 @@ class NotebookLMClient:
                 rotation poke. ``None`` disables it (default). See
                 :class:`NotebookLMClient` for full semantics.
             keepalive_min_interval: Floor for ``keepalive`` (defaults to 60 s).
+            rate_limit_max_retries: Max automatic retries on HTTP 429. ``0``
+                (default) preserves pre-Phase-3 raise-immediately behavior.
+            server_error_max_retries: Max automatic retries for HTTP 5xx /
+                network errors with exponential backoff. Defaults to ``3``.
+            limits: HTTP connection-pool tuning (``ConnectionLimits``). ``None``
+                (default) uses ``ConnectionLimits()`` defaults sized for
+                typical batchexecute fan-out (max_connections=100,
+                max_keepalive_connections=50, keepalive_expiry=30.0s). Widen
+                for heavy batch workloads (FastAPI/Django services sharing one
+                client across many concurrent requests).
 
         Returns:
             NotebookLMClient instance (not yet connected).
@@ -208,6 +272,9 @@ class NotebookLMClient:
             storage_path=storage_path,
             keepalive=keepalive,
             keepalive_min_interval=keepalive_min_interval,
+            rate_limit_max_retries=rate_limit_max_retries,
+            server_error_max_retries=server_error_max_retries,
+            limits=limits,
         )
 
     async def refresh_auth(self) -> AuthTokens:
@@ -223,7 +290,10 @@ class NotebookLMClient:
             ValueError: If token extraction fails (page structure may have changed).
         """
         http_client = self._core.get_http_client()
-        response = await http_client.get("https://notebooklm.google.com/")
+        url = f"{get_base_url()}/"
+        if self.auth.account_email or self.auth.authuser:
+            url = f"{url}?{authuser_query(self.auth.authuser, self.auth.account_email)}"
+        response = await http_client.get(url)
         response.raise_for_status()
 
         # Check for redirect to login page
@@ -231,23 +301,33 @@ class NotebookLMClient:
         if is_google_auth_redirect(final_url):
             raise ValueError("Authentication expired. Run 'notebooklm login' to re-authenticate.")
 
-        # Extract SNlM0e (CSRF token) - REQUIRED
-        csrf_match = re.search(r'"SNlM0e":"([^"]+)"', response.text)
-        if not csrf_match:
+        # Extract SNlM0e (CSRF token) + FdrFJe (Session ID) via the unified
+        # extract_wiz_field helper. The helper tolerates double-quoted,
+        # single-quoted, and HTML-escaped variants, and raises
+        # AuthExtractionError with a sanitized 200-char preview on drift.
+        # AuthExtractionError is wrapped in ValueError to preserve the
+        # historical contract that refresh_auth raises ValueError on
+        # extraction failure (existing callers in keepalive paths catch
+        # ValueError specifically).
+        try:
+            csrf = extract_wiz_field(response.text, "SNlM0e", strict=True)
+            sid = extract_wiz_field(response.text, "FdrFJe", strict=True)
+        except AuthExtractionError as exc:
+            # Preserve the legacy human-readable label for each token
+            # ("CSRF token" / "session ID") so existing callers and tests
+            # that match on substring keep working, while still propagating
+            # the sanitized HTML preview from the new helper.
+            label = {"SNlM0e": "CSRF token", "FdrFJe": "session ID"}.get(exc.key, exc.key)
             raise ValueError(
-                "Failed to extract CSRF token (SNlM0e). "
-                "Page structure may have changed or authentication expired."
-            )
-        self._core.auth.csrf_token = csrf_match.group(1)
-
-        # Extract FdrFJe (Session ID) - REQUIRED
-        sid_match = re.search(r'"FdrFJe":"([^"]+)"', response.text)
-        if not sid_match:
-            raise ValueError(
-                "Failed to extract session ID (FdrFJe). "
-                "Page structure may have changed or authentication expired."
-            )
-        self._core.auth.session_id = sid_match.group(1)
+                f"Failed to extract {label} ({exc.key}). "
+                "Page structure may have changed or authentication expired. "
+                f"Preview: {exc.payload_preview!r}"
+            ) from exc
+        # ``extract_wiz_field`` returns ``Optional[str]``; with ``strict=True``
+        # it never returns None — narrow the type for mypy and tolerate the
+        # (unreachable) None branch without crashing.
+        self._core.auth.csrf_token = csrf or ""
+        self._core.auth.session_id = sid or ""
 
         # CRITICAL: Update the HTTP client headers with new auth tokens
         # Without this, the client continues using stale credentials

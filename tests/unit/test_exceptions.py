@@ -3,6 +3,7 @@
 import pytest
 
 import notebooklm
+from notebooklm._env import DEFAULT_BASE_URL
 from notebooklm.exceptions import (
     ArtifactDownloadError,
     ArtifactError,
@@ -67,9 +68,9 @@ class TestExceptionHierarchy:
             ArtifactDownloadError,
         ]
         for exc_class in exceptions:
-            assert issubclass(
-                exc_class, NotebookLMError
-            ), f"{exc_class.__name__} should inherit from NotebookLMError"
+            assert issubclass(exc_class, NotebookLMError), (
+                f"{exc_class.__name__} should inherit from NotebookLMError"
+            )
 
     def test_network_error_not_under_rpc(self):
         """NetworkError is NOT under RPCError (by design)."""
@@ -149,11 +150,15 @@ class TestRPCErrorAttributes:
             assert issubclass(w[0].category, DeprecationWarning)
             assert "code" in str(w[0].message)
 
-    def test_rpc_error_truncates_raw_response(self):
-        """RPCError truncates raw_response to 500 chars."""
+    def test_rpc_error_truncates_raw_response(self, monkeypatch):
+        """RPCError truncates raw_response to 80 chars + '...' by default."""
+        monkeypatch.delenv("NOTEBOOKLM_DEBUG", raising=False)
         long_response = "x" * 1000
         e = RPCError("Failed", raw_response=long_response)
-        assert len(e.raw_response) == 500
+        assert e.raw_response is not None
+        assert len(e.raw_response) == 83
+        assert e.raw_response.endswith("...")
+        assert e.raw_response[:-3] == "x" * 80
 
     def test_rpc_error_stores_found_ids(self):
         """RPCError stores found_ids list."""
@@ -270,6 +275,23 @@ class TestDomainExceptions:
         assert e.known_limits == (100, 500)
         assert "Known NotebookLM limits include: 100, 500" in str(e)
         assert e.to_error_response_extra()["known_limits"] == [100, 500]
+
+    def test_notebook_limit_error_tolerates_invalid_base_url_env(self, monkeypatch):
+        """NotebookLimitError should preserve quota context even if env config is invalid."""
+        monkeypatch.setenv("NOTEBOOKLM_BASE_URL", "https://evil.example.com")
+
+        e = NotebookLimitError(499, limit=500)
+
+        assert "499/500" in str(e)
+        base_url = (
+            str(e)
+            .split("Delete old notebooks at ", 1)[1]
+            .split(
+                " and try again.",
+                1,
+            )[0]
+        )
+        assert base_url == DEFAULT_BASE_URL
 
     def test_source_not_found_has_source_id(self):
         """SourceNotFoundError stores source_id."""

@@ -1,43 +1,311 @@
 """Source management CLI commands.
 
 Commands:
-    list         List sources in a notebook
-    add          Add a source (url, text, file, youtube)
-    get          Get source details
-    fulltext     Get full indexed text content of a source
-    guide        Get AI-generated source summary and keywords
-    stale        Check if a URL/Drive source needs refresh
-    delete       Delete a source
-    delete-by-title Delete a source by exact title
-    rename       Rename a source
-    refresh      Refresh a URL/Drive source
-    add-drive    Add a Google Drive document
-    add-research Search web/drive and add sources from results
+    list             List sources in a notebook
+    add              Add a source (url, text, file, youtube)
+    add-drive        Add a Google Drive document
+    add-research     Search web/drive and add sources from results
+    get              Get source details
+    fulltext         Get full indexed text content of a source
+    guide            Get AI-generated source summary and keywords
+    stale            Check if a URL/Drive source needs refresh
+    wait             Wait for a source to finish processing
+    clean            Remove duplicate, error, and access-blocked sources
+    delete           Delete a source
+    delete-by-title  Delete a source by exact title
+    rename           Rename a source
+    refresh          Refresh a URL/Drive source
 """
 
 import asyncio
+import contextlib
+import os
 import re
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlparse, urlunparse
 
 import click
 from rich.table import Table
 
-from .._url_utils import is_youtube_url
 from ..client import NotebookLMClient
 from ..types import source_status_to_str
+from ..urls import is_youtube_url
+from .error_handler import _output_error, emit_cancelled_and_exit
 from .helpers import (
     console,
     display_report,
     display_research_sources,
+    emit_status,
     get_source_type_display,
-    import_with_retry,
+    import_research_sources,
     json_output_response,
+    read_stdin_text,
     require_notebook,
     resolve_notebook_id,
+    resolve_prompt,
     resolve_source_id,
     validate_id,
     with_client,
 )
+from .options import (
+    json_option,
+    list_options,
+    notebook_option,
+    prompt_file_option,
+    wait_polling_options,
+)
+
+
+@contextlib.asynccontextmanager
+async def _status_with_elapsed(
+    message: str,
+    *,
+    json_output: bool = False,
+    resume_hint: str | None = None,
+) -> AsyncIterator[None]:
+    """Show a Rich spinner with a periodically updated elapsed timer.
+
+    Used by ``source wait`` so interactive callers see live feedback during
+    the blocking poll (P5.T2 / I7). No-op (for the spinner) when
+    ``json_output`` is True so stdout stays pure JSON for automation. The
+    spinner is transient — it disappears on exit, leaving only the final
+    ready / failure / timeout line.
+
+    The ticker task updates the status text once per second while the wrapped
+    coroutine awaits the long-running call. Cancellation is best-effort: if
+    the wrapped block raises, the ticker is cancelled in ``finally`` and the
+    exception propagates unchanged.
+
+    SIGINT handling (M2 / P5.T3): when ``resume_hint`` is provided, a
+    ``KeyboardInterrupt`` raised inside the wrapped block is caught and
+    converted into a friendly cancellation message via
+    :func:`emit_cancelled_and_exit`. ``source wait`` uses the parallel
+    ``notebooklm source wait <source_id>`` hint (no separate ``poll`` command
+    exists for sources — re-running the same wait IS the resume).
+    """
+
+    @contextlib.contextmanager
+    def _sigint_guard():
+        try:
+            yield
+        except KeyboardInterrupt:
+            if resume_hint is None:
+                raise
+            emit_cancelled_and_exit(resume_hint, json_output=json_output)
+
+    if json_output:
+        with _sigint_guard():
+            yield
+        return
+    start = time.monotonic()
+    with console.status(message) as status:
+
+        async def _ticker() -> None:
+            while True:
+                await asyncio.sleep(1.0)
+                elapsed = int(time.monotonic() - start)
+                status.update(f"{message} [{elapsed}s elapsed]")
+
+        ticker_task = asyncio.create_task(_ticker())
+        try:
+            with _sigint_guard():
+                yield
+        finally:
+            ticker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ticker_task
+
+
+# Titles matching this pattern indicate the source was blocked by an anti-bot
+# gateway, CAPTCHA, or returned an HTTP error page instead of real content.
+_GATEWAY_TITLE_PATTERN = re.compile(
+    r"^\s*(access denied|403|404|forbidden|not found|502"
+    r"|just a moment|attention required|security check|captcha)",
+    re.IGNORECASE,
+)
+
+# P4.T4 / I8: path-shape heuristic for ``source add``. When the user passes a
+# string that *looks like* a path (contains ``/`` OR ends in a recognized
+# document extension) but the path does not exist on disk, the CLI silently
+# falls through to inline-text ingestion. That's a common typo footgun
+# (``./missin.md`` -> "Added source: src_xxx" is indistinguishable from a
+# successful upload). The remediation is a stderr advisory warning; the source
+# is still added as text so the established inferred-text behavior is preserved.
+# Explicit ``--type text`` suppresses the heuristic — the user has stated intent.
+#
+# Extension list intentionally narrow: only formats that are unambiguously
+# documents/data files in the NotebookLM source domain. Adding ``.json``,
+# ``.yaml``, etc. risks false positives on legitimate inline content (e.g.
+# pasting a config snippet as a note).
+_PATH_SHAPED_EXTENSIONS = frozenset(
+    {
+        ".pdf",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".html",
+        ".htm",
+        ".doc",
+        ".docx",
+        ".rtf",
+        ".odt",
+        ".csv",
+        ".tsv",
+        ".epub",
+    }
+)
+
+
+def _looks_like_path(content: str) -> bool:
+    """Return True if ``content`` is path-shaped (slash OR known extension).
+
+    Used by ``source add`` to detect the typo footgun where the user meant to
+    upload a file but the path doesn't exist. See ``_PATH_SHAPED_EXTENSIONS``
+    for the curated extension allowlist.
+    """
+    if "/" in content or "\\" in content:
+        return True
+    suffix = Path(content).suffix.lower()
+    return suffix in _PATH_SHAPED_EXTENSIONS
+
+
+# Only sources with explicit "error" status are auto-cleaned. "unknown" is
+# excluded on purpose: it covers status codes we don't recognize yet (future
+# NotebookLM states) and missing-status responses, which must not be silently
+# deleted.
+_JUNK_STATUSES = frozenset({"error"})
+
+
+def _validate_upload_path(content: str, follow_symlinks: bool) -> Path:
+    """Validate a local-file path before uploading it as a source.
+
+    Returns the resolved ``Path`` so the caller can forward exactly the
+    artifact it validated (closing the time-of-check / time-of-use window
+    that ``add_file()`` would otherwise re-open).
+
+    Rules (default-deny):
+
+    1. If ``follow_symlinks`` is ``False`` and **any** component of the
+       path — the leaf or any parent directory — is a symlink, refuse.
+       Checking parents matters: ``dir_link/secret.pdf`` would otherwise
+       sneak past a leaf-only ``is_symlink()`` check.
+    2. The symlink check runs **before** ``exists()`` so a broken symlink
+       gets a clear "symlink" rejection instead of being treated as text
+       content via the fall-through branch.
+    3. After resolution the target must be a regular file (no
+       directories, FIFOs, devices, sockets).
+
+    Raises:
+        click.ClickException: on any of the above failures. The message
+            tells the user exactly which flag opts in.
+    """
+    raw = Path(content)
+
+    # 1) Symlink gate (leaf + every parent). Catches broken symlinks too,
+    # because ``is_symlink()`` is True for dangling links.
+    if not follow_symlinks:
+        for component in [raw, *raw.parents]:
+            if component.is_symlink():
+                raise click.ClickException(
+                    "Path is a symlink; pass --follow-symlinks to follow it "
+                    f"explicitly. Refusing to upload: {raw}"
+                )
+
+    # 2) Resolve only after the explicit --follow-symlinks opt-in (or after
+    # the no-symlink check above has passed).
+    file_path = raw.expanduser().resolve()
+
+    # 3) Reject directories, pipes, devices, sockets, and non-existent
+    # paths. Symlinks have already been handled above, so this guard now
+    # covers the non-symlink "weird filetype" cases.
+    if not file_path.is_file():
+        raise click.ClickException(f"Not a regular file: {content}")
+
+    return file_path
+
+
+def _normalize_url_for_dedup(url: str) -> str:
+    """Return a URL with only the fragment stripped, for dedup comparison.
+
+    Scheme and host are lowercased per RFC 3986 (both are case-insensitive),
+    so ``https://Example.com/a`` and ``https://example.com/a`` are recognised
+    as the same resource. Query strings are preserved because they often
+    disambiguate distinct resources (e.g. YouTube ``?v=ID``, Google Docs
+    ``?id=ID``, arXiv versions), so collapsing them would falsely flag
+    legitimate sources as duplicates.
+    """
+    parsed = urlparse(url)
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            "",
+        )
+    )
+
+
+# Sort key sentinel: sources with no created_at go to the END so a real,
+# dated copy is preferred as the "oldest" anchor during dedup.
+_UNDATED_SORT_KEY = float("inf")
+
+
+def _classify_junk_sources(sources: list) -> list[tuple[str, str, str, str]]:
+    """Identify junk sources for cleanup.
+
+    Returns a deterministically ordered list of ``(id, title, status, reason)``
+    tuples for every source that should be deleted. ``reason`` is one of
+    ``"error_status"``, ``"gateway_title"``, or ``"duplicate_of:<short-id>"``.
+    The oldest non-junk copy of each URL is kept; later duplicates are flagged.
+    """
+    sorted_sources = sorted(
+        sources,
+        key=lambda s: s.created_at.timestamp() if s.created_at else _UNDATED_SORT_KEY,
+    )
+
+    candidates: list[tuple[str, str, str, str]] = []
+    seen_urls: dict[str, str] = {}
+
+    for s in sorted_sources:
+        title = (s.title or "").strip()
+        status = source_status_to_str(s.status) if s.status else "unknown"
+
+        if status in _JUNK_STATUSES:
+            candidates.append((s.id, title, status, "error_status"))
+            continue
+
+        if _GATEWAY_TITLE_PATTERN.match(title):
+            candidates.append((s.id, title, status, "gateway_title"))
+            continue
+
+        url = s.url or ""
+        if url:
+            normalized = _normalize_url_for_dedup(url)
+            kept = seen_urls.get(normalized)
+            if kept is not None:
+                candidates.append((s.id, title, status, f"duplicate_of:{kept[:8]}"))
+                continue
+            seen_urls[normalized] = s.id
+
+    return candidates
+
+
+def _print_clean_candidates(candidates: list[tuple[str, str, str, str]]) -> None:
+    """Print a Rich table summarizing sources that will (or would) be deleted."""
+    table = Table(title=f"{len(candidates)} source(s) flagged for cleanup")
+    table.add_column("ID", style="dim", overflow="fold")
+    table.add_column("Title", overflow="fold")
+    table.add_column("Status")
+    table.add_column("Reason")
+    for sid, title, status, reason in candidates:
+        display_title = title if title else "[dim](no title)[/dim]"
+        table.add_row(sid[:8], display_title, status, reason)
+    console.print(table)
 
 
 @click.group()
@@ -46,16 +314,20 @@ def source():
 
     \b
     Commands:
-      list         List sources in a notebook
-      add          Add a source (url, text, file, youtube)
-      get          Get source details
-      fulltext     Get full indexed text content
-      guide        Get AI-generated source summary and keywords
-      stale        Check if source needs refresh
-      delete       Delete a source
-      delete-by-title Delete a source by exact title
-      rename       Rename a source
-      refresh      Refresh a URL/Drive source
+      list             List sources in a notebook
+      add              Add a source (url, text, file, youtube)
+      add-drive        Add a Google Drive document
+      add-research     Search web/drive and add sources from results
+      get              Get source details
+      fulltext         Get full indexed text content
+      guide            Get AI-generated source summary and keywords
+      stale            Check if source needs refresh
+      wait             Wait for a source to finish processing
+      clean            Remove duplicate, error, and access-blocked sources
+      delete           Delete a source
+      delete-by-title  Delete a source by exact title
+      rename           Rename a source
+      refresh          Refresh a URL/Drive source
 
     \b
     Partial ID Support:
@@ -87,11 +359,16 @@ def _looks_like_full_source_id(source_id: str) -> bool:
     )
 
 
-async def _resolve_source_for_delete(client, notebook_id: str, source_id: str) -> str:
+async def _resolve_source_for_delete(
+    client, notebook_id: str, source_id: str, *, json_output: bool = False
+) -> str:
     """Resolve a source ID for delete, returning the full source ID string.
 
     Canonical UUIDs take a fast path and skip the live source list lookup.
     Partial IDs are resolved against the live list.
+
+    When ``json_output`` is True, the "Matched..." diagnostic for a successful
+    partial match is routed to stderr so stdout stays parseable JSON.
     """
     source_id = validate_id(source_id, "source")
     if _looks_like_full_source_id(source_id):
@@ -103,7 +380,10 @@ async def _resolve_source_for_delete(client, notebook_id: str, source_id: str) -
     if len(matches) == 1:
         if matches[0].id != source_id:
             title = matches[0].title or "(untitled)"
-            console.print(f"[dim]Matched: {matches[0].id[:12]}... ({title})[/dim]")
+            emit_status(
+                f"[dim]Matched: {matches[0].id[:12]}... ({title})[/dim]",
+                json_output=json_output,
+            )
         return matches[0].id
 
     if len(matches) > 1:
@@ -151,23 +431,27 @@ async def _resolve_source_by_exact_title(client, notebook_id: str, title: str):
 
 
 @source.command("list")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@list_options
 @with_client
-def source_list(ctx, notebook_id, json_output, client_auth):
-    """List all sources in a notebook."""
+def source_list(ctx, notebook_id, json_output, limit, no_truncate, client_auth):
+    """List all sources in a notebook.
+
+    \b
+    Pagination & display:
+      --limit N         Show at most N sources (default: unlimited).
+      --no-truncate     Do not truncate the Title column in the table view.
+    """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             sources = await client.sources.list(nb_id_resolved)
+            # P6.T1 / I16: client-side offset slicing.
+            if limit is not None and limit >= 0:
+                sources = sources[:limit]
             nb = None
             if json_output:
                 nb = await client.notebooks.get(nb_id_resolved)
@@ -196,7 +480,8 @@ def source_list(ctx, notebook_id, json_output, client_auth):
 
             table = Table(title=f"Sources in {nb_id_resolved}")
             table.add_column("ID", style="cyan")
-            table.add_column("Title", style="green")
+            title_overflow: Literal["fold", "ellipsis"] = "fold" if no_truncate else "ellipsis"
+            table.add_column("Title", style="green", overflow=title_overflow)
             table.add_column("Type")
             table.add_column("Created", style="dim")
             table.add_column("Status", style="yellow")
@@ -214,13 +499,7 @@ def source_list(ctx, notebook_id, json_output, client_auth):
 
 @source.command("add")
 @click.argument("content")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option(
     "--type",
     "source_type",
@@ -228,52 +507,161 @@ def source_list(ctx, notebook_id, json_output, client_auth):
     default=None,
     help="Source type (auto-detected if not specified)",
 )
-@click.option("--title", help="Title for text sources")
-@click.option("--mime-type", help="MIME type for file sources")
+@click.option("--title", help="Custom title for text and uploaded-file sources")
+# DEPRECATION-REMOVAL: v0.X.0 — ``--mime-type`` on the file-source path is a
+# no-op (the upload pipeline ignores it; the server derives the MIME type from
+# the filename extension). A deprecation note is echoed to stderr when the flag
+# is used with a file source. The separate Drive-source ``--mime-type`` on the
+# ``add-drive`` command remains live and IS NOT affected by this deprecation.
+@click.option(
+    "--mime-type",
+    help=(
+        "[Deprecated] MIME type for file sources — unused; the server "
+        "derives MIME from the filename extension. Drive sources retain "
+        "this option (see ``source add-drive``)."
+    ),
+)
+@click.option(
+    "--timeout",
+    default=None,
+    type=float,
+    help=(
+        "HTTP request timeout in seconds (default: 30, from the library). "
+        "Increase when adding slow URLs or large files that exceed the default."
+    ),
+)
+@click.option(
+    "--follow-symlinks",
+    is_flag=True,
+    default=False,
+    help=(
+        "Follow symbolic links when uploading a file. By default, symlinks "
+        "are rejected so a workspace symlink cannot silently exfiltrate the "
+        "file it points at (e.g. ~/Downloads/foo.pdf -> /etc/passwd)."
+    ),
+)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
-def source_add(ctx, content, notebook_id, source_type, title, mime_type, json_output, client_auth):
+def source_add(
+    ctx,
+    content,
+    notebook_id,
+    source_type,
+    title,
+    mime_type,
+    timeout,
+    follow_symlinks,
+    json_output,
+    client_auth,
+):
     """Add a source to a notebook.
 
     \b
     Source type is auto-detected:
       - URLs (http/https) -> url or youtube
-      - Existing files (.txt, .md) -> text
+      - Existing files (.pdf, .md, .txt, etc.) -> file (uploaded)
       - Other content -> text (inline)
       - Use --type to override
 
     \b
     Examples:
-      source add https://example.com              # URL
-      source add ./doc.md                         # File content as text
-      source add https://youtube.com/...          # YouTube video
-      source add "My notes here"                  # Inline text
-      source add "My notes" --title "Research"   # Text with custom title
+      notebooklm source add https://example.com             # URL
+      notebooklm source add ./doc.pdf                       # Existing file uploaded
+      notebooklm source add https://youtube.com/...         # YouTube video
+      notebooklm source add "My notes here"                 # Inline text
+      notebooklm source add "My notes" --title "Research"   # Text with custom title
+
+    \b
+    Note: a path-shaped argument (contains '/' or ends in a known document
+    extension) that does not exist on disk is still ingested as inline text,
+    but a stderr warning is emitted so a typo (e.g. ``./missin.md``) cannot
+    silently masquerade as a successful upload. Pass ``--type text`` to suppress
+    the warning when the input is genuinely text content that happens to look
+    path-shaped.
     """
+    # P7.T2 / M3 — Unix ``-`` convention: ``source add -`` reads inline text
+    # from stdin and forces the text-source path. Intercepted here BEFORE
+    # the URL / file / path-shaped auto-detection branches so a single dash
+    # never falls into the path-shaped warning ("'-' looks like a path...")
+    # and so an explicit ``--type file -`` does not try to open a file
+    # literally named ``-``. We always route through the text branch — URL
+    # / file / YouTube would be nonsensical for piped text and the
+    # ``--type`` override is silently coerced for the same reason.
+    if content == "-":
+        content = read_stdin_text(source_label="source content")
+        source_type = "text"
+
     nb_id = require_notebook(notebook_id)
 
     # Auto-detect source type if not specified
     detected_type = source_type
     file_content = None
     file_title = title
+    # Set once the path passes ``_validate_upload_path`` so the upload uses
+    # the resolved path we just validated (closes the TOCTOU window where a
+    # symlink could be retargeted between validation and ``add_file()``).
+    upload_path: Path | None = None
 
     if detected_type is None:
         if content.startswith(("http://", "https://")):
             detected_type = "youtube" if is_youtube_url(content) else "url"
-        elif Path(content).exists():
-            file_path = Path(content).resolve()  # Resolve symlinks
-            # Security: Ensure it's a regular file (not a symlink to sensitive file)
-            if not file_path.is_file():
-                raise click.ClickException(f"Not a regular file: {content}")
-            # All files use add_file() for proper type detection
+        elif Path(content).exists() or Path(content).is_symlink():
+            # ``is_symlink()`` short-circuits ``exists()`` for broken
+            # symlinks (``exists()`` follows the link and reports False),
+            # so we OR them together to make sure the symlink gate fires
+            # on dangling links instead of letting them slip into the
+            # text fall-through branch.
+            upload_path = _validate_upload_path(content, follow_symlinks)
             detected_type = "file"
         else:
+            # P4.T4 / I8: warn when the user passed a path-shaped string that
+            # doesn't exist on disk. Without this, ``source add ./missin.md``
+            # silently sends the literal string ``./missin.md`` as note content
+            # — the success line ("Added source: src_xxx") is indistinguishable
+            # from a real file upload. The source is still added as text so
+            # established inferred-text behavior is preserved (no breaking exit
+            # change). Suppressed when ``source_type`` is already set
+            # explicitly — the user has stated intent — but here we're inside
+            # the ``detected_type is None`` branch so an explicit override
+            # never reaches this code in the first place. See I8 in the audit.
+            if _looks_like_path(content):
+                click.echo(
+                    f"warning: '{content}' looks like a path but does not "
+                    f"exist; ingesting as inline text. Pass --type text to "
+                    f"suppress this warning, or check the path for typos.",
+                    err=True,
+                )
             detected_type = "text"
             file_title = title or "Pasted Text"
+    elif detected_type == "file":
+        # Explicit ``--type file``: the auto-detect block above is skipped,
+        # so apply the same symlink + regular-file gate here. Without this,
+        # ``source add link.pdf --type file`` would silently bypass the
+        # ``--follow-symlinks`` opt-in and leak the symlink target.
+        upload_path = _validate_upload_path(content, follow_symlinks)
+
+    # DEPRECATION-REMOVAL: v0.X.0 — ``--mime-type`` is a no-op on the file
+    # source path (the upload pipeline ignores it). The Drive ``--mime-type``
+    # on ``source add-drive`` is untouched. Suppressible via
+    # ``NOTEBOOKLM_QUIET_DEPRECATIONS=1`` so CI logs stay clean.
+    if (
+        mime_type is not None
+        and detected_type == "file"
+        and os.environ.get("NOTEBOOKLM_QUIET_DEPRECATIONS") != "1"
+    ):
+        click.echo(
+            "--mime-type is unused for file sources; remove the flag "
+            "(Drive sources retain this option).",
+            err=True,
+        )
+
+    client_kwargs: dict = {}
+    if timeout is not None:
+        client_kwargs["timeout"] = timeout
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+        async with NotebookLMClient(client_auth, **client_kwargs) as client:
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             if detected_type == "url" or detected_type == "youtube":
                 src = await client.sources.add_url(nb_id_resolved, content)
             elif detected_type == "text":
@@ -281,7 +669,22 @@ def source_add(ctx, content, notebook_id, source_type, title, mime_type, json_ou
                 text_title = file_title or "Untitled"
                 src = await client.sources.add_text(nb_id_resolved, text_title, text_content)
             elif detected_type == "file":
-                src = await client.sources.add_file(nb_id_resolved, content, mime_type)
+                # ``upload_path`` is always populated by the validation
+                # above when ``detected_type == "file"``. Pass the resolved
+                # path string so ``add_file()`` opens exactly the file we
+                # just validated (no second symlink hop).
+                assert upload_path is not None, (
+                    "upload_path must be set when detected_type == 'file'"
+                )
+                # ``mime_type`` is intentionally NOT forwarded: the upload
+                # pipeline ignores it and ``add_file`` warns when a non-None
+                # value is passed. The CLI deprecation echo above already
+                # informs the user that the flag is a no-op for file sources;
+                # passing it here would also trigger the library-level
+                # ``DeprecationWarning`` and double-up the signal.
+                src = await client.sources.add_file(
+                    nb_id_resolved, str(upload_path), title=file_title
+                )
 
             if json_output:
                 data = {
@@ -305,15 +708,10 @@ def source_add(ctx, content, notebook_id, source_type, title, mime_type, json_ou
 
 @source.command("get")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
+@json_option
 @with_client
-def source_get(ctx, source_id, notebook_id, client_auth):
+def source_get(ctx, source_id, notebook_id, json_output, client_auth):
     """Get source details.
 
     SOURCE_ID can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
@@ -322,38 +720,70 @@ def source_get(ctx, source_id, notebook_id, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             # Resolve partial ID to full ID
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
             src = await client.sources.get(nb_id_resolved, resolved_id)
-            if src:
-                console.print(f"[bold cyan]Source:[/bold cyan] {src.id}")
-                console.print(f"[bold]Title:[/bold] {src.title}")
-                console.print(f"[bold]Type:[/bold] {get_source_type_display(src.kind)}")
-                if src.url:
-                    console.print(f"[bold]URL:[/bold] {src.url}")
-                if src.created_at:
-                    console.print(
-                        f"[bold]Created:[/bold] {src.created_at.strftime('%Y-%m-%d %H:%M')}"
-                    )
-            else:
-                console.print("[yellow]Source not found[/yellow]")
+
+            # C1 (Phase 3, BREAKING): not-found exits 1 with a typed error
+            # instead of the previous exit-0 ``found: false`` placeholder. The
+            # ``_output_error`` helper writes the message to stderr (text mode)
+            # or emits ``{error, code, message, source_id}`` to stdout (json
+            # mode) and raises ``SystemExit(1)``. See ``docs/cli-exit-codes.md``
+            # and the BREAKING entry in ``CHANGELOG.md`` (Unreleased → Changed).
+            #
+            # The trailing ``raise AssertionError`` is unreachable at runtime
+            # (``_output_error`` always raises) — it exists solely to narrow
+            # ``src`` from ``Source | None`` to ``Source`` for mypy without
+            # forcing a ``NoReturn`` annotation onto
+            # ``error_handler._output_error`` (which would touch a module the
+            # C1 spec says we must not).
+            if src is None:
+                _output_error(
+                    "Source not found",
+                    code="NOT_FOUND",
+                    json_output=json_output,
+                    exit_code=1,
+                    extra={"source_id": resolved_id, "notebook_id": nb_id_resolved},
+                )
+                raise AssertionError("unreachable")  # pragma: no cover
+
+            if json_output:
+                data = {
+                    "source": {
+                        "id": src.id,
+                        "title": src.title,
+                        "type": str(src.kind),
+                        "url": src.url,
+                        "status": source_status_to_str(src.status),
+                        "status_id": src.status,
+                        "created_at": (src.created_at.isoformat() if src.created_at else None),
+                    },
+                    "found": True,
+                }
+                json_output_response(data)
+                return
+
+            console.print(f"[bold cyan]Source:[/bold cyan] {src.id}")
+            console.print(f"[bold]Title:[/bold] {src.title}")
+            console.print(f"[bold]Type:[/bold] {get_source_type_display(src.kind)}")
+            if src.url:
+                console.print(f"[bold]URL:[/bold] {src.url}")
+            if src.created_at:
+                console.print(f"[bold]Created:[/bold] {src.created_at.strftime('%Y-%m-%d %H:%M')}")
 
     return _run()
 
 
 @source.command("delete")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@json_option
 @with_client
-def source_delete(ctx, source_id, notebook_id, yes, client_auth):
+def source_delete(ctx, source_id, notebook_id, yes, json_output, client_auth):
     """Delete a source.
 
     SOURCE_ID can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
@@ -362,13 +792,37 @@ def source_delete(ctx, source_id, notebook_id, yes, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            resolved_id = await _resolve_source_for_delete(client, nb_id_resolved, source_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            resolved_id = await _resolve_source_for_delete(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
 
             if not yes and not click.confirm(f"Delete source {resolved_id}?"):
+                if json_output:
+                    json_output_response(
+                        {
+                            "action": "delete",
+                            "source_id": resolved_id,
+                            "notebook_id": nb_id_resolved,
+                            "status": "cancelled",
+                        }
+                    )
                 return
 
             success = await client.sources.delete(nb_id_resolved, resolved_id)
+
+            if json_output:
+                json_output_response(
+                    {
+                        "action": "delete",
+                        "source_id": resolved_id,
+                        "notebook_id": nb_id_resolved,
+                        "success": bool(success),
+                        "status": "deleted" if success else "unknown",
+                    }
+                )
+                return
+
             if success:
                 console.print(f"[green]Deleted source:[/green] {resolved_id}")
             else:
@@ -379,28 +833,47 @@ def source_delete(ctx, source_id, notebook_id, yes, client_auth):
 
 @source.command("delete-by-title")
 @click.argument("title")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@json_option
 @with_client
-def source_delete_by_title(ctx, title, notebook_id, yes, client_auth):
+def source_delete_by_title(ctx, title, notebook_id, yes, json_output, client_auth):
     """Delete a source by exact title."""
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             source = await _resolve_source_by_exact_title(client, nb_id_resolved, title)
 
             if not yes and not click.confirm(f"Delete source '{source.title}' ({source.id})?"):
+                if json_output:
+                    json_output_response(
+                        {
+                            "action": "delete-by-title",
+                            "source_id": source.id,
+                            "title": source.title,
+                            "notebook_id": nb_id_resolved,
+                            "status": "cancelled",
+                        }
+                    )
                 return
 
             success = await client.sources.delete(nb_id_resolved, source.id)
+
+            if json_output:
+                json_output_response(
+                    {
+                        "action": "delete-by-title",
+                        "source_id": source.id,
+                        "title": source.title,
+                        "notebook_id": nb_id_resolved,
+                        "success": bool(success),
+                        "status": "deleted" if success else "unknown",
+                    }
+                )
+                return
+
             if success:
                 console.print(f"[green]Deleted source:[/green] {source.id}")
             else:
@@ -412,15 +885,10 @@ def source_delete_by_title(ctx, title, notebook_id, yes, client_auth):
 @source.command("rename")
 @click.argument("source_id")
 @click.argument("new_title")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
+@json_option
 @with_client
-def source_rename(ctx, source_id, new_title, notebook_id, client_auth):
+def source_rename(ctx, source_id, new_title, notebook_id, json_output, client_auth):
     """Rename a source.
 
     SOURCE_ID can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
@@ -429,10 +897,25 @@ def source_rename(ctx, source_id, new_title, notebook_id, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             # Resolve partial ID to full ID
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
             src = await client.sources.rename(nb_id_resolved, resolved_id, new_title)
+
+            if json_output:
+                json_output_response(
+                    {
+                        "action": "rename",
+                        "source_id": src.id,
+                        "notebook_id": nb_id_resolved,
+                        "title": src.title,
+                        "status": "renamed",
+                    }
+                )
+                return
+
             console.print(f"[green]Renamed source:[/green] {src.id}")
             console.print(f"[bold]New title:[/bold] {src.title}")
 
@@ -441,15 +924,10 @@ def source_rename(ctx, source_id, new_title, notebook_id, client_auth):
 
 @source.command("refresh")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
+@json_option
 @with_client
-def source_refresh(ctx, source_id, notebook_id, client_auth):
+def source_refresh(ctx, source_id, notebook_id, json_output, client_auth):
     """Refresh a URL/Drive source.
 
     SOURCE_ID can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
@@ -458,11 +936,46 @@ def source_refresh(ctx, source_id, notebook_id, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             # Resolve partial ID to full ID
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
-            with console.status("Refreshing source..."):
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
+
+            if json_output:
                 src = await client.sources.refresh(nb_id_resolved, resolved_id)
+            else:
+                with console.status("Refreshing source..."):
+                    src = await client.sources.refresh(nb_id_resolved, resolved_id)
+
+            if json_output:
+                # ``refresh`` may return a Source dataclass, ``True``, or
+                # falsy/None. Surface the same three states in JSON so
+                # automation can branch on ``status`` without scraping text.
+                if src and src is not True:
+                    data = {
+                        "action": "refresh",
+                        "source_id": src.id,
+                        "notebook_id": nb_id_resolved,
+                        "title": src.title,
+                        "status": "refreshed",
+                    }
+                elif src is True:
+                    data = {
+                        "action": "refresh",
+                        "source_id": resolved_id,
+                        "notebook_id": nb_id_resolved,
+                        "status": "refreshed",
+                    }
+                else:
+                    data = {
+                        "action": "refresh",
+                        "source_id": resolved_id,
+                        "notebook_id": nb_id_resolved,
+                        "status": "no_result",
+                    }
+                json_output_response(data)
+                return
 
             if src and src is not True:
                 console.print(f"[green]Source refreshed:[/green] {src.id}")
@@ -478,23 +991,18 @@ def source_refresh(ctx, source_id, notebook_id, client_auth):
 @source.command("add-drive")
 @click.argument("file_id")
 @click.argument("title")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option(
     "--mime-type",
     type=click.Choice(["google-doc", "google-slides", "google-sheets", "pdf"]),
     default="google-doc",
     help="Document type (default: google-doc)",
 )
+@json_option
 @with_client
-def source_add_drive(ctx, file_id, title, notebook_id, mime_type, client_auth):
+def source_add_drive(ctx, file_id, title, notebook_id, mime_type, json_output, client_auth):
     """Add a Google Drive document as a source."""
-    from ..rpc import DriveMimeType
+    from ..types import DriveMimeType
 
     nb_id = require_notebook(notebook_id)
     mime_map = {
@@ -507,9 +1015,30 @@ def source_add_drive(ctx, file_id, title, notebook_id, mime_type, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            with console.status("Adding Drive source..."):
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+
+            if json_output:
                 src = await client.sources.add_drive(nb_id_resolved, file_id, title, mime)
+            else:
+                with console.status("Adding Drive source..."):
+                    src = await client.sources.add_drive(nb_id_resolved, file_id, title, mime)
+
+            if json_output:
+                json_output_response(
+                    {
+                        "action": "add-drive",
+                        "source": {
+                            "id": src.id,
+                            "title": src.title,
+                            "type": str(src.kind),
+                            "url": src.url,
+                            "drive_file_id": file_id,
+                            "mime_type": mime_type,
+                        },
+                        "notebook_id": nb_id_resolved,
+                    }
+                )
+                return
 
             console.print(f"[green]Added Drive source:[/green] {src.id}")
             console.print(f"[bold]Title:[/bold] {src.title}")
@@ -518,14 +1047,9 @@ def source_add_drive(ctx, file_id, title, notebook_id, mime_type, client_auth):
 
 
 @source.command("add-research")
-@click.argument("query")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@click.argument("query", default="", required=False)
+@prompt_file_option
+@notebook_option
 @click.option(
     "--from",
     "search_source",
@@ -540,25 +1064,52 @@ def source_add_drive(ctx, file_id, title, notebook_id, mime_type, client_auth):
     help="Search mode (default: fast)",
 )
 @click.option("--import-all", is_flag=True, help="Import all found sources")
+@click.option("--cited-only", is_flag=True, help="With --import-all, import only cited sources")
 @click.option(
     "--no-wait",
     is_flag=True,
     help="Start research and return immediately (use 'research status/wait' to monitor)",
 )
+@click.option(
+    "--timeout",
+    default=1800,
+    type=int,
+    help=(
+        "Retry budget in seconds for --import-all when the IMPORT_RESEARCH RPC "
+        "times out (default: 1800). Mirrors 'research wait --timeout'. "
+        "Has no effect without --import-all."
+    ),
+)
 @with_client
 def source_add_research(
-    ctx, query, notebook_id, search_source, mode, import_all, no_wait, client_auth
+    ctx,
+    query,
+    prompt_file,
+    notebook_id,
+    search_source,
+    mode,
+    import_all,
+    cited_only,
+    no_wait,
+    timeout,
+    client_auth,
 ):
     """Search web or drive and add sources from results.
 
     \b
     Examples:
-      source add-research "machine learning"              # Search web
-      source add-research "project docs" --from drive     # Search Google Drive
-      source add-research "AI papers" --mode deep         # Deep search
-      source add-research "tutorials" --import-all        # Auto-import all results
-      source add-research "topic" --mode deep --no-wait   # Non-blocking deep search
+      notebooklm source add-research "machine learning"              # Search web
+      notebooklm source add-research "project docs" --from drive     # Search Google Drive
+      notebooklm source add-research "AI papers" --mode deep         # Deep search
+      notebooklm source add-research "tutorials" --import-all        # Auto-import all results
+      notebooklm source add-research "topic" --import-all --cited-only
+      notebooklm source add-research "topic" --mode deep --no-wait   # Non-blocking deep search
+      notebooklm source add-research --prompt-file query.txt --mode deep   # Read query from file
     """
+    query = resolve_prompt(query, prompt_file, "query", required=True)
+    if cited_only and not import_all:
+        raise click.UsageError("--cited-only requires --import-all")
+
     nb_id = require_notebook(notebook_id)
 
     async def _run():
@@ -601,13 +1152,16 @@ def source_add_research(
                 display_report(status.get("report", ""), json_hint=False)
 
                 if import_all and sources and task_id:
-                    imported = await import_with_retry(
+                    import_result = await import_research_sources(
                         client,
                         nb_id_resolved,
                         task_id,
                         sources,
+                        report=status.get("report", ""),
+                        cited_only=cited_only,
+                        max_elapsed=timeout,
                     )
-                    console.print(f"[green]Imported {len(imported)} sources[/green]")
+                    console.print(f"[green]Imported {len(import_result.imported)} sources[/green]")
             else:
                 console.print(f"[yellow]Status: {status.get('status', 'unknown')}[/yellow]")
 
@@ -616,39 +1170,51 @@ def source_add_research(
 
 @source.command("fulltext")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.option("--output", "-o", type=click.Path(), help="Write content to file")
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["text", "markdown"]),
+    default="text",
+    help="Content format: text (default) or markdown",
+)
 @with_client
-def source_fulltext(ctx, source_id, notebook_id, json_output, output, client_auth):
-    """Get full indexed text content of a source.
+def source_fulltext(ctx, source_id, notebook_id, json_output, output, output_format, client_auth):
+    """Get full content of a source.
 
-    Retrieves the complete text content as indexed by NotebookLM. This is the
-    actual text that NotebookLM uses when answering questions about this source.
+    Retrieves the complete content from NotebookLM. Use --format markdown to get
+    a rich version with headings, tables, links, and emphasis preserved.
 
     SOURCE_ID can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
 
     \b
     Examples:
-      source fulltext abc123                    # Show fulltext in terminal
-      source fulltext abc123 --json             # Output as JSON
-      source fulltext abc123 -o content.txt     # Save to file
+      notebooklm source fulltext abc123                        # Show plaintext in terminal
+      notebooklm source fulltext abc123 -f markdown -o out.md  # Save markdown to file
+      notebooklm source fulltext abc123 --json                 # Output as JSON
     """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
 
-            with console.status("Fetching fulltext content..."):
-                fulltext = await client.sources.get_fulltext(nb_id_resolved, resolved_id)
+            async def _fetch():
+                return await client.sources.get_fulltext(
+                    nb_id_resolved, resolved_id, output_format=output_format
+                )
+
+            if json_output:
+                fulltext = await _fetch()
+            else:
+                with console.status("Fetching fulltext content..."):
+                    fulltext = await _fetch()
 
             if json_output:
                 from dataclasses import asdict
@@ -668,27 +1234,21 @@ def source_fulltext(ctx, source_id, notebook_id, json_output, output, client_aut
                 console.print(f"[bold]URL:[/bold] {fulltext.url}")
             console.print()
             console.print("[bold cyan]Content:[/bold cyan]")
-            # Show first 2000 chars with truncation notice
+            # markup=False so markdown links like `[text](url)` are not eaten by Rich's tag parser
             if len(fulltext.content) > 2000:
-                console.print(fulltext.content[:2000])
+                console.print(fulltext.content[:2000], markup=False, highlight=False)
                 console.print(
                     f"\n[dim]... ({fulltext.char_count - 2000:,} more chars, use -o to save full content)[/dim]"
                 )
             else:
-                console.print(fulltext.content)
+                console.print(fulltext.content, markup=False, highlight=False)
 
     return _run()
 
 
 @source.command("guide")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
 def source_guide(ctx, source_id, notebook_id, json_output, client_auth):
@@ -701,18 +1261,26 @@ def source_guide(ctx, source_id, notebook_id, json_output, client_auth):
 
     \b
     Examples:
-      source guide abc123                    # Get guide for source
-      source guide abc123 --json             # Output as JSON
+      notebooklm source guide abc123                    # Get guide for source
+      notebooklm source guide abc123 --json             # Output as JSON
     """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
 
-            with console.status("Generating source guide..."):
-                guide = await client.sources.get_guide(nb_id_resolved, resolved_id)
+            async def _fetch_guide():
+                return await client.sources.get_guide(nb_id_resolved, resolved_id)
+
+            if json_output:
+                guide = await _fetch_guide()
+            else:
+                with console.status("Generating source guide..."):
+                    guide = await _fetch_guide()
 
             if json_output:
                 data = {
@@ -744,33 +1312,53 @@ def source_guide(ctx, source_id, notebook_id, json_output, client_auth):
 
 @source.command("stale")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
+@notebook_option
+@json_option
 @with_client
-def source_stale(ctx, source_id, notebook_id, client_auth):
+def source_stale(ctx, source_id, notebook_id, json_output, client_auth):
     """Check if a URL/Drive source needs refresh.
 
     Returns exit code 0 if stale (needs refresh), 1 if fresh.
     This enables shell scripting: if notebooklm source stale ID; then refresh; fi
 
+    The inverted exit-code semantics are intentional and apply to ``--json``
+    too — see docs/cli-exit-codes.md. Branch on the JSON ``stale`` field
+    when the predicate-style exit code is awkward.
+
     SOURCE_ID can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
 
     \b
     Examples:
-      source stale abc123              # Check if stale
+      notebooklm source stale abc123              # Check if stale
+      notebooklm source stale abc123 --json       # Same exit codes; JSON body
     """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
             is_fresh = await client.sources.check_freshness(nb_id_resolved, resolved_id)
+            stale = not is_fresh
+
+            if json_output:
+                # PRESERVE INVERTED EXIT-CODE SEMANTICS: ``source stale`` is the
+                # only command that exits 0 on a "true predicate" and 1 on a
+                # "false predicate". The JSON body carries the boolean
+                # explicitly so callers who would prefer to branch on a field
+                # rather than the exit code can do so.
+                json_output_response(
+                    {
+                        "source_id": resolved_id,
+                        "notebook_id": nb_id_resolved,
+                        "stale": stale,
+                        "fresh": is_fresh,
+                    }
+                )
+                # Exit codes remain inverted by design — see docs/cli-exit-codes.md.
+                raise SystemExit(0 if stale else 1)
 
             if is_fresh:
                 console.print("[green]✓ Source is fresh[/green]")
@@ -785,22 +1373,11 @@ def source_stale(ctx, source_id, notebook_id, client_auth):
 
 @source.command("wait")
 @click.argument("source_id")
-@click.option(
-    "-n",
-    "--notebook",
-    "notebook_id",
-    default=None,
-    help="Notebook ID (uses current if not set)",
-)
-@click.option(
-    "--timeout",
-    default=120,
-    type=int,
-    help="Maximum seconds to wait (default: 120)",
-)
+@notebook_option
+@wait_polling_options(default_timeout=120, default_interval=1)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
-def source_wait(ctx, source_id, notebook_id, timeout, json_output, client_auth):
+def source_wait(ctx, source_id, notebook_id, timeout, interval, json_output, client_auth):
     """Wait for a source to finish processing.
 
     After adding a source, it needs to be processed before it can be used
@@ -817,9 +1394,10 @@ def source_wait(ctx, source_id, notebook_id, timeout, json_output, client_auth):
 
     \b
     Examples:
-      source wait abc123                    # Wait for source to be ready
-      source wait abc123 --timeout 300      # Wait up to 5 minutes
-      source wait abc123 --json             # Output status as JSON
+      notebooklm source wait abc123                          # Wait for source to be ready
+      notebooklm source wait abc123 --timeout 300            # Wait up to 5 minutes
+      notebooklm source wait abc123 --interval 5             # Poll every 5 seconds
+      notebooklm source wait abc123 --json                   # Output status as JSON
 
     \b
     Subagent pattern for long-running operations:
@@ -833,18 +1411,35 @@ def source_wait(ctx, source_id, notebook_id, timeout, json_output, client_auth):
 
     async def _run():
         async with NotebookLMClient(client_auth) as client:
-            nb_id_resolved = await resolve_notebook_id(client, nb_id)
-            resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
-
-            if not json_output:
-                console.print(f"[dim]Waiting for source {resolved_id}...[/dim]")
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            resolved_id = await resolve_source_id(
+                client, nb_id_resolved, source_id, json_output=json_output
+            )
 
             try:
-                source = await client.sources.wait_until_ready(
-                    nb_id_resolved,
-                    resolved_id,
-                    timeout=float(timeout),
-                )
+                # Wrap the blocking poll in a transient spinner so interactive
+                # users see progress feedback during the wait (P5.T2 / I7).
+                # Replaces the prior static "[dim]Waiting for source ...[/dim]"
+                # print — the spinner conveys the same information AND a live
+                # elapsed-seconds counter, then disappears so the final
+                # ready / failure / timeout line stands alone. No-op under
+                # --json so stdout stays pure JSON.
+                async with _status_with_elapsed(
+                    f"Waiting for source {resolved_id} to finish processing...",
+                    json_output=json_output,
+                    # Parallel hint for ``source wait`` (M2 / P5.T3): there is
+                    # no separate ``source poll`` command, so the resume IS
+                    # re-running the same wait. Keeps the ``Cancelled. Resume
+                    # with: ...`` phrasing consistent across the three
+                    # long-running paths.
+                    resume_hint=f"notebooklm source wait {resolved_id}",
+                ):
+                    source = await client.sources.wait_until_ready(
+                        nb_id_resolved,
+                        resolved_id,
+                        timeout=float(timeout),
+                        initial_interval=float(interval),
+                    )
 
                 if json_output:
                     data = {
@@ -898,5 +1493,138 @@ def source_wait(ctx, source_id, notebook_id, timeout, json_output, client_auth):
                     console.print(f"[yellow]⚠ Timeout waiting for source:[/yellow] {e.source_id}")
                     console.print(f"[dim]Last status: {e.last_status}[/dim]")
                 raise SystemExit(2) from None
+
+    return _run()
+
+
+@source.command("clean")
+@notebook_option
+@click.option(
+    "--dry-run", is_flag=True, help="Show what would be deleted without actually deleting"
+)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@json_option
+@with_client
+def source_clean(ctx, notebook_id, dry_run, yes, json_output, client_auth):
+    """Automatically remove duplicate, error, and access-blocked sources."""
+    nb_id = require_notebook(notebook_id)
+
+    async def _run():
+        async with NotebookLMClient(client_auth) as client:
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            if json_output:
+                sources = await client.sources.list(nb_id_resolved)
+            else:
+                with console.status("Fetching sources for cleanup..."):
+                    sources = await client.sources.list(nb_id_resolved)
+
+            candidates = _classify_junk_sources(sources)
+
+            def _candidates_payload() -> list[dict]:
+                return [
+                    {"id": sid, "title": title, "status": status, "reason": reason}
+                    for sid, title, status, reason in candidates
+                ]
+
+            if not candidates:
+                if json_output:
+                    json_output_response(
+                        {
+                            "action": "clean",
+                            "notebook_id": nb_id_resolved,
+                            "status": "already_clean",
+                            "candidates": [],
+                            "deleted_count": 0,
+                            "failure_count": 0,
+                        }
+                    )
+                    return
+                console.print("[green]Notebook is already clean. No junk sources found.[/green]")
+                return
+
+            if not json_output:
+                _print_clean_candidates(candidates)
+
+            if dry_run:
+                if json_output:
+                    json_output_response(
+                        {
+                            "action": "clean",
+                            "notebook_id": nb_id_resolved,
+                            "status": "dry_run",
+                            "candidates": _candidates_payload(),
+                            "candidate_count": len(candidates),
+                            "deleted_count": 0,
+                            "failure_count": 0,
+                        }
+                    )
+                    return
+                console.print(
+                    f"[yellow]Dry run: would delete {len(candidates)} source(s).[/yellow]"
+                )
+                return
+
+            if not yes and not click.confirm(f"Delete {len(candidates)} source(s)?"):
+                if json_output:
+                    json_output_response(
+                        {
+                            "action": "clean",
+                            "notebook_id": nb_id_resolved,
+                            "status": "cancelled",
+                            "candidates": _candidates_payload(),
+                            "candidate_count": len(candidates),
+                            "deleted_count": 0,
+                            "failure_count": 0,
+                        }
+                    )
+                return
+
+            if not json_output:
+                console.print(
+                    f"[dim]Cleaning {len(candidates)} source(s) (in chunks of 10)...[/dim]"
+                )
+
+            delete_list = [c[0] for c in candidates]
+            chunk_size = 10
+            deleted = 0
+            failures: list[tuple[str, str]] = []
+            for i in range(0, len(delete_list), chunk_size):
+                chunk = delete_list[i : i + chunk_size]
+                delete_tasks = [client.sources.delete(nb_id_resolved, sid) for sid in chunk]
+                results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+                for sid, r in zip(chunk, results, strict=True):
+                    if isinstance(r, Exception):
+                        failures.append((sid, str(r)))
+                    else:
+                        deleted += 1
+                if i + chunk_size < len(delete_list):
+                    await asyncio.sleep(0.5)
+
+            if json_output:
+                json_output_response(
+                    {
+                        "action": "clean",
+                        "notebook_id": nb_id_resolved,
+                        "status": "completed",
+                        "candidates": _candidates_payload(),
+                        "candidate_count": len(candidates),
+                        "deleted_count": deleted,
+                        "failure_count": len(failures),
+                        "failures": [{"id": sid, "error": err} for sid, err in failures],
+                    }
+                )
+                return
+
+            if failures:
+                console.print(
+                    f"[yellow]Cleaned {deleted} source(s). "
+                    f"{len(failures)} deletion(s) failed.[/yellow]"
+                )
+                for sid, err in failures[:5]:
+                    console.print(f"  [red]{sid}:[/red] {err}")
+                if len(failures) > 5:
+                    console.print(f"  [dim]...and {len(failures) - 5} more[/dim]")
+            else:
+                console.print(f"[green]Successfully cleaned {deleted} source(s).[/green]")
 
     return _run()

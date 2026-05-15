@@ -35,76 +35,252 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+import warnings
 import weakref
 from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, NamedTuple, TypeAlias
+from urllib.parse import urlencode
 
 import httpx
+from filelock import FileLock
 
+from ._atomic_io import atomic_update_json, atomic_write_json
+from ._env import get_base_url
 from ._url_utils import contains_google_auth_redirect, is_google_auth_redirect
+from .exceptions import AuthExtractionError
 from .paths import get_storage_path, resolve_profile
 
 logger = logging.getLogger(__name__)
 
-CookieKey: TypeAlias = tuple[str, str]
+CookieKey: TypeAlias = tuple[str, str, str]
 DomainCookieMap: TypeAlias = dict[CookieKey, str]
 FlatCookieMap: TypeAlias = dict[str, str]
-CookieInput: TypeAlias = DomainCookieMap | FlatCookieMap
+# ``CookieInput`` also accepts the legacy ``(name, domain) -> value`` shape that
+# pre-#369 callers constructed by hand; :func:`normalize_cookie_map` widens
+# those entries to ``(name, domain, "/")`` so the rest of the pipeline sees a
+# uniform path-aware shape.
+LegacyDomainCookieMap: TypeAlias = dict[tuple[str, str], str]
+CookieInput: TypeAlias = DomainCookieMap | LegacyDomainCookieMap | FlatCookieMap
 
-# Minimum required cookies (must have at least SID for basic auth)
-MINIMUM_REQUIRED_COOKIES = {"SID"}
 
-# Cookie domains to extract from storage state.
+class CookieSnapshotKey(NamedTuple):
+    """Path-aware cookie identity used by the snapshot/delta save machinery.
+
+    RFC 6265 treats ``path`` as part of cookie identity: two cookies with the
+    same ``(name, domain)`` but different paths are distinct entries. The
+    snapshot/delta path widens the legacy ``(name, domain)`` key (still used
+    elsewhere for back-compat — see ``CookieKey``) to ``(name, domain, path)``
+    so that path-scoped cookies (e.g. ``OSID`` on a per-product path) survive
+    a load → save round trip and so that a sibling-process write to a
+    different-path variant of the same name is not silently overwritten.
+    """
+
+    name: str
+    domain: str
+    path: str
+
+
+class CookieSnapshotValue(NamedTuple):
+    """Snapshot value tuple: ``(value, expires, secure, http_only)``.
+
+    Widened from a bare ``str`` so that a ``Set-Cookie`` which keeps the same
+    value but renews ``expires`` (or flips ``secure`` / ``httpOnly``) still
+    registers as a delta. The legacy save path compared ``expires`` directly
+    and would write the new expiry through; the snapshot path previously
+    keyed on value alone and silently dropped attribute-only refreshes.
+    """
+
+    value: str
+    expires: int | None
+    secure: bool
+    http_only: bool
+
+
+CookieSnapshot: TypeAlias = dict[CookieSnapshotKey, CookieSnapshotValue]
+
+
+@dataclass(frozen=True)
+class CookieSaveResult:
+    """Detailed result for callers that need to maintain a save baseline."""
+
+    ok: bool
+    cas_rejected_keys: frozenset[CookieSnapshotKey] = frozenset()
+
+
+# Tier 1: cookies whose absence Google rejects deterministically.
 #
-# Includes:
-#   - notebooklm.google.com (the API host)
-#   - .google.com / accounts.google.com (auth + token refresh)
-#   - .googleusercontent.com (authenticated media downloads)
-#   - sibling Google products (YouTube, Drive, Docs, myaccount, mail) so future
-#     auth/rotation flows that traverse those domains have cookies available.
-#     See issue #360 for the rationale; these are not load-bearing in any
-#     current code path but make the allowlist symmetric with what a logged-in
-#     browser session actually carries.
+# - ``SID``: only individually-required cookie (singleton ablation).
+# - ``__Secure-1PSIDTS``: directly accepted by Google's homepage check, OR
+#   recoverable via the RotateCookies POST when other auth cookies are intact.
+#   When neither path is viable the homepage GET 302s to login.
 #
-# This set is also fed verbatim to ``rookiepy.load(domains=...)`` by
-# ``_login_with_browser_cookies``, so adding a domain here automatically
-# extends what we ask the browser for at login time.
-ALLOWED_COOKIE_DOMAINS = {
-    ".google.com",
-    "google.com",  # Host-only Domain=google.com cookies (rare but possible)
-    # Playwright storage_state may preserve the leading dot for NotebookLM cookies.
-    ".notebooklm.google.com",
-    "notebooklm.google.com",
-    ".googleusercontent.com",
-    "accounts.google.com",  # Required for token refresh redirects
-    ".accounts.google.com",  # http.cookiejar may normalize Domain=accounts.google.com
-    # Sibling Google products — auth/rotation flows may traverse these.
-    # Both dotted and non-dotted variants are listed so that http.cookiejar
-    # normalization (which can add a leading dot) doesn't drop a cookie at the
-    # next extraction; same defensive pattern as accounts.google.com above.
-    ".youtube.com",
-    "youtube.com",
-    "accounts.youtube.com",
-    ".accounts.youtube.com",
-    "drive.google.com",
-    ".drive.google.com",
-    "docs.google.com",
-    ".docs.google.com",
-    "myaccount.google.com",
-    ".myaccount.google.com",
-    # Optional — not load-bearing in any current flow, but kept for symmetry
-    # with what a logged-in browser session actually holds.
-    "mail.google.com",
-    ".mail.google.com",
+# See ``docs/auth-keepalive.md`` §3.5 for the ablation methodology and the full
+# 16-pair failure table backing this set.
+MINIMUM_REQUIRED_COOKIES = {"SID", "__Secure-1PSIDTS"}
+
+
+_EXTRACTION_HINT = (
+    "This typically means --browser-cookies extraction was incomplete "
+    "(Chrome 127+ App-Bound Encryption can cause silent partial reads). "
+    "Run 'notebooklm login' to re-authenticate."
+)
+
+# Tier 2 fires per cookie-load; a single CLI run can hit it 2-3 times across
+# the four loader entry points. One warning per process is enough signal.
+_SECONDARY_BINDING_WARNED = False
+
+
+def _has_valid_secondary_binding(cookie_names: set[str]) -> bool:
+    """Tier 2 acceptance check (see ``MINIMUM_REQUIRED_COOKIES``).
+
+    Pair-wise ablation against a live Google session reveals that the
+    NotebookLM homepage GET requires *at least one* of two redundant
+    secondary-binding paths in addition to Tier 1:
+
+    - ``OSID`` (recent-sign-in binding), OR
+    - both ``APISID`` AND ``SAPISID`` (legacy XSSI binding pair).
+
+    Without either, Google 302s to ``accounts.google.com/v3/signin`` even when
+    ``SID`` and ``__Secure-1PSIDTS`` are present and otherwise valid.
+    """
+    if "OSID" in cookie_names:
+        return True
+    return {"APISID", "SAPISID"} <= cookie_names
+
+
+def _validate_required_cookies(
+    cookie_names: set[str],
+    *,
+    context: str = "",
+    extra_diagnostics: list[str] | None = None,
+) -> None:
+    """Enforce the Tier 1 cookie-set rule (raise) and warn on Tier 2 violation.
+
+    Hybrid rollout: Tier 1 (``MINIMUM_REQUIRED_COOKIES``) is a hard requirement
+    because its ablation evidence is unambiguous — Google rejects deterministically
+    and there is no recovery path inside the library. Tier 2 (secondary binding,
+    see ``_has_valid_secondary_binding``) is logged as a warning so partial
+    extractions surface in user logs without breaking edge-case auth flows we
+    haven't ablated yet (e.g. Workspace SSO). After one release of telemetry
+    this can be promoted to a hard raise.
+
+    Args:
+        cookie_names: Names of cookies present in the loaded set (any domain).
+        context: Optional suffix for the Tier 1 error message
+            (e.g. ``" for downloads"``).
+        extra_diagnostics: Optional extra lines inserted into the Tier 1 error
+            (e.g. observed cookies, source domains) for friendlier diagnosis.
+    """
+    missing = MINIMUM_REQUIRED_COOKIES - cookie_names
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        parts = [f"Missing required cookies{context}: {missing_names}"]
+        if extra_diagnostics:
+            parts.extend(extra_diagnostics)
+        parts.append(_EXTRACTION_HINT)
+        raise ValueError("\n".join(parts))
+
+    if not _has_valid_secondary_binding(cookie_names):
+        global _SECONDARY_BINDING_WARNED
+        if not _SECONDARY_BINDING_WARNED:
+            _SECONDARY_BINDING_WARNED = True
+            logger.warning(
+                "Cookie set lacks a secondary binding (need OSID, or both APISID "
+                "and SAPISID). Google may reject auth on the next call. %s",
+                _EXTRACTION_HINT,
+            )
+
+
+# Cookie domains we extract / accept by default.
+#
+# Empirical justification (T5.G): traced cassettes
+# (``tests/cassettes/*.yaml``) and the live auth-refresh path. Only the
+# following domains are actually exercised during login + token refresh +
+# source-add + chat-ask flows:
+#   - ``notebooklm.google.com`` (the API host — all CLI RPCs land here)
+#   - ``.google.com`` (carries ``SID``/``HSID``/``SSID``/etc.)
+#   - ``accounts.google.com`` (token refresh + ``RotateCookies`` endpoint at
+#     :data:`KEEPALIVE_ROTATE_URL`)
+#   - ``.googleusercontent.com`` (authenticated media downloads — audio /
+#     infographic / slide assets)
+#   - ``drive.google.com`` (Drive-source ingest follows redirects through
+#     here; kept in REQUIRED for source-add safety)
+#
+# YouTube / Docs / Mail / myaccount cookies do NOT appear in any traced
+# flow. They are now :data:`OPTIONAL_COOKIE_DOMAINS` — opted in via
+# ``notebooklm login --include-domains=...``. This narrows the blast
+# radius if ``storage_state.json`` is ever leaked (synthesis K15).
+#
+# REQUIRED is also fed verbatim to ``rookiepy.load(domains=...)`` by
+# ``_login_with_browser_cookies`` (via
+# :func:`notebooklm.cli.session._build_google_cookie_domains`); adding a
+# domain here automatically extends what we ask the browser for at login.
+# This is the single load-bearing T5.G control: blast-radius reduction
+# is enforced at extraction time (what rookiepy returns), not at the
+# runtime gate, which stays permissive over the REQUIRED ∪ OPTIONAL
+# union so that ``--include-domains=...`` cookies survive downstream
+# filters (see :func:`_is_allowed_cookie_domain`).
+REQUIRED_COOKIE_DOMAINS: frozenset[str] = frozenset(
+    {
+        ".google.com",
+        "google.com",  # Host-only Domain=google.com cookies (rare but possible)
+        # Playwright storage_state may preserve the leading dot for NotebookLM cookies.
+        ".notebooklm.google.com",
+        "notebooklm.google.com",
+        ".notebooklm.cloud.google.com",
+        "notebooklm.cloud.google.com",
+        ".googleusercontent.com",
+        "accounts.google.com",  # Required for token refresh + RotateCookies
+        ".accounts.google.com",  # http.cookiejar may normalize Domain=accounts.google.com
+        # Drive-source ingest follows redirects through drive.google.com.
+        # Both dotted and non-dotted variants are listed so that
+        # http.cookiejar normalization (which can add a leading dot) doesn't
+        # drop a cookie at the next extraction; same defensive pattern as
+        # accounts.google.com above.
+        "drive.google.com",
+        ".drive.google.com",
+    }
+)
+
+# Sibling Google product domains — NOT exercised by any current code path
+# but historically extracted "for symmetry with a logged-in browser session"
+# (issue #360). Now opt-in via ``--include-domains=...`` to reduce
+# storage_state.json blast radius. The keys here (``youtube``, ``docs``,
+# ``myaccount``, ``mail``) are also the labels accepted by ``--include-domains``.
+#
+# Both dotted and non-dotted variants are listed so that http.cookiejar
+# normalization (which can add a leading dot) doesn't drop a cookie at the
+# next extraction.
+OPTIONAL_COOKIE_DOMAINS_BY_LABEL: dict[str, frozenset[str]] = {
+    "youtube": frozenset(
+        {
+            ".youtube.com",
+            "youtube.com",
+            "accounts.youtube.com",
+            ".accounts.youtube.com",
+        }
+    ),
+    "docs": frozenset({"docs.google.com", ".docs.google.com"}),
+    "myaccount": frozenset({"myaccount.google.com", ".myaccount.google.com"}),
+    "mail": frozenset({"mail.google.com", ".mail.google.com"}),
 }
+
+OPTIONAL_COOKIE_DOMAINS: frozenset[str] = frozenset().union(
+    *OPTIONAL_COOKIE_DOMAINS_BY_LABEL.values()
+)
+
+# Backward-compatible union — preserves the old constant name so external
+# imports keep working. Internal code should prefer ``REQUIRED_*`` /
+# ``OPTIONAL_*`` so the security tier is explicit at the call site.
+ALLOWED_COOKIE_DOMAINS: frozenset[str] = REQUIRED_COOKIE_DOMAINS | OPTIONAL_COOKIE_DOMAINS
 
 # Regional Google ccTLDs where Google may set auth cookies
 # Users in these regions may have SID cookies on regional domains instead of .google.com
@@ -199,13 +375,28 @@ class AuthTokens:
     """Authentication tokens for NotebookLM API.
 
     Attributes:
-        cookies: Dict of required Google auth cookies keyed by (name, domain)
+        cookies: Required Google auth cookies keyed by ``(name, domain, path)``
+            per RFC 6265 §5.3 (issue #369). Legacy 2-tuple ``(name, domain)``
+            and flat ``name -> value`` shapes are still accepted on
+            construction and widened to the path-aware shape by
+            :func:`normalize_cookie_map` during ``__post_init__``.
         csrf_token: CSRF token (SNlM0e) extracted from page
         session_id: Session ID (FdrFJe) extracted from page
         storage_path: Path to the storage_state.json file, if file-based auth was used
         cookie_jar: Domain-preserving httpx.Cookies jar. Preferred over flat cookies dict
             for HTTP operations as it retains original cookie domains (e.g.,
             .googleusercontent.com vs .google.com).
+        authuser: Google ``authuser`` index this profile authenticates as.
+            ``0`` (the default account) is used when no account metadata is
+            present in ``context.json`` — matching pre-multi-account behavior.
+        account_email: Stable Google account identity for routing. When set,
+            NotebookLM requests use it as the ``authuser`` value instead of the
+            integer index, because Google account indices can change when other
+            accounts sign out.
+        cookie_snapshot: Internal save baseline used when a pre-client token
+            fetch mutates cookies but persistence fails or CAS-rejects. This
+            lets the eventual ClientCore retry the unpersisted delta instead
+            of snapshotting the already-mutated jar as clean state.
     """
 
     cookies: DomainCookieMap
@@ -213,6 +404,9 @@ class AuthTokens:
     session_id: str
     storage_path: Path | None = None
     cookie_jar: httpx.Cookies | None = None
+    authuser: int = 0
+    cookie_snapshot: CookieSnapshot | None = None
+    account_email: str | None = None
 
     def __post_init__(self) -> None:
         """Normalize legacy flat cookie mappings into domain-keyed mappings."""
@@ -230,13 +424,18 @@ class AuthTokens:
         return "; ".join(f"{k}={v}" for k, v in self.flat_cookies.items())
 
     @property
+    def account_route(self) -> str:
+        """Return the value to send in NotebookLM ``authuser`` routing fields."""
+        return format_authuser_value(self.authuser, self.account_email)
+
+    @property
     def flat_cookies(self) -> FlatCookieMap:
         """Return a legacy name→value cookie mapping.
 
-        When the same cookie name exists on multiple domains, the base
-        ``.google.com`` value wins for compatibility with the previous flat
-        representation. Domain-aware HTTP operations should use ``cookie_jar``
-        or ``cookies`` directly instead.
+        Duplicate-name resolution follows :func:`_auth_domain_priority` so the
+        result matches what :func:`load_auth_from_storage` produces for the same
+        storage state (see issue #375). Domain-aware HTTP operations should use
+        ``cookie_jar`` or ``cookies`` directly instead.
         """
         return flatten_cookie_map(self.cookies)
 
@@ -273,16 +472,55 @@ class AuthTokens:
         if path is None and (profile is not None or "NOTEBOOKLM_AUTH_JSON" not in os.environ):
             path = get_storage_path(profile=profile)
 
+        authuser = get_authuser_for_storage(path)
+        account_email = get_account_email_for_storage(path)
         # Build the cookie jar via the lossless loader so path/secure/httpOnly
         # survive into the live jar. The earlier
         # extract_cookies_with_domains -> build_cookie_jar pipeline only carried
         # (name, domain) -> value and dropped the same attributes the load
         # paths in #365 fixed.
         jar = build_httpx_cookies_from_storage(path)
-        csrf_token, session_id, _ = await _fetch_tokens_with_refresh(jar, path, profile)
+        # Snapshot before token fetch can rotate cookies; the snapshot/delta
+        # merge in save_cookies_to_storage will then write only what this
+        # process actually rotated, preserving sibling-process state.
+        snapshot = snapshot_cookie_jar(jar)
+        route_kwargs: dict[str, Any] = {"authuser": authuser}
+        if account_email is not None:
+            route_kwargs["account_email"] = account_email
+        csrf_token, session_id, refreshed, post_refresh_snapshot = await _fetch_tokens_with_refresh(
+            jar, path, profile, **route_kwargs
+        )
 
-        # Persist any refreshed cookies from the token fetch
-        save_cookies_to_storage(jar, path)
+        # If NOTEBOOKLM_REFRESH_CMD ran, ``_fetch_tokens_with_refresh`` captured
+        # a snapshot immediately after the jar was wholesale-replaced from
+        # disk — before the retry fetch could mutate it with redirect
+        # Set-Cookies. Use that snapshot so the retry's rotations land on
+        # disk as deltas instead of being silently absorbed into the baseline.
+        if refreshed and post_refresh_snapshot is not None:
+            snapshot = post_refresh_snapshot
+
+        # Persist any refreshed cookies from the token fetch. If the save
+        # fails, carry the old baseline into the returned AuthTokens so a
+        # later ClientCore can retry the delta instead of treating the mutated
+        # jar as clean state.
+        post_save_snapshot = snapshot_cookie_jar(jar)
+        save_result = save_cookies_to_storage(
+            jar,
+            path,
+            original_snapshot=snapshot,
+            return_result=True,
+        )
+        if isinstance(save_result, CookieSaveResult):
+            if save_result.ok:
+                cookie_snapshot = None
+            elif save_result.cas_rejected_keys:
+                cookie_snapshot = advance_cookie_snapshot_after_save(
+                    snapshot, post_save_snapshot, save_result.cas_rejected_keys
+                )
+            else:
+                cookie_snapshot = snapshot
+        else:
+            cookie_snapshot = None if save_result else snapshot
         cookies = _cookie_map_from_jar(jar)
 
         return cls(
@@ -291,33 +529,79 @@ class AuthTokens:
             session_id=session_id,
             storage_path=path,
             cookie_jar=jar,
+            authuser=authuser,
+            cookie_snapshot=cookie_snapshot,
+            account_email=account_email,
         )
 
 
 def normalize_cookie_map(cookies: CookieInput | None) -> DomainCookieMap:
-    """Normalize flat or domain-aware cookie maps into (name, domain) keys."""
+    """Normalize flat or domain-aware cookie maps into ``(name, domain, path)`` keys.
+
+    Accepts three input shapes for back-compat:
+
+    - Path-aware ``(name, domain, path) -> value`` (the canonical post-#369 shape).
+    - Legacy ``(name, domain) -> value`` — kept so external callers that built a
+      ``DomainCookieMap`` against the pre-#369 type alias keep working. The
+      missing path component defaults to ``/``.
+    - Flat ``name -> value`` — assigned to ``.google.com`` / ``/`` for backward
+      compatibility with very old callers.
+    """
     normalized: DomainCookieMap = {}
     if not cookies:
         return normalized
 
     for key, value in cookies.items():
         if isinstance(key, tuple):
-            name, domain = key
+            if len(key) == 3:
+                name, domain, path = key
+            elif len(key) == 2:
+                name, domain = key
+                path = "/"
+            else:
+                # Malformed tuple keys would silently disappear into a
+                # generic "missing required cookies" failure further down.
+                # Log loudly so the caller can fix the input.
+                logger.warning(
+                    "Dropping malformed cookie key %r (expected (name, domain[, path]))",
+                    key,
+                )
+                continue
         else:
-            name, domain = key, ".google.com"
+            name, domain, path = key, ".google.com", "/"
         if name:
-            normalized[(name, domain or ".google.com")] = value
+            normalized[(name, domain or ".google.com", path or "/")] = value
     return normalized
 
 
 def flatten_cookie_map(cookies: CookieInput | None) -> FlatCookieMap:
-    """Flatten domain-aware cookies for legacy raw Cookie header callers."""
-    flat: FlatCookieMap = {}
+    """Flatten domain-aware cookies for legacy raw Cookie header callers.
 
-    for (name, domain), value in normalize_cookie_map(cookies).items():
-        is_base_domain = domain == ".google.com"
-        if name not in flat or is_base_domain:
+    Duplicate-name resolution mirrors :func:`extract_cookies_from_storage`:
+    domains are ranked by :func:`_auth_domain_priority` (``.google.com`` >
+    ``.notebooklm.google.com`` > ``notebooklm.google.com`` > regional > other).
+    Named tiers are strictly distinct, so the cross-tier case from #375 (e.g.
+    ``OSID`` on ``myaccount.google.com`` (tier 0) vs ``notebooklm.google.com``
+    (tier 2)) resolves the same way regardless of input order. Within a single
+    tier, first occurrence in iteration order wins — matching
+    :func:`extract_cookies_from_storage`'s within-tier semantics.
+
+    Path is intentionally collapsed here (#369): the legacy ``Cookie:`` header
+    that consumes the flat shape carries only ``name=value`` pairs, with no slot
+    for path. When two cookies share ``(name, domain)`` at different paths, the
+    first one observed during iteration of the normalized map wins. This is
+    deterministic but **not** RFC 6265 §5.4 path-specificity ordering — callers
+    that need accurate path-aware behavior must use ``cookie_jar`` or the
+    ``DomainCookieMap`` directly.
+    """
+    flat: FlatCookieMap = {}
+    priorities: dict[str, int] = {}
+
+    for (name, domain, _path), value in normalize_cookie_map(cookies).items():
+        priority = _auth_domain_priority(domain)
+        if name not in flat or priority > priorities[name]:
             flat[name] = value
+            priorities[name] = priority
 
     return flat
 
@@ -363,8 +647,9 @@ def _is_allowed_auth_domain(domain: str) -> bool:
     and download-cookie loading (and the persistence path that filters which
     cookies get saved back) share a single allowlist policy:
 
-    1. Exact match against :data:`ALLOWED_COOKIE_DOMAINS` (covers the API host,
-       sibling Google products like YouTube/Drive/Docs/myaccount, and the
+    1. Exact match against :data:`REQUIRED_COOKIE_DOMAINS` (covers the API
+       host, ``.google.com`` / ``accounts.google.com`` /
+       ``.googleusercontent.com`` / ``drive.google.com``, and the
        leading-dot variants ``http.cookiejar`` may normalize to).
     2. Regional Google ccTLDs (``.google.com.sg``, ``.google.co.uk``,
        ``.google.de``, …) where SID cookies may be set for users in those
@@ -376,7 +661,12 @@ def _is_allowed_auth_domain(domain: str) -> bool:
     The previous strict / broad split (#334 / fea8315) created an asymmetry
     where ``save_cookies_to_storage`` would persist cookies that the next
     extraction would silently drop. Issue #360 collapsed both filters into
-    this single policy.
+    this single policy. T5.G narrows the *extraction* surface (rookiepy
+    only requests :data:`REQUIRED_COOKIE_DOMAINS` by default, so YouTube
+    cookies are never written to ``storage_state.json`` unless the user
+    opts in via ``--include-domains=youtube``); the runtime gate stays
+    permissive over the full :data:`ALLOWED_COOKIE_DOMAINS` union so that
+    opted-in cookies survive the downstream filters.
 
     Args:
         domain: Cookie domain to check (e.g., '.google.com', '.google.com.sg')
@@ -398,6 +688,10 @@ def _auth_domain_priority(domain: str) -> int:
     if domain == ".notebooklm.google.com":
         return 3
     if domain == "notebooklm.google.com":
+        return 2
+    if domain == ".notebooklm.cloud.google.com":
+        return 3
+    if domain == "notebooklm.cloud.google.com":
         return 2
     if _is_google_domain(domain):
         return 1
@@ -539,22 +833,99 @@ def extract_cookies_from_storage(storage_state: dict[str, Any]) -> dict[str, str
         if "SID" in cookie_domains:
             logger.debug("SID cookie from domain: %s", cookie_domains["SID"])
 
-    missing = MINIMUM_REQUIRED_COOKIES - set(cookies.keys())
-    if missing:
-        # Provide more helpful error message with diagnostic info
+    # Build diagnostic extras only on the failure path. The successful path is
+    # by far the common case; iterating the cookie list to compute found-names
+    # and Google domains every call would be wasted work.
+    cookie_names = set(cookies.keys())
+    extras: list[str] = []
+    if not MINIMUM_REQUIRED_COOKIES.issubset(cookie_names):
         all_domains = {c.get("domain", "") for c in storage_state.get("cookies", [])}
         google_domains = sorted(d for d in all_domains if "google" in d.lower())
         found_names = list(cookies.keys())[:5]
-
-        error_parts = [f"Missing required cookies: {missing}"]
         if found_names:
-            error_parts.append(f"Found cookies: {found_names}{'...' if len(cookies) > 5 else ''}")
+            extras.append(f"Found cookies: {found_names}{'...' if len(cookies) > 5 else ''}")
         if google_domains:
-            error_parts.append(f"Google domains in storage: {google_domains}")
-        error_parts.append("Run 'notebooklm login' to authenticate.")
-        raise ValueError("\n".join(error_parts))
+            extras.append(f"Google domains in storage: {google_domains}")
+    _validate_required_cookies(cookie_names, extra_diagnostics=extras)
 
     return cookies
+
+
+def _build_wiz_field_patterns(key: str) -> list[re.Pattern[str]]:
+    """Build the ordered list of regex patterns used to locate a Wiz field.
+
+    Patterns are tried in priority order: canonical double-quoted form first,
+    then single-quoted, then HTML-escaped. Each pattern captures the value
+    (which may be empty — empty tokens are legitimate, not a drift signal).
+
+    All three variants tolerate backslash-escaped delimiters inside the value
+    so JSON-style escapes like ``"key":"a\\"b"`` parse correctly. The inner
+    character class ``[^"\\\\]*(?:\\\\.[^"\\\\]*)*`` is the standard
+    "string with escapes" idiom: consume runs of non-quote/non-backslash
+    chars, optionally followed by an escape pair (``\\.``) and another run.
+
+    The HTML-escaped variant uses a tempered-dot lookahead so the capture
+    stops only at a literal ``&quot;`` terminator (not at any ``&`` — values
+    legitimately contain ``&amp;`` and similar entities).
+
+    Whitespace tolerance (``\\s*``) around the colon mirrors the original
+    ``extract_csrf_from_html`` regex so we don't regress.
+    """
+    escaped = re.escape(key)
+    return [
+        # 1. Canonical double-quoted: "key":"value"  (or  "key" : "value")
+        #    Captures escaped quotes: "key":"a\"b" -> a\"b
+        re.compile(rf'"{escaped}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"'),
+        # 2. Single-quoted variant: 'key':'value' with escaped-quote support.
+        re.compile(rf"'{escaped}'\s*:\s*'([^'\\]*(?:\\.[^'\\]*)*)'"),
+        # 3. HTML-escaped: &quot;key&quot;:&quot;value&quot;
+        #    Tempered dot so the value can contain other entities like &amp;.
+        re.compile(rf"&quot;{escaped}&quot;\s*:\s*&quot;((?:(?!&quot;).)*)&quot;"),
+    ]
+
+
+def extract_wiz_field(html: str, key: str, *, strict: bool = True) -> str | None:
+    """Extract a ``WIZ_global_data[key]`` value from a NotebookLM HTML response.
+
+    NotebookLM (and other Google products) embed a JavaScript object literal
+    named ``WIZ_global_data`` in the page chrome. Tokens like ``SNlM0e``
+    (CSRF) and ``FdrFJe`` (session ID) live inside that object. This helper
+    is the single place that knows how to parse the embedding so all callers
+    benefit from the same drift tolerance and diagnostics.
+
+    Tolerated input variants, tried in priority order:
+
+    1. Canonical double-quoted ``"key":"value"`` (typical raw HTML).
+    2. Single-quoted ``'key':'value'`` (rare, observed in some debug renders).
+    3. HTML-escaped ``&quot;key&quot;:&quot;value&quot;`` (when the script
+       block is rendered inside an attribute or escaped fragment).
+
+    Empty values are passed through verbatim: ``"SNlM0e":""`` returns the
+    empty string. Some Google endpoints legitimately emit empty tokens (e.g.
+    for unauthenticated probes) and the caller — not this helper — should
+    decide whether an empty value is acceptable.
+
+    Args:
+        html: The page HTML to search.
+        key: Field name to extract from ``WIZ_global_data``.
+        strict: When True (default) and no pattern matches, raise
+            :class:`AuthExtractionError` with a sanitized preview. When False,
+            return ``None`` on drift so callers can fall back gracefully.
+
+    Returns:
+        The extracted value (possibly empty), or ``None`` when ``strict=False``
+        and no pattern matched.
+
+    Raises:
+        AuthExtractionError: ``strict=True`` and the key was not found.
+    """
+    for pattern in _build_wiz_field_patterns(key):
+        match = pattern.search(html)
+        if match is not None:
+            return match.group(1)
+    if strict:
+        raise AuthExtractionError(key, html)
+    return None
 
 
 def extract_csrf_from_html(html: str, final_url: str = "") -> str:
@@ -572,21 +943,29 @@ def extract_csrf_from_html(html: str, final_url: str = "") -> str:
         CSRF token value (typically starts with "AF1_QpN-")
 
     Raises:
-        ValueError: If token pattern not found in HTML
+        ValueError: Preserved for backward compatibility — raised both when
+            redirected to a Google login page and when the token is missing
+            from a non-redirect response. Existing callers and tests rely on
+            the ``"CSRF token not found"`` / ``"Authentication expired"``
+            message substrings, so we intentionally keep the legacy type.
+            Internally we delegate to :func:`extract_wiz_field` so the regex
+            matrix (double-quoted / single-quoted / HTML-escaped) is shared.
     """
-    # Match "SNlM0e": "<token>" or "SNlM0e":"<token>" pattern
-    match = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
-    if not match:
-        # Check if we were redirected to login page
-        if is_google_auth_redirect(final_url) or contains_google_auth_redirect(html):
-            raise ValueError(
-                "Authentication expired or invalid. Run 'notebooklm login' to re-authenticate."
-            )
+    # Tolerant extraction via the unified helper — accepts canonical,
+    # single-quoted, and HTML-escaped variants of the WIZ_global_data field.
+    token = extract_wiz_field(html, "SNlM0e", strict=False)
+    if token is not None:
+        return token
+    # Drift path: differentiate "auth expired" from "shape changed" because
+    # the remediation differs (re-login vs file a bug).
+    if is_google_auth_redirect(final_url) or contains_google_auth_redirect(html):
         raise ValueError(
-            f"CSRF token not found in HTML. Final URL: {final_url}\n"
-            "This may indicate the page structure has changed."
+            "Authentication expired or invalid. Run 'notebooklm login' to re-authenticate."
         )
-    return match.group(1)
+    raise ValueError(
+        f"CSRF token not found in HTML. Final URL: {final_url}\n"
+        "This may indicate the page structure has changed."
+    )
 
 
 def extract_session_id_from_html(html: str, final_url: str = "") -> str:
@@ -604,20 +983,339 @@ def extract_session_id_from_html(html: str, final_url: str = "") -> str:
         Session ID value
 
     Raises:
-        ValueError: If session ID pattern not found in HTML
+        ValueError: Preserved for backward compatibility — raised both when
+            redirected to a Google login page and when the session ID is
+            missing from a non-redirect response. See
+            :func:`extract_csrf_from_html` for the rationale.
     """
-    # Match "FdrFJe": "<session_id>" or "FdrFJe":"<session_id>" pattern
-    match = re.search(r'"FdrFJe"\s*:\s*"([^"]+)"', html)
-    if not match:
-        if is_google_auth_redirect(final_url) or contains_google_auth_redirect(html):
-            raise ValueError(
-                "Authentication expired or invalid. Run 'notebooklm login' to re-authenticate."
-            )
+    sid = extract_wiz_field(html, "FdrFJe", strict=False)
+    if sid is not None:
+        return sid
+    if is_google_auth_redirect(final_url) or contains_google_auth_redirect(html):
         raise ValueError(
-            f"Session ID not found in HTML. Final URL: {final_url}\n"
-            "This may indicate the page structure has changed."
+            "Authentication expired or invalid. Run 'notebooklm login' to re-authenticate."
         )
-    return match.group(1)
+    raise ValueError(
+        f"Session ID not found in HTML. Final URL: {final_url}\n"
+        "This may indicate the page structure has changed."
+    )
+
+
+@dataclass(frozen=True)
+class Account:
+    """A Google account discovered via authuser=N probing.
+
+    Attributes:
+        authuser: The integer index used in ``?authuser=N`` URL parameters.
+            Index 0 is the default account; subsequent indices follow the
+            order Google reports for the browser session.
+        email: The account's email address as it appears in the NotebookLM
+            page's ``WIZ_global_data`` block.
+        is_default: True only for the account at ``authuser=0``.
+    """
+
+    authuser: int
+    email: str
+    is_default: bool
+
+
+# Hard cap on how many ``authuser`` indices to probe before giving up.
+# Google supports up to ~10 simultaneously signed-in accounts in a browser
+# session; ten covers every realistic case and bounds the worst-case probe.
+MAX_AUTHUSER_PROBE = 10
+
+# Local-parts of well-known non-user emails that NotebookLM may embed in page
+# chrome (footer links, support contacts) and must not be misread as the
+# active account. Combined with ``_NON_USER_EMAIL_DOMAINS`` so we only drop
+# the address when *both* match — otherwise legitimate Workspace users like
+# ``support@customer.com`` would be filtered out.
+_NON_USER_EMAIL_LOCALS = frozenset(
+    {
+        "abuse",
+        "feedback",
+        "info",
+        "mail-noreply",
+        "googlemail-noreply",
+        "no-reply",
+        "noreply",
+        "press",
+        "privacy",
+        "support",
+    }
+)
+_NON_USER_EMAIL_DOMAINS = frozenset({"google.com", "accounts.google.com", "gmail.com"})
+
+# Match a quoted email address, e.g. ``"alice@example.com"``. Mirrors how
+# emails appear in the page's WIZ_global_data JSON.
+_EMAIL_RE = re.compile(r'"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"')
+
+
+def extract_email_from_html(html: str) -> str | None:
+    """Extract the active user's email from a NotebookLM page response.
+
+    Returns the first plausible Google account email found in the HTML,
+    skipping addresses that look like Google's own contact endpoints
+    (e.g. ``support@google.com``, ``noreply@accounts.google.com``).
+
+    Args:
+        html: Page HTML from ``notebooklm.google.com/?authuser=N``.
+
+    Returns:
+        The account's email, or ``None`` if no plausible address was found
+        (typically because the response was a login redirect or the page
+        structure changed).
+    """
+    for match in _EMAIL_RE.finditer(html):
+        email = match.group(1)
+        local, _, domain = email.partition("@")
+        if local.lower() in _NON_USER_EMAIL_LOCALS and domain.lower() in _NON_USER_EMAIL_DOMAINS:
+            continue
+        return email
+    return None
+
+
+# Chromium-style User-Agent for ``enumerate_accounts``. Without a real-browser
+# UA, Google serves a stripped-down page that omits the WIZ_global_data block
+# (and therefore the active user's email), and ``extract_email_from_html``
+# returns None — looking like "no signed-in account". Empirically validated
+# against ``notebooklm.google.com/?authuser=N``.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+)
+
+
+async def _probe_authuser(client: httpx.AsyncClient, n: int) -> str | None:
+    """Probe one ``authuser`` index and return the active email or ``None``.
+
+    Returns ``None`` for auth-redirect or unparseable responses; lets the
+    caller decide whether that means "past the last account" or a real error.
+    HTTP transport errors propagate.
+
+    Only checks the *final* URL for an auth redirect. The page body is not
+    scanned because a healthy NotebookLM page legitimately contains many
+    ``accounts.google.com`` links (account chooser, manage-account menu)
+    that would fool ``contains_google_auth_redirect``.
+    """
+    response = await client.get(
+        f"{get_base_url()}/?{authuser_query(n)}",
+        headers={"User-Agent": _BROWSER_UA, "Accept": "text/html,*/*"},
+    )
+    if response.status_code != 200:
+        return None
+    if is_google_auth_redirect(str(response.url)):
+        return None
+    return extract_email_from_html(response.text)
+
+
+async def enumerate_accounts(
+    cookie_jar: httpx.Cookies, *, max_authuser: int = MAX_AUTHUSER_PROBE
+) -> list[Account]:
+    """Enumerate Google accounts visible to the given cookie jar.
+
+    Probes ``https://notebooklm.google.com/?authuser=N`` for ``N`` in
+    ``0..max_authuser`` and parses the active user's email from each response.
+
+    Stop condition: when the email at index ``N>0`` matches the email at
+    index 0, Google has silently fallen back to the default account, meaning
+    ``N`` is past the real count. Without this check the caller would record
+    duplicate phantom accounts; Google does not redirect to login in this
+    case.
+
+    Args:
+        cookie_jar: ``httpx.Cookies`` jar with auth cookies. Not mutated.
+        max_authuser: Hard cap on indices probed (default
+            :data:`MAX_AUTHUSER_PROBE`).
+
+    Returns:
+        Accounts ordered by ``authuser`` index. ``is_default`` is true for
+        index 0 only.
+
+    Raises:
+        ValueError: If ``authuser=0`` itself does not return a signed-in
+            account (cookies expired or invalid).
+        httpx.HTTPError: If the HTTP transport fails.
+    """
+    async with httpx.AsyncClient(
+        cookies=cookie_jar,
+        follow_redirects=True,
+        timeout=httpx.Timeout(10.0, read=60.0),
+    ) as client:
+        # The browser's on-disk cookie DB rotates ``__Secure-1PSIDTS`` every
+        # few minutes, but only when Chrome itself is actively running. A
+        # ``--browser-cookies`` extraction against an idle Chrome lands here
+        # with a stale SIDTS — the SID is fine, but ``notebooklm.google.com``
+        # responds with a redirect to ``accounts.google.com`` and we'd
+        # incorrectly conclude the user is signed out. Poke once to fetch
+        # fresh SIDTS via Set-Cookie before the probes start.
+        await _poke_session(client, None)
+        default_email = await _probe_authuser(client, 0)
+        if default_email is None:
+            raise ValueError(
+                "Authentication expired or invalid; "
+                "authuser=0 did not return a signed-in account. "
+                "Run 'notebooklm login' to re-authenticate."
+            )
+        accounts = [Account(authuser=0, email=default_email, is_default=True)]
+        for n in range(1, max_authuser + 1):
+            email = await _probe_authuser(client, n)
+            if email is None or email == default_email:
+                break
+            accounts.append(Account(authuser=n, email=email, is_default=False))
+        return accounts
+
+
+_ACCOUNT_CONTEXT_KEY = "account"
+
+
+def _account_context_path(storage_path: Path) -> Path:
+    """Return the context.json path that annotates ``storage_path``."""
+    return storage_path.with_name("context.json")
+
+
+def read_account_metadata(storage_path: Path | None) -> dict[str, Any]:
+    """Read profile account metadata from ``context.json``.
+
+    The ``account`` object records the Google ``authuser`` index used when
+    the profile was authenticated. Profiles from before this feature shipped
+    (and profiles for users with a single Google account) have no account
+    metadata and use ``authuser=0``.
+
+    Args:
+        storage_path: Path to ``storage_state.json``. The sibling
+            ``context.json`` stores account metadata. ``None`` means the
+            profile is loaded from ``NOTEBOOKLM_AUTH_JSON``.
+
+    Returns:
+        Parsed metadata dict, or ``{}`` if the file is missing, unreadable,
+        or malformed. Callers should treat a missing ``authuser`` key as 0.
+    """
+    if storage_path is None:
+        return {}
+    context_path = _account_context_path(storage_path)
+    if not context_path.exists():
+        return {}
+    try:
+        data = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug("account metadata read failed at %s: %s", context_path, e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    account = data.get(_ACCOUNT_CONTEXT_KEY)
+    return account if isinstance(account, dict) else {}
+
+
+def get_authuser_for_storage(storage_path: Path | None) -> int:
+    """Return the ``authuser`` index recorded for a profile, defaulting to 0.
+
+    Profiles without account metadata (legacy single-account installs and
+    fresh logins that never set an authuser) are treated as ``authuser=0``,
+    preserving existing behavior.
+
+    Returns:
+        Non-negative ``authuser`` index. Malformed values fall back to 0.
+    """
+    raw = read_account_metadata(storage_path).get("authuser")
+    if isinstance(raw, int) and raw >= 0:
+        return raw
+    return 0
+
+
+def get_account_email_for_storage(storage_path: Path | None) -> str | None:
+    """Return the persisted account email for stable routing, if available."""
+    raw = read_account_metadata(storage_path).get("email")
+    if isinstance(raw, str):
+        email = raw.strip()
+        if email:
+            return email
+    return None
+
+
+def format_authuser_value(authuser: int = 0, account_email: str | None = None) -> str:
+    """Return the explicit NotebookLM auth routing value.
+
+    Google accepts either an integer account index or the account email in the
+    ``authuser`` field. Email is stable across browser account reordering, so it
+    wins when available; otherwise callers retain the existing integer behavior.
+    """
+    if account_email:
+        stripped = account_email.strip()
+        if stripped:
+            return stripped
+    return str(authuser)
+
+
+def authuser_query(authuser: int = 0, account_email: str | None = None) -> str:
+    """Return a URL-encoded ``authuser=...`` query string."""
+    return urlencode({"authuser": format_authuser_value(authuser, account_email)})
+
+
+def write_account_metadata(storage_path: Path, *, authuser: int, email: str | None = None) -> None:
+    """Persist profile account metadata inside sibling ``context.json``.
+
+    Uses :func:`atomic_update_json` so concurrent CLI invocations (e.g., a
+    ``login`` while ``use`` is in flight) cannot lose updates by writing
+    stale snapshots of ``context.json`` over each other.
+
+    Args:
+        storage_path: Path to ``storage_state.json``. The sibling
+            ``context.json`` is created or updated.
+        authuser: ``authuser`` index used when extracting cookies for this
+            profile (0 for the default account).
+        email: Optional account email to record alongside the index.
+    """
+    context_path = _account_context_path(storage_path)
+    payload: dict[str, Any] = {"authuser": authuser}
+    if email:
+        payload["email"] = email
+
+    def _set_account(data: dict[str, Any]) -> dict[str, Any]:
+        data[_ACCOUNT_CONTEXT_KEY] = payload
+        return data
+
+    # ``recover_from_corrupt=True`` keeps the empty-dict fallback **inside**
+    # the file lock. An outside-the-lock unlink-and-retry would race a
+    # concurrent process that wrote a valid payload between our raise and
+    # our retry, causing us to delete their good write (see PR #465 review).
+    # Account metadata is unrecoverable from corrupt JSON, so silent reset
+    # under the lock is the right behaviour.
+    atomic_update_json(context_path, _set_account, recover_from_corrupt=True)
+
+
+def clear_account_metadata(storage_path: Path | None) -> None:
+    """Remove account metadata from sibling ``context.json`` if present.
+
+    Holds the same sibling ``.lock`` file used by :func:`atomic_update_json`
+    so concurrent ``write_account_metadata`` / context-mutation calls don't
+    lose updates against our clear-and-maybe-delete.
+    """
+    if storage_path is None:
+        return
+    context_path = _account_context_path(storage_path)
+    if not context_path.exists():
+        return
+    lock_path = context_path.with_suffix(context_path.suffix + ".lock")
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(lock_path), timeout=10.0):
+        # Re-check existence under the lock — another writer may have
+        # removed it between the early-return check and the lock acquire.
+        if not context_path.exists():
+            return
+        try:
+            data = json.loads(context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.debug("account metadata clear skipped for %s: %s", context_path, e)
+            return
+        if not isinstance(data, dict) or _ACCOUNT_CONTEXT_KEY not in data:
+            return
+        del data[_ACCOUNT_CONTEXT_KEY]
+        if data:
+            # atomic_update_json would re-acquire the lock; use the atomic
+            # write directly since we already hold the lock here.
+            atomic_write_json(context_path, data)
+        else:
+            context_path.unlink()
 
 
 def _load_storage_state(path: Path | None = None) -> dict[str, Any]:
@@ -686,12 +1384,18 @@ def _load_storage_state(path: Path | None = None) -> dict[str, Any]:
 
 
 def load_auth_from_storage(path: Path | None = None) -> dict[str, str]:
-    """Load Google cookies from storage.
+    """Load Google cookies from storage as a flat name→value dict.
 
     Loads authentication cookies with the following precedence:
     1. Explicit path argument (from --storage CLI flag)
     2. NOTEBOOKLM_AUTH_JSON environment variable (inline JSON, no file needed)
     3. File at $NOTEBOOKLM_HOME/storage_state.json (or ~/.notebooklm/storage_state.json)
+
+    Duplicate-name resolution follows :func:`_auth_domain_priority`, matching
+    :attr:`AuthTokens.flat_cookies` for the same storage state — previously the
+    two paths disagreed on names that live only on non-base hosts (e.g.
+    ``OSID`` on ``myaccount.google.com`` vs ``notebooklm.google.com``). See
+    issue #375.
 
     Args:
         path: Path to storage_state.json. If provided, takes precedence over env vars.
@@ -718,17 +1422,18 @@ def load_auth_from_storage(path: Path | None = None) -> dict[str, str]:
 def _is_allowed_cookie_domain(domain: str) -> bool:
     """Canonical cookie-domain allowlist for both auth and downloads.
 
-    This is the single source of truth for "is this cookie domain one we
-    accept?". Both the auth-extraction path and the download path go through
-    here — :func:`_is_allowed_auth_domain` is a thin alias preserved for
-    call-site readability. See issue #360 for why the split was collapsed.
+    Single source of truth for "is this cookie domain one we accept at
+    runtime?". Both the auth-extraction path and the download path go
+    through here — :func:`_is_allowed_auth_domain` is a thin alias
+    preserved for call-site readability. See issue #360 for why the split
+    was collapsed.
 
     A domain is allowed if any of the following holds:
 
-    1. Exact match against :data:`ALLOWED_COOKIE_DOMAINS` (the API host,
-       sibling Google products like ``.youtube.com`` / ``drive.google.com`` /
-       ``docs.google.com`` / ``myaccount.google.com``, ``accounts.google.com``,
-       and the leading-dot variants ``http.cookiejar`` may normalize to).
+    1. Exact match against :data:`REQUIRED_COOKIE_DOMAINS` (the API host,
+       ``.google.com``, ``accounts.google.com``, ``.googleusercontent.com``,
+       ``drive.google.com``, and the leading-dot variants ``http.cookiejar``
+       may normalize to).
     2. Valid Google domain via :func:`_is_google_domain` (regional ccTLDs:
        ``.google.com.sg``, ``.google.co.uk``, ``.google.de``, …).
     3. Subdomain of ``.google.com``, ``.googleusercontent.com``, or
@@ -738,13 +1443,27 @@ def _is_allowed_cookie_domain(domain: str) -> bool:
     The leading-dot suffix check ensures lookalikes like ``evil-google.com``
     are rejected.
 
+    Note (T5.G): the runtime gate consults the
+    :data:`ALLOWED_COOKIE_DOMAINS` union (REQUIRED ∪ OPTIONAL). The
+    blast-radius reduction is enforced at **extraction time** —
+    ``_build_google_cookie_domains`` defaults to
+    :data:`REQUIRED_COOKIE_DOMAINS` only, so rookiepy never returns
+    sibling-product cookies (e.g. ``.youtube.com``) unless the user
+    opts in via ``--include-domains=...``. The runtime gate must stay
+    permissive over the full union so that opted-in cookies survive
+    the downstream filters in :func:`convert_rookiepy_cookies_to_storage_state`,
+    :func:`extract_cookies_with_domains`, and
+    :func:`build_httpx_cookies_from_storage`.
+
     Args:
         domain: Cookie domain to check (e.g., '.google.com', 'lh3.google.com')
 
     Returns:
         True if domain is allowed for auth/download cookies.
     """
-    # Exact match against the primary allowlist
+    # Exact match against the union of REQUIRED + OPTIONAL. Anything that
+    # could have been validly opted in via ``--include-domains`` at
+    # extraction time must pass this gate at runtime (T5.G).
     if domain in ALLOWED_COOKIE_DOMAINS:
         return True
 
@@ -804,13 +1523,7 @@ def load_httpx_cookies(path: Path | None = None) -> "httpx.Cookies":
             cookies.jar.set_cookie(_storage_entry_to_cookie(entry))
             cookie_names.add(name)
 
-    # Validate that essential cookies are present
-    missing = MINIMUM_REQUIRED_COOKIES - cookie_names
-    if missing:
-        raise ValueError(
-            f"Missing required cookies for downloads: {missing}\n"
-            "Run 'notebooklm login' to re-authenticate."
-        )
+    _validate_required_cookies(cookie_names, context=" for downloads")
 
     return cookies
 
@@ -818,19 +1531,18 @@ def load_httpx_cookies(path: Path | None = None) -> "httpx.Cookies":
 def extract_cookies_with_domains(
     storage_state: dict[str, Any],
 ) -> DomainCookieMap:
-    """Extract Google cookies from storage state preserving original domains.
+    """Extract Google cookies from storage state preserving original identity.
 
-    Unlike extract_cookies_from_storage() which returns a simple dict of
-    name->value, this function returns a dict of (name, domain)->value tuples
-    to preserve the original cookie domains. This is required for building
-    proper httpx.Cookies jars that handle cross-domain redirects correctly.
+    Returns a path-aware ``(name, domain, path) -> value`` map per RFC 6265 §5.3.
+    Two cookies sharing ``(name, domain)`` at distinct paths survive as
+    independent entries instead of one silently shadowing the other (issue #369).
 
     Args:
         storage_state: Parsed JSON from Playwright's storage state file.
 
     Returns:
-        Dict mapping (cookie_name, domain) tuples to values.
-        Example: {("SID", ".google.com"): "abc123", ("HSID", ".google.com"): "def456"}
+        Dict mapping ``(cookie_name, domain, path)`` tuples to values.
+        Example: ``{("SID", ".google.com", "/"): "abc123"}``.
 
     Raises:
         ValueError: If required cookies (SID) are missing from storage state.
@@ -845,18 +1557,12 @@ def extract_cookies_with_domains(
         if not _is_allowed_auth_domain(domain) or not name or not value:
             continue
 
-        key = (name, domain)
+        key = (name, domain, cookie.get("path") or "/")
         if key not in cookie_map:
             cookie_map[key] = value
 
-    # Validate required cookies exist (any domain)
-    cookie_names = {name for name, _ in cookie_map}
-    missing = MINIMUM_REQUIRED_COOKIES - cookie_names
-    if missing:
-        raise ValueError(
-            f"Missing required cookies: {missing}\nRun 'notebooklm login' to authenticate."
-        )
-
+    # Validate required cookies exist (any domain or path).
+    _validate_required_cookies({name for name, _, _ in cookie_map})
     return cookie_map
 
 
@@ -880,31 +1586,25 @@ def build_httpx_cookies_from_storage(path: Path | None = None) -> "httpx.Cookies
     storage_state = _load_storage_state(path)
 
     cookies = httpx.Cookies()
-    # Dedup by (name, domain) to stay symmetric with save_cookies_to_storage,
-    # which keys cookies_by_key on the same pair. Cookie identity per RFC 6265
-    # is (name, domain, path), but the save side cannot represent multiple
-    # path-scoped siblings yet — so the load side keeps a compatible model
-    # rather than constructing pairs that would silently collapse on save.
-    seen_keys: set[CookieKey] = set()
+    # Cookie identity per RFC 6265 is (name, domain, path). Keep every path
+    # variant in the jar so the snapshot/delta save path can CAS-protect each
+    # storage row independently.
+    seen_names: set[str] = set()
+    seen_snapshot_keys: set[CookieSnapshotKey] = set()
     for entry in storage_state.get("cookies", []):
         domain = entry.get("domain", "")
         name = entry.get("name")
         value = entry.get("value", "")
         if not _is_allowed_auth_domain(domain) or not name or not value:
             continue
-        key = (name, domain)
-        if key in seen_keys:
+        key = CookieSnapshotKey(name, domain, entry.get("path") or "/")
+        if key in seen_snapshot_keys:
             continue
-        seen_keys.add(key)
+        seen_snapshot_keys.add(key)
+        seen_names.add(name)
         cookies.jar.set_cookie(_storage_entry_to_cookie(entry))
 
-    cookie_names = {name for name, _ in seen_keys}
-    missing = MINIMUM_REQUIRED_COOKIES - cookie_names
-    if missing:
-        raise ValueError(
-            f"Missing required cookies: {missing}\nRun 'notebooklm login' to authenticate."
-        )
-
+    _validate_required_cookies(seen_names)
     return cookies
 
 
@@ -922,8 +1622,11 @@ def build_cookie_jar(
        flat mappings are assigned to .google.com for backward compatibility.
 
     Args:
-        cookies: Domain-aware (name, domain) cookie dict, or legacy flat
-            name-to-value cookie dict.
+        cookies: Path-aware ``(name, domain, path)`` cookie dict (the
+            canonical post-#369 shape), legacy ``(name, domain)`` cookie
+            dict, or legacy flat ``name -> value`` dict. The latter two are
+            widened via :func:`normalize_cookie_map` — missing path defaults
+            to ``/``, missing domain to ``.google.com``.
         storage_path: Path to storage_state.json with domain metadata.
 
     Returns:
@@ -934,8 +1637,8 @@ def build_cookie_jar(
         return build_httpx_cookies_from_storage(storage_path)
 
     jar = httpx.Cookies()
-    for (name, domain), value in normalize_cookie_map(cookies).items():
-        jar.set(name, value, domain=domain)
+    for (name, domain, path), value in normalize_cookie_map(cookies).items():
+        jar.set(name, value, domain=domain, path=path)
     return jar
 
 
@@ -1011,6 +1714,9 @@ def _file_lock(lock_path: Path, *, blocking: bool, log_prefix: str) -> Iterator[
         os.close(fd)
 
 
+_FLOCK_UNAVAILABLE_WARNED = False
+
+
 @contextlib.contextmanager
 def _file_lock_exclusive(lock_path: Path) -> Iterator[None]:
     """Blocking cross-process exclusive lock on ``lock_path``.
@@ -1024,14 +1730,138 @@ def _file_lock_exclusive(lock_path: Path) -> Iterator[None]:
 
     The lock is per-process: threads within one process aren't serialized —
     that's the intra-process ``threading.Lock`` in ``ClientCore``. If the
-    lock can't be acquired (e.g. NFS where flock semantics vary), the save
-    proceeds anyway; correctness on NFS is best-effort.
+    lock can't be acquired (e.g. NFS where flock semantics vary, read-only
+    parent dir, fd exhaustion), the save proceeds anyway; correctness in
+    that mode is best-effort and relies on the snapshot/delta CAS guards in
+    :func:`_merge_cookies_with_snapshot` alone. The first time this
+    fallback fires per process emits a WARNING so operators learn their
+    deployment is running without cross-process coordination.
     """
-    with _file_lock(lock_path, blocking=True, log_prefix="save_cookies_to_storage"):
+    global _FLOCK_UNAVAILABLE_WARNED
+    with _file_lock(lock_path, blocking=True, log_prefix="save_cookies_to_storage") as state:
+        if state == "unavailable" and not _FLOCK_UNAVAILABLE_WARNED:
+            _FLOCK_UNAVAILABLE_WARNED = True
+            logger.warning(
+                "Cross-process file lock unavailable at %s; cookie saves will "
+                "proceed without cross-process coordination and rely solely on "
+                "snapshot/delta CAS guards. Common causes: NFS without flock "
+                "support, read-only parent directory, fd exhaustion. (Logged "
+                "once per process.)",
+                lock_path,
+            )
         yield
 
 
-def save_cookies_to_storage(cookie_jar: httpx.Cookies, path: Path | None = None) -> None:
+def snapshot_cookie_jar(cookie_jar: httpx.Cookies) -> CookieSnapshot:
+    """Capture an open-time snapshot of an httpx cookie jar.
+
+    Snapshots are the input to the dirty-flag/delta merge in
+    :func:`save_cookies_to_storage`: at save time, only cookies whose
+    in-memory value differs from the snapshot — plus cookies absent from
+    the jar but present in the snapshot (deletions) — are propagated to
+    disk. Cookies the in-process code never touched are left to whatever
+    a sibling process may have written (closes the §3.4.1
+    stale-overwrite-fresh hazard).
+
+    The key shape is path-aware ``(name, domain, path)`` (also closes
+    §3.4.2). Cookies with no name or no domain are skipped — the storage
+    format requires both.
+
+    Args:
+        cookie_jar: The httpx.Cookies object to snapshot.
+
+    Returns:
+        Mapping of ``CookieSnapshotKey -> CookieSnapshotValue`` capturing
+        each cookie's value and the attributes the storage_state schema
+        persists (``expires``, ``secure``, ``httpOnly``).
+    """
+    return {
+        CookieSnapshotKey(cookie.name, cookie.domain, cookie.path or "/"): CookieSnapshotValue(
+            value=cookie.value,
+            expires=cookie.expires,
+            secure=bool(cookie.secure),
+            http_only=_cookie_is_http_only(cookie),
+        )
+        for cookie in cookie_jar.jar
+        if cookie.name and cookie.domain and cookie.value is not None
+    }
+
+
+def _cookie_snapshot_key_variants(key: CookieSnapshotKey) -> set[CookieSnapshotKey]:
+    """Return equivalent host/domain snapshot keys for leading-dot domains.
+
+    Mirrors :func:`_cookie_key_variants` but preserves the path component so
+    storage entries on the same path match snapshot entries regardless of
+    whether ``http.cookiejar`` normalized the domain to a leading dot.
+    """
+    variants = {key}
+    if key.domain.startswith("."):
+        variants.add(CookieSnapshotKey(key.name, key.domain[1:], key.path))
+    else:
+        variants.add(CookieSnapshotKey(key.name, f".{key.domain}", key.path))
+    return variants
+
+
+def _stored_cookie_snapshot_key(stored_cookie: dict[str, Any]) -> CookieSnapshotKey | None:
+    """Build a path-aware snapshot key from a Playwright storage_state cookie."""
+    name = stored_cookie.get("name")
+    domain = stored_cookie.get("domain", "")
+    if not name or not domain:
+        return None
+    path = stored_cookie.get("path") or "/"
+    return CookieSnapshotKey(name, domain, path)
+
+
+def advance_cookie_snapshot_after_save(
+    original_snapshot: CookieSnapshot | None,
+    post_save_snapshot: CookieSnapshot,
+    cas_rejected_keys: frozenset[CookieSnapshotKey],
+) -> CookieSnapshot | None:
+    """Advance save baseline for successful keys while preserving rejected ones.
+
+    A save can partially succeed: one cookie delta may write through while a
+    sibling-process CAS conflict rejects another. Advancing the whole baseline
+    would lose the rejected delta; keeping the whole old baseline would replay
+    already-written deltas and wedge future saves. This helper advances every
+    key to ``post_save_snapshot`` except the CAS-rejected keys, which retain
+    their old baseline value or absence. Rejected keys are matched through
+    leading-dot variants because the merge path can reject a normalized variant
+    of the key captured in ``original_snapshot``.
+    """
+    if original_snapshot is None:
+        return None
+
+    advanced = dict(post_save_snapshot)
+    for key in cas_rejected_keys:
+        original_key = next(
+            (
+                variant
+                for variant in _cookie_snapshot_key_variants(key)
+                if variant in original_snapshot
+            ),
+            None,
+        )
+        for variant in _cookie_snapshot_key_variants(key):
+            advanced.pop(variant, None)
+        if original_key is not None:
+            advanced[original_key] = original_snapshot[original_key]
+    return advanced
+
+
+def _cookie_save_return(
+    result: CookieSaveResult, *, return_result: bool
+) -> bool | CookieSaveResult:
+    """Return either the detailed save result or its public bool projection."""
+    return result if return_result else result.ok
+
+
+def save_cookies_to_storage(
+    cookie_jar: httpx.Cookies,
+    path: Path | None = None,
+    *,
+    original_snapshot: CookieSnapshot | None = None,
+    return_result: bool = False,
+) -> bool | CookieSaveResult:
     """Save an updated httpx.Cookies jar back to Playwright storage_state.json.
 
     This ensures that when Google issues short-lived token refreshes (e.g.
@@ -1046,9 +1876,39 @@ def save_cookies_to_storage(cookie_jar: httpx.Cookies, path: Path | None = None)
     plus a cron-driven ``notebooklm auth refresh``) serialize cleanly rather
     than tearing or losing updates.
 
+    Two merge modes:
+
+    - **Legacy (``original_snapshot=None``)**: every in-memory cookie whose
+      value differs from disk wins. Vulnerable to the stale-overwrite-fresh
+      race documented in ``docs/auth-keepalive.md`` §3.4.1 and emits a
+      ``DeprecationWarning``. Kept only as a public-API back-compat shim
+      for callers outside this repo; every first-party caller passes
+      ``original_snapshot``.
+    - **Snapshot/delta (``original_snapshot`` provided)**: only cookies
+      whose in-memory persisted tuple differs from the snapshot are written, and
+      cookies present in the snapshot but no longer in the jar are
+      deleted from disk. Cookies the in-process code never touched are
+      left untouched on disk so a sibling-process write survives.
+      Path-aware ``(name, domain, path)`` keys are used here (also closes
+      §3.4.2).
+
     Args:
         cookie_jar: The httpx.Cookies object containing the latest cookies.
         path: Path to storage_state.json. If None, cookie sync is skipped.
+        original_snapshot: Open-time snapshot from
+            :func:`snapshot_cookie_jar`. When provided, only deltas and
+            deletions relative to the snapshot are persisted.
+        return_result: Internal escape hatch for callers that need CAS-rejected
+            keys to maintain a per-cookie baseline. Public callers should use
+            the default bool return.
+
+    Returns:
+        ``True`` if the disk state now reflects the caller's intent (write
+        succeeded, was a successful no-op, or the call was a deliberate skip
+        because auth was loaded from an env var). ``False`` if an I/O error
+        prevented the save or a CAS guard preserved a sibling-process write.
+        With ``return_result=True``, callers can inspect CAS-rejected keys and
+        advance their baseline for the keys that did write through.
     """
     if (
         not path
@@ -1056,91 +1916,339 @@ def save_cookies_to_storage(cookie_jar: httpx.Cookies, path: Path | None = None)
         and os.environ["NOTEBOOKLM_AUTH_JSON"].strip()
     ):
         logger.debug("Skipping cookie sync: Auth loaded from NOTEBOOKLM_AUTH_JSON env var")
-        return
+        return _cookie_save_return(CookieSaveResult(True), return_result=return_result)
 
     if not path:
         logger.debug("Skipping cookie sync: No storage file path available")
-        return
+        return _cookie_save_return(CookieSaveResult(True), return_result=return_result)
+
+    if original_snapshot is None:
+        warnings.warn(
+            "save_cookies_to_storage called without original_snapshot; the "
+            "legacy full-merge path is vulnerable to the stale-overwrite-fresh "
+            "race (docs/auth-keepalive.md §3.4.1). Pass an original_snapshot "
+            "captured via snapshot_cookie_jar() at jar-open time.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     lock_path = path.with_name(f".{path.name}.lock")
     with _file_lock_exclusive(lock_path):
         if not path.exists():
             logger.debug("Skipping cookie sync: Storage file not found at %s", path)
-            return
+            return _cookie_save_return(CookieSaveResult(False), return_result=return_result)
 
         try:
             storage_data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
             logger.warning("Failed to read storage state for cookie sync: %s", e)
-            return
+            return _cookie_save_return(CookieSaveResult(False), return_result=return_result)
 
         if not isinstance(storage_data, dict) or "cookies" not in storage_data:
-            return
-
-        cookies_by_key = {
-            (cookie.name, cookie.domain): cookie
-            for cookie in cookie_jar.jar
-            if cookie.name and cookie.domain and _is_allowed_cookie_domain(cookie.domain)
-        }
-
-        updated_count = 0
-        stored_keys: set[CookieKey] = set()
-        for stored_cookie in storage_data["cookies"]:
-            name = stored_cookie.get("name")
-            domain = stored_cookie.get("domain", "")
-            if not name or not domain:
-                continue
-
-            key = (name, domain)
-            stored_keys.update(_cookie_key_variants(key))
-            refreshed_cookie = _find_cookie_for_storage(
-                cookies_by_key, key, stored_cookie.get("value")
+            logger.warning(
+                "storage_state at %s lacks 'cookies' key; rotated cookies will not be persisted",
+                path,
             )
-            if refreshed_cookie is None:
-                continue
+            return _cookie_save_return(CookieSaveResult(False), return_result=return_result)
 
-            new_expires = refreshed_cookie.expires if refreshed_cookie.expires is not None else -1
-            changed = (
-                stored_cookie.get("value") != refreshed_cookie.value
-                or stored_cookie.get("expires") != new_expires
+        if original_snapshot is None:
+            updated_count = _merge_cookies_legacy(cookie_jar, storage_data)
+            cas_rejected_keys: frozenset[CookieSnapshotKey] = frozenset()
+        else:
+            updated_count, cas_rejected_keys = _merge_cookies_with_snapshot(
+                cookie_jar, storage_data, original_snapshot
             )
-            if changed:
-                stored_cookie["value"] = refreshed_cookie.value
-                stored_cookie["expires"] = new_expires
-                stored_cookie["path"] = refreshed_cookie.path or stored_cookie.get("path", "/")
-                stored_cookie["secure"] = refreshed_cookie.secure
-                stored_cookie["httpOnly"] = _cookie_is_http_only(refreshed_cookie)
-                updated_count += 1
 
-        for key, cookie in cookies_by_key.items():
-            if key in stored_keys:
-                continue
-            storage_data["cookies"].append(_cookie_to_storage_state(cookie))
+        if updated_count == 0:
+            # A CAS rejection with no other successful work means disk does
+            # not reflect our intent; the caller must not advance baseline.
+            return _cookie_save_return(
+                CookieSaveResult(not cas_rejected_keys, cas_rejected_keys),
+                return_result=return_result,
+            )
+
+        try:
+            atomic_write_json(path, storage_data)
+            logger.debug("Successfully synced %d refreshed cookies to %s", updated_count, path)
+            # Even on a successful disk write, if any CAS arm rejected work,
+            # disk diverges from ``post`` for at least one key — caller must
+            # not advance baseline.
+            return _cookie_save_return(
+                CookieSaveResult(not cas_rejected_keys, cas_rejected_keys),
+                return_result=return_result,
+            )
+        except Exception as e:
+            logger.warning("Failed to write updated cookies to %s: %s", path, e)
+            return _cookie_save_return(CookieSaveResult(False), return_result=return_result)
+
+
+def _merge_cookies_legacy(cookie_jar: httpx.Cookies, storage_data: dict[str, Any]) -> int:
+    """Legacy merge: trust in-memory whenever it differs from disk.
+
+    Vulnerable to the stale-overwrite-fresh race (§3.4.1). Kept only for
+    callers that have not yet opted into snapshot semantics. New callers
+    must pass ``original_snapshot`` to :func:`save_cookies_to_storage`.
+
+    Returns:
+        Number of cookie entries added or modified in ``storage_data``.
+    """
+    cookies_by_key: dict[CookieKey, Any] = {
+        (cookie.name, cookie.domain, cookie.path or "/"): cookie
+        for cookie in cookie_jar.jar
+        if cookie.name and cookie.domain and _is_allowed_cookie_domain(cookie.domain)
+    }
+
+    updated_count = 0
+    stored_keys: set[CookieKey] = set()
+    for stored_cookie in storage_data["cookies"]:
+        name = stored_cookie.get("name")
+        domain = stored_cookie.get("domain", "")
+        if not name or not domain:
+            continue
+
+        key: CookieKey = (name, domain, stored_cookie.get("path") or "/")
+        stored_keys.update(_cookie_key_variants(key))
+        refreshed_cookie = _find_cookie_for_storage(cookies_by_key, key, stored_cookie.get("value"))
+        if refreshed_cookie is None:
+            continue
+
+        new_expires = refreshed_cookie.expires if refreshed_cookie.expires is not None else -1
+        changed = (
+            stored_cookie.get("value") != refreshed_cookie.value
+            or stored_cookie.get("expires") != new_expires
+        )
+        if changed:
+            stored_cookie["value"] = refreshed_cookie.value
+            stored_cookie["expires"] = new_expires
+            # Normalize present-but-empty ``"path": ""`` to ``"/"`` so the row
+            # we write matches the path normalization used to build the
+            # identity key one block up (and used by every loader). Without
+            # the trailing ``or "/"`` an on-disk row with ``"path": ""`` would
+            # survive across save cycles while every other code path treats
+            # it as ``"/"``.
+            stored_cookie["path"] = refreshed_cookie.path or stored_cookie.get("path") or "/"
+            stored_cookie["secure"] = refreshed_cookie.secure
+            stored_cookie["httpOnly"] = _cookie_is_http_only(refreshed_cookie)
             updated_count += 1
 
-        if updated_count > 0:
-            temp_path: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    "w",
-                    encoding="utf-8",
-                    dir=path.parent,
-                    prefix=f".{path.name}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as temp_file:
-                    temp_file.write(json.dumps(storage_data, indent=2, ensure_ascii=False))
-                    temp_path = Path(temp_file.name)
-                os.chmod(temp_path, 0o600)
-                temp_path.replace(path)
-                logger.debug("Successfully synced %d refreshed cookies to %s", updated_count, path)
-            except Exception as e:
-                logger.warning("Failed to write updated cookies to %s: %s", path, e)
-                if temp_path is not None:
-                    try:
-                        temp_path.unlink(missing_ok=True)
-                    except Exception as cleanup_err:
-                        logger.debug("Failed to clean up temp file %s: %s", temp_path, cleanup_err)
+    for key, cookie in cookies_by_key.items():
+        if key in stored_keys:
+            continue
+        storage_data["cookies"].append(_cookie_to_storage_state(cookie))
+        updated_count += 1
+
+    return updated_count
+
+
+def _merge_cookies_with_snapshot(
+    cookie_jar: httpx.Cookies,
+    storage_data: dict[str, Any],
+    original_snapshot: CookieSnapshot,
+) -> tuple[int, frozenset[CookieSnapshotKey]]:
+    """Snapshot/delta merge: write only what this process actually changed.
+
+    Closes §3.4.1 (stale-overwrite-fresh) and §3.4.2 (path collapse):
+
+    - **Deltas (CAS-guarded for keys in the snapshot)**: cookies in the
+      jar whose snapshot tuple (``value, expires, secure, http_only``)
+      differs from ``original_snapshot`` are written to disk **only if**
+      the on-disk value still matches the snapshot value. If disk has
+      rotated since open time, a sibling process has written it; we
+      preserve their write rather than clobber it with our local
+      rotation. New cookies acquired during the session are written only
+      when no same-key storage row exists yet; an existing row means a
+      sibling acquired the same cookie first. Comparing the full snapshot
+      tuple keeps attribute-only refreshes (same value, new ``expires``)
+      flowing to disk, but CAS remains value-only because attribute-only
+      sibling drift is routine session metadata and should not wedge later
+      value rotations.
+    - **Deletions (CAS-guarded)**: a key present in the snapshot but
+      absent from the jar is dropped from disk **only if** the on-disk
+      value still matches the snapshot value — symmetric with the
+      value-update CAS above. An ``Max-Age=0`` that evicted our
+      locally-expired copy must not erase the sibling's freshly-issued
+      replacement.
+    - **Untouched**: cookies in the jar whose tuple matches the snapshot
+      are not written, so a sibling-process write to the same key
+      survives. Cookies on disk that are not in the snapshot are also
+      left alone (they belong to a sibling process or another path).
+
+    Args:
+        cookie_jar: Current in-memory cookie jar.
+        storage_data: Mutable storage_state.json dict (modified in place).
+        original_snapshot: Open-time snapshot of the same jar.
+
+    Returns:
+        Tuple of ``(updated_count, cas_rejected_keys)``:
+
+        - ``updated_count``: cookie entries added, modified, or removed
+          (drives whether the temp-write step runs).
+        - ``cas_rejected_keys``: keys whose CAS check rejected a delta or
+          deletion. Caller uses this to advance the baseline only for keys
+          that were actually written or already matched.
+    """
+    current_snapshot = snapshot_cookie_jar(cookie_jar)
+
+    # Path-aware index of jar cookies for delta application. Restricting to
+    # _is_allowed_cookie_domain matches the legacy save's allowlist gate so
+    # this PR doesn't inadvertently widen the persisted-domain set.
+    # Filter ``cookie.value is not None`` to mirror ``snapshot_cookie_jar``: a
+    # value-less cookie is treated as a deletion (absent from this index, absent
+    # from ``current_snapshot``) rather than a delta that would write ``null``
+    # to disk.
+    cookies_by_snapshot_key = {
+        CookieSnapshotKey(cookie.name, cookie.domain, cookie.path or "/"): cookie
+        for cookie in cookie_jar.jar
+        if (
+            cookie.name
+            and cookie.domain
+            and cookie.value is not None
+            and _is_allowed_cookie_domain(cookie.domain)
+        )
+    }
+
+    deltas: dict[CookieSnapshotKey, Any] = {}
+    for snapshot_key, cookie in cookies_by_snapshot_key.items():
+        if original_snapshot.get(snapshot_key) != current_snapshot.get(snapshot_key):
+            deltas[snapshot_key] = cookie
+
+    deletion_candidates: set[CookieSnapshotKey] = {
+        snapshot_key
+        for snapshot_key in original_snapshot
+        if snapshot_key not in current_snapshot
+        # Only delete cookies the merge would otherwise be allowed to write.
+        # Snapshot may include sibling-product domains the allowlist filters
+        # out at write time; treating those as deletions would silently drop
+        # disk entries we never persisted to begin with.
+        and _is_allowed_cookie_domain(snapshot_key.domain)
+    }
+
+    updated_count = 0
+    cas_rejected_keys: set[CookieSnapshotKey] = set()
+
+    # Apply deltas + deletions to the existing storage entries in place.
+    new_cookies: list[dict[str, Any]] = []
+    matched_delta_keys: set[CookieSnapshotKey] = set()
+    for stored_cookie in storage_data["cookies"]:
+        stored_key = _stored_cookie_snapshot_key(stored_cookie)
+        if stored_key is None:
+            new_cookies.append(stored_cookie)
+            continue
+
+        # Find the delta (or deletion) that maps to this stored entry.
+        # Match leading-dot domain variants so e.g. snapshot
+        # ``.accounts.google.com`` lines up with stored ``accounts.google.com``.
+        # A delta wins over a deletion: if the same stored entry matches
+        # both (which can happen when httpx normalized one variant), we
+        # prefer to update rather than drop, because dropping would lose
+        # the rotation we just applied.
+        matched_delta_cookie = None
+        matched_delta_key: CookieSnapshotKey | None = None
+        for variant in _cookie_snapshot_key_variants(stored_key):
+            if variant in deltas:
+                matched_delta_cookie = deltas[variant]
+                matched_delta_key = variant
+                break
+
+        if matched_delta_cookie is not None:
+            if matched_delta_key is None:  # pragma: no cover - loop invariant
+                raise RuntimeError("matched_delta_cookie set without matched_delta_key")
+            # CAS-guard for value updates: if our snapshot had this key in any
+            # leading-dot variant and disk's current value differs from the
+            # snapshot value, a sibling process has rewritten the row between
+            # our open and our save. Preserve their write rather than clobber,
+            # unless disk has already converged to our current value; in that
+            # case the save intent is satisfied and the caller may advance its
+            # baseline.
+            # Variant-aware lookup mirrors the delta match above: if the snapshot
+            # was keyed on ``accounts.google.com`` but the matched delta key is
+            # the leading-dot variant, a plain ``.get(matched_delta_key)`` would
+            # miss the entry and silently bypass the CAS.
+            snapshot_entry = next(
+                (
+                    original_snapshot[variant]
+                    for variant in _cookie_snapshot_key_variants(matched_delta_key)
+                    if variant in original_snapshot
+                ),
+                None,
+            )
+            stored_value = stored_cookie.get("value")
+            if (
+                snapshot_entry is not None
+                and stored_value != snapshot_entry.value
+                and stored_value != matched_delta_cookie.value
+            ):
+                logger.debug(
+                    "Skipped CAS-guarded value update of %s on %s: disk value "
+                    "differs from snapshot (sibling write preserved)",
+                    matched_delta_key.name,
+                    matched_delta_key.domain,
+                )
+                cas_rejected_keys.add(matched_delta_key)
+                matched_delta_keys.add(matched_delta_key)
+                new_cookies.append(stored_cookie)
+                continue
+            if snapshot_entry is None and stored_value != matched_delta_cookie.value:
+                logger.debug(
+                    "Skipped CAS-guarded value update of new cookie %s on %s: "
+                    "disk row already exists (sibling write preserved)",
+                    matched_delta_key.name,
+                    matched_delta_key.domain,
+                )
+                cas_rejected_keys.add(matched_delta_key)
+                matched_delta_keys.add(matched_delta_key)
+                new_cookies.append(stored_cookie)
+                continue
+            new_expires = (
+                matched_delta_cookie.expires if matched_delta_cookie.expires is not None else -1
+            )
+            stored_cookie["value"] = matched_delta_cookie.value
+            stored_cookie["expires"] = new_expires
+            # Mirror :func:`_merge_cookies_legacy`: ``or "/"`` normalizes a
+            # present-but-empty ``"path": ""`` so the written row matches the
+            # path normalization used by the identity key and every loader.
+            stored_cookie["path"] = matched_delta_cookie.path or stored_cookie.get("path") or "/"
+            stored_cookie["secure"] = matched_delta_cookie.secure
+            stored_cookie["httpOnly"] = _cookie_is_http_only(matched_delta_cookie)
+            matched_delta_keys.add(matched_delta_key)
+            updated_count += 1
+            new_cookies.append(stored_cookie)
+            continue
+
+        deletion_match = next(
+            (
+                variant
+                for variant in _cookie_snapshot_key_variants(stored_key)
+                if variant in deletion_candidates
+            ),
+            None,
+        )
+        if deletion_match is not None:
+            # CAS-guard: only drop the disk row if its value still matches
+            # what we observed at snapshot time. A sibling process may have
+            # rewritten this key between our open and our save; clobbering
+            # their fresh value with our local eviction would resurrect the
+            # exact stale-overwrite-fresh hazard the snapshot path exists
+            # to close (just inverted — deletion-of-fresh instead of
+            # value-write-of-stale).
+            snapshot_value = original_snapshot[deletion_match].value
+            if stored_cookie.get("value") == snapshot_value:
+                updated_count += 1
+                continue  # drop the entry from disk
+            cas_rejected_keys.add(deletion_match)
+
+        new_cookies.append(stored_cookie)
+
+    # Append delta cookies that didn't match any existing storage entry
+    # (genuinely new cookies acquired during the session).
+    for snapshot_key, cookie in deltas.items():
+        if snapshot_key in matched_delta_keys:
+            continue
+        new_cookies.append(_cookie_to_storage_state(cookie))
+        updated_count += 1
+
+    storage_data["cookies"] = new_cookies
+    return updated_count, frozenset(cas_rejected_keys)
 
 
 def _cookie_is_http_only(cookie: Any) -> bool:
@@ -1206,13 +2314,18 @@ def _storage_entry_to_cookie(entry: dict[str, Any]) -> http.cookiejar.Cookie:
 
 
 def _cookie_key_variants(key: CookieKey) -> set[CookieKey]:
-    """Return equivalent host/domain cookie keys for leading-dot domains."""
-    name, domain = key
+    """Return equivalent host/domain cookie keys for leading-dot domains.
+
+    The path component is preserved verbatim (issue #369): RFC 6265 §5.3 treats
+    ``path`` as part of cookie identity, so variants only span the leading-dot
+    domain normalization that ``http.cookiejar`` applies.
+    """
+    name, domain, path = key
     variants = {key}
     if domain.startswith("."):
-        variants.add((name, domain[1:]))
+        variants.add((name, domain[1:], path))
     else:
-        variants.add((name, f".{domain}"))
+        variants.add((name, f".{domain}", path))
     return variants
 
 
@@ -1224,7 +2337,9 @@ def _find_cookie_for_storage(
     http.cookiejar normalizes ``Domain=accounts.google.com`` to
     ``.accounts.google.com``. If both the original host-only key and the
     normalized domain key exist, prefer the value that differs from storage
-    because that is the refreshed Set-Cookie value.
+    because that is the refreshed Set-Cookie value. Path is held fixed across
+    variants so a same-name sibling on a different path can't be returned by
+    accident (issue #369).
     """
     candidates = [
         cookie
@@ -1250,14 +2365,56 @@ def _replace_cookie_jar(target: httpx.Cookies, source: httpx.Cookies) -> None:
 
 
 NOTEBOOKLM_REFRESH_CMD_ENV = "NOTEBOOKLM_REFRESH_CMD"
+NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV = "NOTEBOOKLM_REFRESH_CMD_USE_SHELL"
 _REFRESH_ATTEMPTED_ENV = "_NOTEBOOKLM_REFRESH_ATTEMPTED"
 # The ContextVar prevents same-task retry loops in the parent process. The env
 # flag is passed only to child refresh commands so recursive CLI calls skip refresh.
 _REFRESH_ATTEMPTED_CONTEXT: ContextVar[bool] = ContextVar(
     "_REFRESH_ATTEMPTED_CONTEXT", default=False
 )
-_REFRESH_LOCK = asyncio.Lock()
+# In-process state for refresh coordination, keyed per resolved storage path.
+#
+# Two layers of protection are required:
+#
+# - ``_REFRESH_STATE_LOCK`` (sync ``threading.Lock``) makes the
+#   ``_REFRESH_GENERATIONS`` check-and-update atomic ACROSS event loops.
+#   Two loops sharing a storage path each hold their own ``asyncio.Lock``
+#   (see below), so the asyncio lock alone cannot serialize the generation
+#   bump.
+#
+# - ``_REFRESH_LOCKS_BY_LOOP`` mirrors the keepalive ``_POKE_LOCKS_BY_LOOP``
+#   pattern: ``asyncio.Lock`` is loop-bound, so a per-loop / per-resolved-
+#   storage-path registry avoids the cross-loop / cross-thread hazard of a
+#   module-global ``asyncio.Lock`` that binds to the first event loop that
+#   uses it. The outer ``WeakKeyDictionary`` is keyed on the loop object so
+#   the inner dict is reclaimed when the loop is garbage-collected.
+_REFRESH_STATE_LOCK = threading.Lock()
+_REFRESH_LOCKS_BY_LOOP: "weakref.WeakKeyDictionary[Any, dict[Path | None, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
 _REFRESH_GENERATIONS: dict[str, int] = {}
+
+
+def _get_refresh_lock(resolved_storage_path: Path | None) -> asyncio.Lock:
+    """Return the ``asyncio.Lock`` for ``(running event loop, resolved storage path)``.
+
+    Mirrors ``_get_poke_lock``. Keyed on the RESOLVED storage path so callers
+    passing ``(None, profile="foo")`` share the lock with callers passing the
+    explicit profile-resolved path.
+    """
+    loop = asyncio.get_running_loop()
+    with _REFRESH_STATE_LOCK:
+        per_loop = _REFRESH_LOCKS_BY_LOOP.get(loop)
+        if per_loop is None:
+            per_loop = {}
+            _REFRESH_LOCKS_BY_LOOP[loop] = per_loop
+        lock = per_loop.get(resolved_storage_path)
+        if lock is None:
+            lock = asyncio.Lock()
+            per_loop[resolved_storage_path] = lock
+        return lock
+
+
 _AUTH_ERROR_SIGNALS = (
     "authentication expired",
     "redirected to",
@@ -1275,11 +2432,63 @@ def _should_try_refresh(err: Exception) -> bool:
     return any(sig in msg for sig in _AUTH_ERROR_SIGNALS)
 
 
+def _split_refresh_cmd(cmd: str) -> list[str]:
+    """Parse ``NOTEBOOKLM_REFRESH_CMD`` into an argv for ``shell=False`` exec.
+
+    On POSIX systems, defers to :func:`shlex.split`. On Windows, uses
+    ``CommandLineToArgvW`` so quoted paths like
+    ``"C:\\Program Files\\Python\\python.exe"`` produce a properly unquoted
+    argv that ``subprocess.run(argv, shell=False)`` can locate. ``shlex``
+    in non-POSIX mode preserves the literal quote characters and would
+    leave the OS unable to find the executable.
+
+    Raises:
+        ValueError: If the command is malformed (e.g., unterminated quote).
+    """
+    if os.name != "nt":
+        return shlex.split(cmd)
+
+    import ctypes
+    from ctypes import wintypes
+
+    CommandLineToArgvW = ctypes.windll.shell32.CommandLineToArgvW  # type: ignore[attr-defined]
+    CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    LocalFree = ctypes.windll.kernel32.LocalFree  # type: ignore[attr-defined]
+    LocalFree.argtypes = [wintypes.HLOCAL]
+    LocalFree.restype = wintypes.HLOCAL
+
+    argc = ctypes.c_int(0)
+    argv_ptr = CommandLineToArgvW(cmd, ctypes.byref(argc))
+    if not argv_ptr:
+        # CommandLineToArgvW returns NULL for some empty-input edge cases.
+        # Mirror shlex.split's behavior and return an empty list; the caller
+        # surfaces this as ``RuntimeError("...parsed to empty argv")``.
+        return []
+    try:
+        # On Windows, ``CommandLineToArgvW`` is documented to return a single
+        # empty-string entry (argc=1, argv[0]="") for whitespace-only input,
+        # rather than NULL. Filter out empty entries so the caller's
+        # ``if not argv`` empty-argv guard catches this case the same way
+        # ``shlex.split("   ") == []`` does on POSIX.
+        return [argv_ptr[i] for i in range(argc.value) if argv_ptr[i]]
+    finally:
+        LocalFree(ctypes.cast(argv_ptr, wintypes.HLOCAL))
+
+
 async def _run_refresh_cmd(storage_path: Path | None = None, profile: str | None = None) -> None:
     """Run ``NOTEBOOKLM_REFRESH_CMD`` to refresh stored cookies.
 
+    By default, the command string is parsed with :func:`shlex.split` and
+    executed with ``shell=False`` to avoid shell-injection footguns when the
+    env var is sourced from CI configs or container env files. Set
+    ``NOTEBOOKLM_REFRESH_CMD_USE_SHELL=1`` to opt back into the legacy
+    ``shell=True`` behavior (e.g., when the command relies on shell features
+    like pipes, redirection, or env-var expansion).
+
     Raises:
-        RuntimeError: If the refresh command is missing, times out, or exits
+        RuntimeError: If the refresh command is missing, parses to an empty
+            argv, is malformed (unterminated quote), times out, or exits
             non-zero.
     """
     cmd = os.environ.get(NOTEBOOKLM_REFRESH_CMD_ENV)
@@ -1291,11 +2500,41 @@ async def _run_refresh_cmd(storage_path: Path | None = None, profile: str | None
     refresh_env["NOTEBOOKLM_REFRESH_STORAGE_PATH"] = str(
         storage_path or get_storage_path(profile=profile)
     )
+
+    use_shell = os.environ.get(NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV) == "1"
+    run_target: str | list[str]
+    run_shell: bool
+    if use_shell:
+        logger.warning("Using shell-mode for %s (opt-in)", NOTEBOOKLM_REFRESH_CMD_ENV)
+        # Deliberately do NOT log a basename/preview of ``cmd`` here: in
+        # shell-mode the entire string is forwarded to ``/bin/sh -c`` and
+        # may contain pipes, redirection, ``$VAR`` expansion, or inline
+        # tokens. We can't extract a single "first token" without risking
+        # leaking the rest, so we stay silent past the opt-in warning.
+        run_target = cmd
+        run_shell = True
+    else:
+        try:
+            # POSIX → shlex.split. Windows → CommandLineToArgvW so quoted
+            # paths like ``"C:\\Program Files\\..."`` arrive unquoted.
+            argv = _split_refresh_cmd(cmd)
+        except ValueError as split_err:
+            raise RuntimeError(
+                f"{NOTEBOOKLM_REFRESH_CMD_ENV} could not be parsed: {split_err}"
+            ) from split_err
+        if not argv:
+            raise RuntimeError(f"{NOTEBOOKLM_REFRESH_CMD_ENV} parsed to empty argv")
+        # Log basename only — full argv may carry tokens and absolute paths
+        # can leak secrets-directory layouts.
+        logger.info("Running refresh command: %s ...", os.path.basename(argv[0]))
+        run_target = argv
+        run_shell = False
+
     try:
         result = await asyncio.to_thread(
             subprocess.run,
-            cmd,
-            shell=True,
+            run_target,
+            shell=run_shell,
             capture_output=True,
             text=True,
             timeout=60,
@@ -1315,11 +2554,34 @@ async def _fetch_tokens_with_refresh(
     cookie_jar: httpx.Cookies,
     storage_path: Path | None = None,
     profile: str | None = None,
-) -> tuple[str, str, bool]:
-    """Fetch tokens, optionally running NOTEBOOKLM_REFRESH_CMD on auth expiry."""
+    *,
+    authuser: int = 0,
+    account_email: str | None = None,
+    force_authuser_query: bool = False,
+) -> tuple[str, str, bool, CookieSnapshot | None]:
+    """Fetch tokens, optionally running NOTEBOOKLM_REFRESH_CMD on auth expiry.
+
+    Returns ``(csrf, session_id, refreshed, post_refresh_snapshot)``.
+
+    When ``refreshed`` is ``True``, ``post_refresh_snapshot`` is a snapshot
+    captured **immediately after** ``_replace_cookie_jar`` swaps in the
+    refresh-cmd output and **before** the retry token fetch can mutate the
+    jar with redirect Set-Cookies. Callers must use that snapshot as the
+    save baseline; re-snapshotting the jar after this function returns
+    would include the retry's rotations in the baseline (so they would
+    never reach disk on the subsequent save).
+
+    When ``refreshed`` is ``False`` the snapshot is ``None`` (no refresh
+    happened; caller's pre-fetch snapshot is still the right baseline).
+    """
     try:
-        csrf, session_id = await _fetch_tokens_with_jar(cookie_jar, storage_path)
-        return csrf, session_id, False
+        route_kwargs: dict[str, Any] = {"authuser": authuser}
+        if account_email is not None:
+            route_kwargs["account_email"] = account_email
+        if force_authuser_query:
+            route_kwargs["force_authuser_query"] = True
+        csrf, session_id = await _fetch_tokens_with_jar(cookie_jar, storage_path, **route_kwargs)
+        return csrf, session_id, False, None
     except ValueError as err:
         if not _should_try_refresh(err):
             raise
@@ -1328,27 +2590,66 @@ async def _fetch_tokens_with_refresh(
             err,
             NOTEBOOKLM_REFRESH_CMD_ENV,
         )
-        refresh_storage_path = storage_path or get_storage_path(profile=profile)
+        # Canonicalize the storage path so different representations of the
+        # same physical file (relative vs absolute, with or without symlinks,
+        # ``~`` shorthand) hash to the same lock-registry / generation key.
+        # ``get_storage_path`` already returns a resolved path, but a
+        # caller-supplied ``storage_path`` may be relative or a symlink.
+        refresh_storage_path = (
+            (storage_path or get_storage_path(profile=profile)).expanduser().resolve()
+        )
         refresh_key = str(refresh_storage_path)
-        refresh_generation = _REFRESH_GENERATIONS.get(refresh_key, 0)
+        # Snapshot the generation BEFORE acquiring the async lock so we can
+        # detect whether a concurrent refresh (potentially on a different
+        # event loop) bumped it while we were waiting. ``_REFRESH_STATE_LOCK``
+        # makes this read atomic with the later check-and-update below.
+        with _REFRESH_STATE_LOCK:
+            refresh_generation = _REFRESH_GENERATIONS.get(refresh_key, 0)
         refresh_token = _REFRESH_ATTEMPTED_CONTEXT.set(True)
         try:
-            async with _REFRESH_LOCK:
-                if _REFRESH_GENERATIONS.get(refresh_key, 0) == refresh_generation:
+            async with _get_refresh_lock(refresh_storage_path):
+                # Re-check under the sync state lock so the check-and-update is
+                # atomic ACROSS event loops. The per-loop asyncio lock only
+                # serializes within a single loop; a second loop sharing this
+                # storage path holds its own asyncio.Lock and could otherwise
+                # race the generation bump.
+                with _REFRESH_STATE_LOCK:
+                    current_generation = _REFRESH_GENERATIONS.get(refresh_key, 0)
+                    should_run_refresh = current_generation == refresh_generation
+                    if should_run_refresh:
+                        # Claim the slot eagerly so any other loop that wakes
+                        # up while ``_run_refresh_cmd`` is in flight sees the
+                        # bump and skips its own refresh.
+                        _REFRESH_GENERATIONS[refresh_key] = refresh_generation + 1
+                if should_run_refresh:
                     await _run_refresh_cmd(refresh_storage_path, profile)
-                    _REFRESH_GENERATIONS[refresh_key] = refresh_generation + 1
                 fresh_jar = build_httpx_cookies_from_storage(refresh_storage_path)
                 _replace_cookie_jar(cookie_jar, fresh_jar)
-            csrf, session_id = await _fetch_tokens_with_jar(cookie_jar, refresh_storage_path)
-            return csrf, session_id, True
+                # Capture the baseline NOW — after the wholesale replacement
+                # but before the retry fetch can mutate the jar.
+                post_refresh_snapshot = snapshot_cookie_jar(cookie_jar)
+            route_kwargs = {"authuser": authuser}
+            if account_email is not None:
+                route_kwargs["account_email"] = account_email
+            if force_authuser_query:
+                route_kwargs["force_authuser_query"] = True
+            csrf, session_id = await _fetch_tokens_with_jar(
+                cookie_jar, refresh_storage_path, **route_kwargs
+            )
+            return csrf, session_id, True, post_refresh_snapshot
         finally:
             _REFRESH_ATTEMPTED_CONTEXT.reset(refresh_token)
 
 
 def _cookie_map_from_jar(cookie_jar: httpx.Cookies) -> DomainCookieMap:
-    """Extract a domain-aware auth cookie map from an httpx cookie jar."""
+    """Extract a path-aware auth cookie map from an httpx cookie jar.
+
+    Path-aware identity (issue #369) keeps two cookies that share ``(name,
+    domain)`` but differ on ``path`` from collapsing into a single map entry
+    on the way into ``AuthTokens.cookies``.
+    """
     return {
-        (cookie.name, cookie.domain): cookie.value
+        (cookie.name, cookie.domain, cookie.path or "/"): cookie.value
         for cookie in cookie_jar.jar
         if cookie.name
         and cookie.domain
@@ -1358,11 +2659,30 @@ def _cookie_map_from_jar(cookie_jar: httpx.Cookies) -> DomainCookieMap:
 
 
 def _update_cookie_input(target: CookieInput, fresh: DomainCookieMap) -> None:
-    """Update caller-provided cookies in place while preserving key style."""
+    """Update caller-provided cookies in place while preserving key style.
+
+    The caller's ``target`` may use any of the three accepted shapes (flat
+    ``name -> value``, legacy ``(name, domain) -> value``, or path-aware
+    ``(name, domain, path) -> value``). The freshly-fetched delta is always the
+    path-aware shape; we collapse it back to the caller's original shape so
+    they don't observe an in-place type change.
+    """
+    if any(isinstance(key, tuple) and len(key) == 2 for key in target):
+        # Legacy 2-tuple caller. Collapse the path dimension by keeping the
+        # first occurrence per (name, domain); for cookies that share name and
+        # domain at distinct paths this is lossy, but legacy callers had no
+        # way to express path either, so this matches their original contract.
+        legacy: dict[tuple[str, str], str] = {}
+        for (name, domain, _path), value in fresh.items():
+            legacy.setdefault((name, domain), value)
+        target.clear()
+        target.update(legacy)  # type: ignore[arg-type]
+        return
+
     use_domain_keys = any(isinstance(key, tuple) for key in target)
     target.clear()
     if use_domain_keys:
-        target.update(fresh)
+        target.update(fresh)  # type: ignore[arg-type]
     else:
         target.update(flatten_cookie_map(fresh))  # type: ignore[arg-type]
 
@@ -1688,7 +3008,12 @@ async def _rotate_cookies(client: httpx.AsyncClient, storage_path: Path | None =
 
 
 async def _fetch_tokens_with_jar(
-    cookie_jar: httpx.Cookies, storage_path: Path | None = None
+    cookie_jar: httpx.Cookies,
+    storage_path: Path | None = None,
+    *,
+    authuser: int = 0,
+    account_email: str | None = None,
+    force_authuser_query: bool = False,
 ) -> tuple[str, str]:
     """Internal: fetch CSRF and session tokens using a pre-built cookie jar.
 
@@ -1704,6 +3029,13 @@ async def _fetch_tokens_with_jar(
         cookie_jar: httpx.Cookies jar with auth cookies (domain-preserving or fallback).
         storage_path: Optional storage_state.json path, forwarded to
             ``_poke_session`` to gate the rotation poke.
+        authuser: Google account index to authenticate as. ``0`` is the
+            default account.
+        account_email: Stable account email to use instead of the integer
+            index when known.
+        force_authuser_query: Append ``?authuser=0`` when callers explicitly
+            requested account index 0. Implicit default-account calls leave the
+            URL byte-identical to pre-multi-account behavior.
 
     Returns:
         Tuple of (csrf_token, session_id)
@@ -1717,8 +3049,11 @@ async def _fetch_tokens_with_jar(
     async with httpx.AsyncClient(cookies=cookie_jar) as client:
         await _poke_session(client, storage_path)
 
+        url = f"{get_base_url()}/"
+        if account_email or authuser or force_authuser_query:
+            url = f"{url}?{authuser_query(authuser, account_email)}"
         response = await client.get(
-            "https://notebooklm.google.com/",
+            url,
             follow_redirects=True,
             timeout=30.0,
         )
@@ -1746,8 +3081,37 @@ async def _fetch_tokens_with_jar(
         return csrf, session_id
 
 
+def _resolve_token_route_kwargs(
+    storage_path: Path | None,
+    *,
+    authuser: int | None,
+    account_email: str | None,
+) -> dict[str, Any]:
+    """Resolve token-fetch routing while preserving explicit caller intent."""
+    explicit_authuser = authuser is not None
+    resolved_authuser = get_authuser_for_storage(storage_path) if authuser is None else authuser
+    if account_email is not None:
+        resolved_account_email = account_email
+    elif explicit_authuser:
+        resolved_account_email = None
+    else:
+        resolved_account_email = get_account_email_for_storage(storage_path)
+
+    route_kwargs: dict[str, Any] = {"authuser": resolved_authuser}
+    if resolved_account_email is not None:
+        route_kwargs["account_email"] = resolved_account_email
+    if explicit_authuser:
+        route_kwargs["force_authuser_query"] = True
+    return route_kwargs
+
+
 async def fetch_tokens(
-    cookies: CookieInput, storage_path: Path | None = None, profile: str | None = None
+    cookies: CookieInput,
+    storage_path: Path | None = None,
+    profile: str | None = None,
+    *,
+    authuser: int | None = None,
+    account_email: str | None = None,
 ) -> tuple[str, str]:
     """Fetch tokens from a cookie mapping. For backward compatibility.
 
@@ -1762,6 +3126,10 @@ async def fetch_tokens(
         cookies: Google auth cookies. Mutated in place on refresh.
         storage_path: Optional storage_state.json path to reload after refresh.
         profile: Optional profile name exposed to the refresh command.
+        authuser: Optional explicit Google account index. Defaults to the
+            persisted profile value, or 0 when none exists.
+        account_email: Optional explicit Google account email. When provided,
+            it is used as the auth routing value instead of the integer index.
 
     Returns:
         Tuple of (csrf_token, session_id)
@@ -1772,7 +3140,14 @@ async def fetch_tokens(
         RuntimeError: If ``NOTEBOOKLM_REFRESH_CMD`` is set but fails
     """
     jar = build_cookie_jar(cookies=cookies, storage_path=storage_path)
-    csrf, session_id, refreshed = await _fetch_tokens_with_refresh(jar, storage_path, profile)
+    route_kwargs = _resolve_token_route_kwargs(
+        storage_path,
+        authuser=authuser,
+        account_email=account_email,
+    )
+    csrf, session_id, refreshed, _post_refresh_snapshot = await _fetch_tokens_with_refresh(
+        jar, storage_path, profile, **route_kwargs
+    )
     if refreshed:
         fresh = _cookie_map_from_jar(jar)
         _update_cookie_input(cookies, fresh)
@@ -1780,7 +3155,11 @@ async def fetch_tokens(
 
 
 async def fetch_tokens_with_domains(
-    path: Path | None = None, profile: str | None = None
+    path: Path | None = None,
+    profile: str | None = None,
+    *,
+    authuser: int | None = None,
+    account_email: str | None = None,
 ) -> tuple[str, str]:
     """Fetch tokens with domain-preserving cookies from storage.
 
@@ -1791,6 +3170,10 @@ async def fetch_tokens_with_domains(
     Args:
         path: Path to storage_state.json. If provided, takes precedence over env vars.
         profile: Optional profile name exposed to the refresh command.
+        authuser: Optional explicit Google account index. Defaults to the
+            persisted profile value, or 0 when none exists.
+        account_email: Optional explicit Google account email. When provided,
+            it is used as the auth routing value instead of the integer index.
 
     Returns:
         Tuple of (csrf_token, session_id)
@@ -1804,6 +3187,19 @@ async def fetch_tokens_with_domains(
     if path is None and (profile is not None or "NOTEBOOKLM_AUTH_JSON" not in os.environ):
         path = get_storage_path(profile=profile)
     jar = build_httpx_cookies_from_storage(path)
-    csrf, session_id, _ = await _fetch_tokens_with_refresh(jar, path, profile)
-    save_cookies_to_storage(jar, path)
+    route_kwargs = _resolve_token_route_kwargs(path, authuser=authuser, account_email=account_email)
+    # Capture the open-time snapshot before any rotation could fire. The
+    # snapshot is the input to the dirty-flag/delta merge that closes the
+    # stale-overwrite-fresh race (docs/auth-keepalive.md §3.4.1).
+    snapshot = snapshot_cookie_jar(jar)
+    csrf, session_id, refreshed, post_refresh_snapshot = await _fetch_tokens_with_refresh(
+        jar, path, profile, **route_kwargs
+    )
+    if refreshed and post_refresh_snapshot is not None:
+        # NOTEBOOKLM_REFRESH_CMD replaced the jar wholesale. Use the snapshot
+        # captured immediately after the replacement (before the retry fetch
+        # added redirect Set-Cookies); re-snapshotting here would let those
+        # retry rotations be absorbed into the baseline and never reach disk.
+        snapshot = post_refresh_snapshot
+    save_cookies_to_storage(jar, path, original_snapshot=snapshot)
     return csrf, session_id

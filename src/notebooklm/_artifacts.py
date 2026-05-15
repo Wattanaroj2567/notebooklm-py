@@ -7,18 +7,24 @@ Quizzes, Flashcards, Infographics, Slide Decks, Data Tables, and Mind Maps.
 
 import asyncio
 import builtins
+import contextlib
 import csv
 import html
 import json
 import logging
+import os
 import re
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
 
+from . import _mind_map
 from ._core import ClientCore
+from ._env import get_default_language
 from .auth import load_httpx_cookies
 from .exceptions import ValidationError
 from .rpc import (
@@ -30,16 +36,21 @@ from .rpc import (
     InfographicDetail,
     InfographicOrientation,
     InfographicStyle,
+    NetworkError,
     QuizDifficulty,
     QuizQuantity,
     ReportFormat,
     RPCError,
     RPCMethod,
+    RPCTimeoutError,
+    ServerError,
     SlideDeckFormat,
     SlideDeckLength,
     VideoFormat,
     VideoStyle,
     artifact_status_to_str,
+    nest_source_ids,
+    safe_index,
 )
 from .types import (
     Artifact,
@@ -55,6 +66,9 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of retries for transient errors during artifact polling
+POLL_MAX_RETRIES = 3
+
 # Media artifact types that require URL availability before reporting completion
 _MEDIA_ARTIFACT_TYPES = frozenset(
     {
@@ -66,7 +80,31 @@ _MEDIA_ARTIFACT_TYPES = frozenset(
 )
 
 if TYPE_CHECKING:
-    from ._notes import NotesAPI
+    from ._notes import NotesAPI  # retained for backward-compatible type hints
+
+
+@dataclass(frozen=False)
+class DownloadResult:
+    """Outcome of a multi-URL download batch.
+
+    Replaces the v0 silent-partial-failure behavior where `_download_urls_batch`
+    returned only successful paths. Callers can now distinguish "all succeeded"
+    from "partial" via the properties below.
+
+    `succeeded`: paths that downloaded cleanly (matches existing list[str] shape).
+    `failed`: (url, exception) tuples for transient httpx / ValueError failures.
+    """
+
+    succeeded: list[str] = field(default_factory=list)
+    failed: list[tuple[str, Exception]] = field(default_factory=list)
+
+    @property
+    def all_succeeded(self) -> bool:
+        return not self.failed
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.succeeded) and bool(self.failed)
 
 
 def _extract_app_data(html_content: str) -> dict:
@@ -212,7 +250,7 @@ class ArtifactsAPI:
     Reports, Quizzes, Flashcards, Infographics, Slide Decks, Data Tables, and Mind Maps.
 
     Usage:
-        async with NotebookLMClient.from_storage() as client:
+        async with await NotebookLMClient.from_storage() as client:
             # Generate
             status = await client.artifacts.generate_audio(notebook_id)
             await client.artifacts.wait_for_completion(notebook_id, status.task_id)
@@ -228,18 +266,27 @@ class ArtifactsAPI:
     def __init__(
         self,
         core: ClientCore,
-        notes_api: "NotesAPI",
+        notes_api: "NotesAPI | None" = None,
         storage_path: Path | None = None,
     ):
         """Initialize the artifacts API.
 
         Args:
             core: The core client infrastructure.
-            notes_api: The notes API for accessing notes/mind maps.
+            notes_api: Deprecated. Retained as an optional, ignored
+                keyword for backward compatibility — ``ArtifactsAPI`` no
+                longer depends on :class:`NotesAPI`. Mind-map RPC
+                primitives are accessed directly through the
+                :mod:`_mind_map` module, so the construction order of
+                ``client.artifacts`` and ``client.notes`` is no longer
+                significant.
             storage_path: Path to storage state file for loading download cookies.
         """
         self._core = core
-        self._notes = notes_api
+        # ``notes_api`` is intentionally not stored — it is accepted only
+        # so that existing call sites (tests, third-party code) keep
+        # working through the deprecation cycle.
+        del notes_api
         self._storage_path = storage_path
 
     # =========================================================================
@@ -291,7 +338,7 @@ class ArtifactsAPI:
         # Fetch mind maps from notes system (if not filtering to non-mind-map type)
         if artifact_type is None or artifact_type == ArtifactType.MIND_MAP:
             try:
-                mind_maps = await self._notes.list_mind_maps(notebook_id)
+                mind_maps = await _mind_map.list_mind_maps(self._core, notebook_id)
                 for mm_data in mind_maps:
                     mind_map_artifact = Artifact.from_mind_map(mm_data)
                     if mind_map_artifact is not None:  # None means deleted (status=2)
@@ -362,7 +409,7 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
         audio_format: AudioFormat | None = None,
         audio_length: AudioLength | None = None,
@@ -372,7 +419,8 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Custom instructions for the podcast hosts.
             audio_format: DEEP_DIVE, BRIEF, CRITIQUE, or DEBATE.
             audio_length: SHORT, DEFAULT, or LONG.
@@ -380,11 +428,13 @@ class ArtifactsAPI:
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
+        source_ids_double = nest_source_ids(source_ids, 1)
 
         format_code = audio_format.value if audio_format else None
         length_code = audio_length.value if audio_length else None
@@ -395,7 +445,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                1,  # ArtifactTypeCode.AUDIO
+                ArtifactTypeCode.AUDIO.value,
                 source_ids_triple,
                 None,
                 None,
@@ -419,32 +469,57 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
         video_format: VideoFormat | None = None,
         video_style: VideoStyle | None = None,
+        style_prompt: str | None = None,
     ) -> GenerationStatus:
         """Generate a Video Overview.
 
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Custom instructions for video generation.
             video_format: EXPLAINER or BRIEF.
             video_style: AUTO_SELECT, CLASSIC, WHITEBOARD, etc.
+            style_prompt: Custom visual style instructions. Requires
+                ``video_style=VideoStyle.CUSTOM``.
 
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
+        normalized_style_prompt = style_prompt.strip() if style_prompt is not None else None
+        if video_format == VideoFormat.CINEMATIC and normalized_style_prompt:
+            raise ValidationError("style_prompt is not supported for cinematic videos")
+        if video_style == VideoStyle.CUSTOM and not normalized_style_prompt:
+            raise ValidationError("style_prompt is required when video_style is CUSTOM")
+        if normalized_style_prompt and video_style != VideoStyle.CUSTOM:
+            raise ValidationError("style_prompt requires video_style=VideoStyle.CUSTOM")
+
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
+        source_ids_double = nest_source_ids(source_ids, 1)
 
         format_code = video_format.value if video_format else None
         style_code = video_style.value if video_style else None
+
+        video_config = [
+            source_ids_double,
+            language,
+            instructions,
+            None,
+            format_code,
+            style_code,
+        ]
+        if normalized_style_prompt:
+            video_config.append(normalized_style_prompt)
 
         params = [
             [2],
@@ -452,7 +527,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                3,  # ArtifactTypeCode.VIDEO
+                ArtifactTypeCode.VIDEO.value,
                 source_ids_triple,
                 None,
                 None,
@@ -461,14 +536,7 @@ class ArtifactsAPI:
                 [
                     None,
                     None,
-                    [
-                        source_ids_double,
-                        language,
-                        instructions,
-                        None,
-                        format_code,
-                        style_code,
-                    ],
+                    video_config,
                 ],
             ],
         ]
@@ -478,7 +546,7 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
     ) -> GenerationStatus:
         """Generate a Cinematic Video Overview.
@@ -498,17 +566,20 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Custom instructions for video generation.
 
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
+        source_ids_double = nest_source_ids(source_ids, 1)
 
         params = [
             [2],
@@ -542,7 +613,7 @@ class ArtifactsAPI:
         notebook_id: str,
         report_format: ReportFormat = ReportFormat.BRIEFING_DOC,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         custom_prompt: str | None = None,
         extra_instructions: str | None = None,
     ) -> GenerationStatus:
@@ -552,7 +623,8 @@ class ArtifactsAPI:
             notebook_id: The notebook ID.
             report_format: BRIEFING_DOC, STUDY_GUIDE, BLOG_POST, or CUSTOM.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             custom_prompt: Prompt for CUSTOM format. Falls back to a generic
                 default if None.
             extra_instructions: Additional instructions appended to the built-in
@@ -562,6 +634,8 @@ class ArtifactsAPI:
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
@@ -604,8 +678,8 @@ class ArtifactsAPI:
         config = format_configs[report_format]
         if extra_instructions and report_format != ReportFormat.CUSTOM:
             config = {**config, "prompt": f"{config['prompt']}\n\n{extra_instructions}"}
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
-        source_ids_double = [[sid] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
+        source_ids_double = nest_source_ids(source_ids, 1)
 
         params = [
             [2],
@@ -613,7 +687,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                2,  # ArtifactTypeCode.REPORT
+                ArtifactTypeCode.REPORT.value,
                 source_ids_triple,
                 None,
                 None,
@@ -639,7 +713,7 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         extra_instructions: str | None = None,
     ) -> GenerationStatus:
         """Generate a study guide report.
@@ -649,12 +723,15 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             extra_instructions: Additional instructions appended to the default template.
 
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         return await self.generate_report(
             notebook_id,
             report_format=ReportFormat.STUDY_GUIDE,
@@ -686,7 +763,7 @@ class ArtifactsAPI:
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
         quantity_code = quantity.value if quantity else None
         difficulty_code = difficulty.value if difficulty else None
 
@@ -696,7 +773,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                4,  # ArtifactTypeCode.QUIZ_FLASHCARD
+                ArtifactTypeCode.QUIZ_FLASHCARD.value,
                 source_ids_triple,
                 None,
                 None,
@@ -743,7 +820,7 @@ class ArtifactsAPI:
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
         quantity_code = quantity.value if quantity else None
         difficulty_code = difficulty.value if difficulty else None
 
@@ -753,7 +830,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                4,  # ArtifactTypeCode.QUIZ_FLASHCARD
+                ArtifactTypeCode.QUIZ_FLASHCARD.value,
                 source_ids_triple,
                 None,
                 None,
@@ -780,7 +857,7 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
         orientation: InfographicOrientation | None = None,
         detail_level: InfographicDetail | None = None,
@@ -791,7 +868,8 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Custom instructions for infographic generation.
             orientation: LANDSCAPE, PORTRAIT, or SQUARE.
             detail_level: CONCISE, STANDARD, or DETAILED.
@@ -800,10 +878,12 @@ class ArtifactsAPI:
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
         orientation_code = orientation.value if orientation else None
         detail_code = detail_level.value if detail_level else None
         style_code = style.value if style else None
@@ -814,7 +894,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                7,  # ArtifactTypeCode.INFOGRAPHIC
+                ArtifactTypeCode.INFOGRAPHIC.value,
                 source_ids_triple,
                 None,
                 None,
@@ -835,7 +915,7 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
         slide_format: SlideDeckFormat | None = None,
         slide_length: SlideDeckLength | None = None,
@@ -845,7 +925,8 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Custom instructions for slide deck generation.
             slide_format: DETAILED_DECK or PRESENTER_SLIDES.
             slide_length: DEFAULT or SHORT.
@@ -853,10 +934,12 @@ class ArtifactsAPI:
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
         format_code = slide_format.value if slide_format else None
         length_code = slide_length.value if slide_length else None
 
@@ -866,7 +949,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                8,  # ArtifactTypeCode.SLIDE_DECK
+                ArtifactTypeCode.SLIDE_DECK.value,
                 source_ids_triple,
                 None,
                 None,
@@ -922,9 +1005,6 @@ class ArtifactsAPI:
                 source_path=f"/notebook/{notebook_id}",
                 allow_null=True,
             )
-            if result is None:
-                logger.warning("REVISE_SLIDE returned null result for artifact %s", artifact_id)
-            return self._parse_generation_result(result)
         except RPCError as e:
             if e.rpc_code == "USER_DISPLAYABLE_ERROR":
                 return GenerationStatus(
@@ -934,12 +1014,19 @@ class ArtifactsAPI:
                     error_code=str(e.rpc_code) if e.rpc_code is not None else None,
                 )
             raise
+        if result is None:
+            logger.warning("REVISE_SLIDE returned null result for artifact %s", artifact_id)
+        # Parse outside the try/except so a strict-mode UnknownRPCMethodError
+        # (DecodingError -> RPCError) is not swallowed by the rpc_code guard
+        # above. Schema drift is a separate signal from quota/displayable
+        # errors and must surface to callers under strict decoding.
+        return self._parse_generation_result(result, method_id=RPCMethod.REVISE_SLIDE.value)
 
     async def generate_data_table(
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
     ) -> GenerationStatus:
         """Generate a data table.
@@ -947,16 +1034,19 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Description of desired table structure.
 
         Returns:
             GenerationStatus with task_id for polling.
         """
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_triple = [[[sid]] for sid in source_ids] if source_ids else []
+        source_ids_triple = nest_source_ids(source_ids, 2)
 
         params = [
             [2],
@@ -964,7 +1054,7 @@ class ArtifactsAPI:
             [
                 None,
                 None,
-                9,  # ArtifactTypeCode.DATA_TABLE
+                ArtifactTypeCode.DATA_TABLE.value,
                 source_ids_triple,
                 None,
                 None,
@@ -989,7 +1079,7 @@ class ArtifactsAPI:
         self,
         notebook_id: str,
         source_ids: builtins.list[str] | None = None,
-        language: str = "en",
+        language: str | None = None,
         instructions: str | None = None,
     ) -> dict[str, Any]:
         """Generate an interactive mind map.
@@ -1000,7 +1090,8 @@ class ArtifactsAPI:
         Args:
             notebook_id: The notebook ID.
             source_ids: Source IDs to include. If None, uses all sources.
-            language: Language code (default: "en").
+            language: Language code. If None, uses the ``NOTEBOOKLM_HL``
+                environment variable, defaulting to ``"en"``.
             instructions: Custom instructions for the mind map.
 
         Returns:
@@ -1008,10 +1099,12 @@ class ArtifactsAPI:
         """
         import json as json_module
 
+        if language is None:
+            language = get_default_language()
         if source_ids is None:
             source_ids = await self._core.get_source_ids(notebook_id)
 
-        source_ids_nested = [[[sid]] for sid in source_ids] if source_ids else []
+        source_ids_nested = nest_source_ids(source_ids, 2)
 
         params = [
             source_ids_nested,
@@ -1054,7 +1147,9 @@ class ArtifactsAPI:
 
                 # The GENERATE_MIND_MAP RPC generates content but does NOT persist it.
                 # We must explicitly create a note to save the mind map.
-                note = await self._notes.create(notebook_id, title=title, content=mind_map_json)
+                note = await _mind_map.create_note(
+                    self._core, notebook_id, title=title, content=mind_map_json
+                )
                 note_id = note.id if note else None
 
                 return {
@@ -1083,25 +1178,13 @@ class ArtifactsAPI:
         """
         artifacts_data = await self._list_raw(notebook_id)
 
-        # Filter for completed audio artifacts
-        audio_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.AUDIO
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            audio_art = next((a for a in audio_candidates if a[0] == artifact_id), None)
-            if not audio_art:
-                raise ArtifactNotReadyError("audio", artifact_id=artifact_id)
-        else:
-            audio_art = audio_candidates[0] if audio_candidates else None
-
-        if not audio_art:
-            raise ArtifactNotReadyError("audio")
+        audio_art = self._select_artifact(
+            artifacts_data,
+            artifact_id,
+            "Audio",
+            "audio",
+            type_code=ArtifactTypeCode.AUDIO,
+        )
 
         # Route through the shared extractor so readiness checks, Artifact.url,
         # GenerationStatus.url, and downloads all agree on the same URL.
@@ -1130,25 +1213,16 @@ class ArtifactsAPI:
         """
         artifacts_data = await self._list_raw(notebook_id)
 
-        # Filter for completed video artifacts
-        video_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.VIDEO
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            video_art = next((v for v in video_candidates if v[0] == artifact_id), None)
-            if not video_art:
-                raise ArtifactNotReadyError("video", artifact_id=artifact_id)
-        else:
-            video_art = video_candidates[0] if video_candidates else None
-
-        if not video_art:
-            raise ArtifactNotReadyError("video_overview")
+        # Note: distinct error keys preserved — specific-ID miss raises
+        # "video" (from type_name="Video"); empty-list raises
+        # "video_overview" (from type_name_lower).
+        video_art = self._select_artifact(
+            artifacts_data,
+            artifact_id,
+            "Video",
+            "video_overview",
+            type_code=ArtifactTypeCode.VIDEO,
+        )
 
         # Route through the shared extractor so readiness checks, Artifact.url,
         # GenerationStatus.url, and downloads all agree on the same URL.
@@ -1177,25 +1251,13 @@ class ArtifactsAPI:
         """
         artifacts_data = await self._list_raw(notebook_id)
 
-        # Filter for completed infographic artifacts
-        info_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.INFOGRAPHIC
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            info_art = next((i for i in info_candidates if i[0] == artifact_id), None)
-            if not info_art:
-                raise ArtifactNotReadyError("infographic", artifact_id=artifact_id)
-        else:
-            info_art = info_candidates[0] if info_candidates else None
-
-        if not info_art:
-            raise ArtifactNotReadyError("infographic")
+        info_art = self._select_artifact(
+            artifacts_data,
+            artifact_id,
+            "Infographic",
+            "infographic",
+            type_code=ArtifactTypeCode.INFOGRAPHIC,
+        )
 
         # Route through the shared extractor so readiness checks and downloads
         # agree on which URL to select.
@@ -1233,25 +1295,13 @@ class ArtifactsAPI:
 
         artifacts_data = await self._list_raw(notebook_id)
 
-        # Filter for completed slide deck artifacts
-        slide_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 4
-            and a[2] == ArtifactTypeCode.SLIDE_DECK
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        if artifact_id:
-            slide_art = next((s for s in slide_candidates if s[0] == artifact_id), None)
-            if not slide_art:
-                raise ArtifactNotReadyError("slide_deck", artifact_id=artifact_id)
-        else:
-            slide_art = slide_candidates[0] if slide_candidates else None
-
-        if not slide_art:
-            raise ArtifactNotReadyError("slide_deck")
+        slide_art = self._select_artifact(
+            artifacts_data,
+            artifact_id,
+            "Slide deck",
+            "slide_deck",
+            type_code=ArtifactTypeCode.SLIDE_DECK,
+        )
 
         # Extract download URL from metadata at index 16
         # Structure: artifact[16] = [config, title, slides_list, pdf_url, pptx_url]
@@ -1439,16 +1489,13 @@ class ArtifactsAPI:
         """
         artifacts_data = await self._list_raw(notebook_id)
 
-        report_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 7
-            and a[2] == ArtifactTypeCode.REPORT
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        report_art = self._select_artifact(report_candidates, artifact_id, "Report", "report")
+        report_art = self._select_artifact(
+            artifacts_data,
+            artifact_id,
+            "Report",
+            "report",
+            type_code=ArtifactTypeCode.REPORT,
+        )
 
         try:
             content_wrapper = report_art[7]
@@ -1489,7 +1536,7 @@ class ArtifactsAPI:
         Returns:
             The output path where the file was saved.
         """
-        mind_maps = await self._notes.list_mind_maps(notebook_id)
+        mind_maps = await _mind_map.list_mind_maps(self._core, notebook_id)
         if not mind_maps:
             raise ArtifactNotReadyError("mind_map")
 
@@ -1501,8 +1548,13 @@ class ArtifactsAPI:
             mind_map = mind_maps[0]
 
         try:
-            json_string = mind_map[1][1]
-            if not isinstance(json_string, str):
+            # Use the shared extractor so legacy ``[id, content_str]`` rows
+            # work too — direct ``[1][1]`` indexing into a legacy item would
+            # string-index the content (``"…"[1] == "…"`` of length 1) and
+            # then fail downstream JSON parsing instead of returning the real
+            # payload.
+            json_string = _mind_map.extract_content(mind_map)
+            if json_string is None:
                 raise ArtifactParseError("mind_map_content", details="Invalid structure")
 
             json_data = json.loads(json_string)
@@ -1535,16 +1587,17 @@ class ArtifactsAPI:
         """
         artifacts_data = await self._list_raw(notebook_id)
 
-        table_candidates = [
-            a
-            for a in artifacts_data
-            if isinstance(a, list)
-            and len(a) > 18
-            and a[2] == ArtifactTypeCode.DATA_TABLE
-            and a[4] == ArtifactStatus.COMPLETED
-        ]
-
-        table_art = self._select_artifact(table_candidates, artifact_id, "Data table", "data table")
+        table_art = self._select_artifact(
+            artifacts_data,
+            artifact_id,
+            "Data table",
+            # Unified to "data_table" so both empty-list and explicit-id-miss
+            # paths raise ArtifactNotReadyError with the same artifact_type
+            # key. The pre-refactor inline code used "data table" (space) for
+            # the empty case, which made `except` filtering inconsistent.
+            "data_table",
+            type_code=ArtifactTypeCode.DATA_TABLE,
+        )
 
         try:
             raw_data = table_art[18]
@@ -1553,10 +1606,13 @@ class ArtifactsAPI:
             output = Path(output_path)
             output.parent.mkdir(parents=True, exist_ok=True)
 
-            with output.open("w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-                writer.writerows(rows)
+            def _write_csv() -> None:
+                with output.open("w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(rows)
+
+            await asyncio.to_thread(_write_csv)
 
             return str(output)
 
@@ -1731,22 +1787,45 @@ class ArtifactsAPI:
 
         Uses exponential backoff for polling to reduce API load.
 
+        Concurrent callers for the same ``(notebook_id, task_id)`` share a
+        single underlying poll loop via the leader/follower registry on
+        ``ClientCore._pending_polls`` (audit §21 / T7.E2). The first
+        caller is the *leader* and drives the poll loop; subsequent
+        *followers* attach to the leader's future without issuing their
+        own ``LIST_ARTIFACTS`` requests. Cancellation is per-caller —
+        only the cancelled caller's ``await`` raises ``CancelledError``;
+        the underlying poll continues and remaining followers still
+        receive the result.
+
+        Because followers attach to the leader's already-running poll,
+        only the *leader's* ``initial_interval`` / ``max_interval`` /
+        ``timeout`` / ``max_not_found`` / ``min_not_found_window`` apply
+        to the shared poll loop. Followers' values for these parameters
+        are ignored once they attach. This is acceptable for the
+        intended use case (deduping accidental fan-out from the same
+        application) — distinct waiters that genuinely need distinct
+        timeouts should serialize their calls instead.
+
         Args:
             notebook_id: The notebook ID.
             task_id: The task/artifact ID to wait for.
-            initial_interval: Initial seconds between status checks.
-            max_interval: Maximum seconds between status checks.
-            timeout: Maximum seconds to wait.
+            initial_interval: Initial seconds between status checks
+                (leader only — see note above).
+            max_interval: Maximum seconds between status checks
+                (leader only).
+            timeout: Maximum seconds to wait (leader only).
             poll_interval: Deprecated. Use initial_interval instead.
             max_not_found: Consecutive "not found" polls before treating
                 the task as failed.  When the API removes an artifact
                 from the list (e.g. after a daily-quota rejection), the
                 poller would otherwise spin until *timeout*.  Defaults
                 to 5 to tolerate brief replication lag and slow networks.
+                (Leader only.)
             min_not_found_window: Minimum seconds that must have elapsed
                 since the *first* not-found response before a consecutive
                 run triggers failure.  This avoids false positives on
                 slow or unreliable networks.  Defaults to 10.0.
+                (Leader only.)
 
         Returns:
             Final GenerationStatus.
@@ -1765,15 +1844,138 @@ class ArtifactsAPI:
             )
             initial_interval = poll_interval
 
+        pending = self._core._pending_polls
+        key = (notebook_id, task_id)
+
+        existing = pending.get(key)
+        if existing is not None:
+            # Follower path. ``asyncio.shield`` ensures that *this* caller's
+            # cancellation does not propagate into the shared future; the
+            # leader's poll task continues on behalf of every other follower.
+            return await asyncio.shield(existing[0])
+
+        # Leader path. Create the shared future, spawn the poll task,
+        # register the pair so any follower can attach. Both the future
+        # and the task live in the registry entry — the task reference
+        # alone is what anchors the running poll against GC (Python's
+        # task-GC contract is permissive; see asyncio C4 lesson /
+        # Python 3.11+ task GC fix). The done-callback pops the entry
+        # on every termination path (success / exception / cancel) so
+        # the registry cannot leak.
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[GenerationStatus] = loop.create_future()
+
+        # Consume any exception set on the future if no caller ever
+        # retrieves it (e.g. leader cancelled with no followers). Without
+        # this, ``set_exception`` on an unawaited future logs
+        # "Future exception was never retrieved" at GC time.
+        def _consume_orphan_exception(fut: asyncio.Future[GenerationStatus]) -> None:
+            if not fut.cancelled():
+                # ``exception()`` clears the _log_traceback flag inside the
+                # future. We intentionally drop the value.
+                fut.exception()
+
+        future.add_done_callback(_consume_orphan_exception)
+
+        poll_task = asyncio.create_task(
+            self._run_poll_loop(
+                notebook_id,
+                task_id,
+                initial_interval=initial_interval,
+                max_interval=max_interval,
+                timeout=timeout,
+                max_not_found=max_not_found,
+                min_not_found_window=min_not_found_window,
+            ),
+            name=f"artifact-poll-{notebook_id}-{task_id}",
+        )
+
+        pending[key] = (future, poll_task)
+
+        def _on_poll_done(task: asyncio.Task[GenerationStatus]) -> None:
+            # Pop the registry entry first so a follower that arrives
+            # concurrently with completion either (a) attaches to the
+            # already-resolved future and gets the cached result, or
+            # (b) misses the entry entirely and starts a fresh poll for
+            # the *next* generation. Either is correct.
+            pending.pop(key, None)
+            # Inside this callback there are no ``await`` points, so
+            # the single-threaded asyncio model guarantees ``future`` is
+            # still pending — assert that invariant rather than guard
+            # silently. A regression in callback ordering would surface
+            # loudly instead of dropping a result on the floor.
+            assert not future.done(), "future resolved before poll task done-callback"
+            if task.cancelled():
+                # The poll task itself was cancelled. Followers shield
+                # the future and the leader's cancel doesn't propagate
+                # to the task, so this is exceedingly rare — but if it
+                # happens, surface ``CancelledError`` to attached waiters.
+                future.cancel()
+                return
+            exc = task.exception()
+            if exc is not None:
+                future.set_exception(exc)
+                return
+            future.set_result(task.result())
+
+        poll_task.add_done_callback(_on_poll_done)
+
+        # Leader awaits via ``asyncio.shield`` so that the leader's
+        # cancellation unwinds locally without taking down the shared
+        # poll. The shielded poll task continues until the done-callback
+        # fires; remaining followers still receive the result.
+        return await asyncio.shield(future)
+
+    async def _run_poll_loop(
+        self,
+        notebook_id: str,
+        task_id: str,
+        *,
+        initial_interval: float,
+        max_interval: float,
+        timeout: float,
+        max_not_found: int,
+        min_not_found_window: float,
+    ) -> GenerationStatus:
+        """The actual polling loop. Driven by the leader's shielded task.
+
+        This is intentionally private and parameter-keyword-only — direct
+        callers should always go through ``wait_for_completion`` so the
+        leader/follower dedupe is honored.
+        """
         start_time = asyncio.get_running_loop().time()
         current_interval = initial_interval
         consecutive_not_found = 0
         total_not_found = 0
+        poll_retry_count = 0
         first_not_found_time: float | None = None
         last_status: str | None = None
 
         while True:
-            status = await self.poll_status(notebook_id, task_id)
+            try:
+                status = await self.poll_status(notebook_id, task_id)
+            except (NetworkError, RPCTimeoutError, ServerError) as e:
+                # Transient — retry up to POLL_MAX_RETRIES times with exponential
+                # backoff capped at 8s. Also clamp by remaining timeout budget so
+                # the retry path never extends wall-clock past the caller's
+                # `timeout` parameter; raise if there's no headroom left.
+                if poll_retry_count >= POLL_MAX_RETRIES:
+                    raise
+                remaining = timeout - (asyncio.get_running_loop().time() - start_time)
+                if remaining <= 0:
+                    raise
+                poll_retry_count += 1
+                backoff = min(2**poll_retry_count, 8.0, remaining)
+                logger.warning(
+                    "wait_for_completion: transient %s on poll #%d, retrying in %.1fs",
+                    e.__class__.__name__,
+                    poll_retry_count,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            poll_retry_count = 0  # reset on success
             last_status = status.status
 
             if status.is_complete or status.is_failed:
@@ -1999,7 +2201,6 @@ class ArtifactsAPI:
                 source_path=f"/notebook/{notebook_id}",
                 allow_null=True,
             )
-            return self._parse_generation_result(result)
         except RPCError as e:
             if e.rpc_code == "USER_DISPLAYABLE_ERROR":
                 return GenerationStatus(
@@ -2009,6 +2210,11 @@ class ArtifactsAPI:
                     error_code=str(e.rpc_code) if e.rpc_code is not None else None,
                 )
             raise
+        # Parse outside the try/except so a strict-mode UnknownRPCMethodError
+        # (DecodingError -> RPCError) is not swallowed by the rpc_code guard
+        # above. Schema drift is a separate signal from quota/displayable
+        # errors and must surface to callers under strict decoding.
+        return self._parse_generation_result(result, method_id=RPCMethod.CREATE_ARTIFACT.value)
 
     async def _list_raw(self, notebook_id: str) -> builtins.list[Any]:
         """Get raw artifact list data."""
@@ -2028,54 +2234,102 @@ class ArtifactsAPI:
         candidates: builtins.list[Any],
         artifact_id: str | None,
         type_name: str,
-        type_name_lower: str,
+        no_result_error_key: str,
+        *,
+        type_code: ArtifactTypeCode,
     ) -> Any:
-        """Select an artifact from candidates by ID or return first available.
+        """Select an artifact from candidates by ID or return latest completed.
+
+        This is the single point where completed-artifact selection happens.
+        Callers pass the raw artifact list from ``_list_raw``; the helper
+        filters it down to entries matching ``type_code`` with status
+        ``COMPLETED`` before applying the explicit-ID or latest-timestamp
+        rules.
+
+        Note on the length guard: the filter only requires ``len(a) > 4`` —
+        the minimum needed to read ``a[2]`` (type) and ``a[4]`` (status). The
+        old inline filters in ``download_report`` and ``download_data_table``
+        used stricter length checks (``> 7`` / ``> 18``). A completed-but-too-
+        short artifact now passes this filter and surfaces as
+        ``ArtifactParseError`` from the downstream extractor instead of
+        ``ArtifactNotReadyError`` from the candidate filter. In practice the
+        API returns consistent structures, and downstream paths already wrap
+        ``IndexError``/``TypeError`` into ``ArtifactParseError``.
 
         Args:
-            candidates: List of candidate artifacts.
-            artifact_id: Specific artifact ID to select, or None for first.
-            type_name: Display name for error messages (e.g., "Report").
-            type_name_lower: Lowercase name for error messages (e.g., "report").
+            candidates: Raw artifact list (typically from ``_list_raw``).
+            artifact_id: Specific artifact ID to select, or None for latest.
+            type_name: Display name (e.g., "Audio", "Slide deck"). Used for
+                the explicit-id-miss error key — lowercased with spaces turned
+                into underscores (e.g., "Slide deck" -> "slide_deck").
+            no_result_error_key: Error key used when no candidate survives
+                filtering. Most callers pass ``type_name.lower()`` but some
+                (e.g. ``download_video``) intentionally pass a distinct key
+                (``"video_overview"``) to preserve historical exception keys.
+                Named ``no_result_error_key`` (rather than something like
+                ``type_name_lower``) because it is not in general the
+                lowercase of ``type_name`` — see ``download_video``.
+            type_code: ArtifactTypeCode used to filter candidates by type.
 
         Returns:
             Selected artifact data.
 
         Raises:
-            ValueError: If artifact not found or no candidates available.
+            ArtifactNotReadyError: If artifact not found or no candidates
+                available after filtering.
         """
+        # Filter by type + completed-status. Requires at least 5 elements so
+        # we can read a[2] (type) and a[4] (status); downstream parsers raise
+        # ArtifactParseError if specific deeper indices are missing.
+        filtered = [
+            a
+            for a in candidates
+            if isinstance(a, list)
+            and len(a) > 4
+            and a[2] == type_code
+            and a[4] == ArtifactStatus.COMPLETED
+        ]
+
         if artifact_id:
-            artifact = next((a for a in candidates if a[0] == artifact_id), None)
+            artifact = next((a for a in filtered if a[0] == artifact_id), None)
             if not artifact:
                 raise ArtifactNotReadyError(
                     type_name.lower().replace(" ", "_"), artifact_id=artifact_id
                 )
             return artifact
 
-        if not candidates:
-            raise ArtifactNotReadyError(type_name_lower)
+        if not filtered:
+            raise ArtifactNotReadyError(no_result_error_key)
 
         # Sort by creation timestamp (descending) to get the latest.
-        # Timestamp is at index 15, position 0.
-        candidates.sort(
-            key=lambda a: a[15][0] if len(a) > 15 and isinstance(a[15], list) and a[15] else 0,
+        # Timestamp is the raw API field at index 15, position 0. Falsy
+        # values at that position (``None``, ``0``) fall back to ``0`` so we
+        # never compare ``None`` against ``int`` during the sort.
+        filtered.sort(
+            key=lambda a: (
+                (a[15][0] or 0) if len(a) > 15 and isinstance(a[15], list) and a[15] else 0
+            ),
             reverse=True,
         )
 
-        return candidates[0]
+        return filtered[0]
 
     async def _download_urls_batch(
         self, urls_and_paths: builtins.list[tuple[str, str]]
-    ) -> builtins.list[str]:
+    ) -> "DownloadResult":
         """Download multiple files using httpx with proper cookie handling.
 
         Args:
             urls_and_paths: List of (url, output_path) tuples.
 
         Returns:
-            List of successfully downloaded output paths.
+            DownloadResult with succeeded (paths) and failed ((url, exception)
+            tuples) lists. Transient httpx/ValueError failures land in `failed`
+            so the caller can act on partial success; ArtifactDownloadError
+            (auth / untrusted-domain / HTML response) still propagates and
+            aborts the batch — those are security signals, not transient.
         """
-        downloaded: list[str] = []
+        result = DownloadResult()
 
         # Load cookies with domain info for cross-domain redirect handling
         cookies = load_httpx_cookies(path=self._storage_path)
@@ -2102,6 +2356,16 @@ class ArtifactsAPI:
                         )
 
                     response = await client.get(url)
+                    if response.status_code in (401, 403):
+                        # Auth-shaped failures are security signals, not
+                        # transient. Surface them so callers re-auth.
+                        raise ArtifactDownloadError(
+                            "media",
+                            details=(
+                                f"Authentication failed (HTTP {response.status_code}) "
+                                f"on {parsed.netloc}{parsed.path}"
+                            ),
+                        )
                     response.raise_for_status()
 
                     content_type = response.headers.get("content-type", "")
@@ -2112,14 +2376,35 @@ class ArtifactsAPI:
 
                     output_file = Path(output_path)
                     output_file.parent.mkdir(parents=True, exist_ok=True)
-                    output_file.write_bytes(response.content)
-                    downloaded.append(output_path)
-                    logger.debug("Downloaded %s (%d bytes)", url[:60], len(response.content))
+                    await asyncio.to_thread(output_file.write_bytes, response.content)
+                    result.succeeded.append(output_path)
+                    # Log host+path only; download URLs may carry capability
+                    # tokens in query params that aren't covered by the
+                    # standard redaction patterns.
+                    logger.debug(
+                        "Downloaded %s%s (%d bytes)",
+                        parsed.netloc,
+                        parsed.path,
+                        len(response.content),
+                    )
 
                 except (httpx.HTTPError, ValueError) as e:
-                    logger.warning("Download failed for %s: %s", url[:60], e)
+                    # str(e) for httpx errors can include the full request URL
+                    # (with capability tokens in query params). Log a safe
+                    # identifier instead.
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        reason = f"HTTP {e.response.status_code}"
+                    else:
+                        reason = e.__class__.__name__
+                    logger.warning(
+                        "Download failed for %s%s: %s",
+                        parsed.netloc,
+                        parsed.path,
+                        reason,
+                    )
+                    result.failed.append((url, e))
 
-        return downloaded
+        return result
 
     async def _download_url(self, url: str, output_path: str) -> str:
         """Download a file from URL using streaming with proper cookie handling.
@@ -2136,7 +2421,14 @@ class ArtifactsAPI:
             The output path on success.
 
         Raises:
-            ArtifactDownloadError: If download fails or authentication expired.
+            ArtifactDownloadError: On any HTTP or network failure. For 401/403
+                responses the message indicates that re-authentication is
+                needed (``try `notebooklm login```), and the exception's
+                ``status_code`` attribute carries the HTTP status. For other
+                HTTP errors ``status_code`` is set to the response code; for
+                transport failures (timeouts, DNS, connection resets) the
+                ``status_code`` is ``None``. Callers no longer see raw
+                ``httpx.HTTPError`` subclasses from this method.
         """
         # Validate URL scheme and domain before sending auth cookies.
         # httpx sends cookies to every request made by the client regardless of
@@ -2153,83 +2445,193 @@ class ArtifactsAPI:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Use temp file to avoid leaving corrupted partial files on failure
-        temp_file = output_file.with_suffix(output_file.suffix + ".tmp")
+        # Use a unique temp file per call (not ``<output>.tmp``) so two
+        # concurrent downloads targeting the same ``output_path`` cannot
+        # interleave bytes into a shared file or have one task's
+        # ``rename`` clobber the other's. ``mkstemp`` creates+opens an
+        # exclusive FD; we close it immediately and re-open via ``open``
+        # in the worker-thread write loop below — passing the raw FD
+        # into ``asyncio.to_thread(f.write, ...)`` would risk Windows
+        # sharing violations and FD leaks across the rename.
+        fd, temp_path_str = tempfile.mkstemp(
+            dir=output_file.parent,
+            prefix=output_file.name + ".",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        temp_file = Path(temp_path_str)
 
-        # Load cookies with domain info for cross-domain redirect handling
-        cookies = load_httpx_cookies(path=self._storage_path)
-
-        # Use granular timeouts: 10s to connect, 30s per chunk read/write
-        # This allows large files to download without timeout while still
-        # detecting network failures quickly
-        timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
-
+        # NOTE: outer try MUST start here, immediately after the temp file
+        # exists on disk, so the ``except BaseException`` cleanup at the
+        # bottom unlinks the empty temp if anything between mkstemp and the
+        # download (e.g. ``load_httpx_cookies``) raises. Pre-existing code
+        # had `temp_file = output_file.with_suffix(...)` which only built a
+        # ``Path`` (no filesystem entry); switching to mkstemp creates the
+        # file immediately, so the cleanup window must widen.
         try:
-            # Nested context managers required: client.stream() returns an async
-            # context manager that must run within the client's scope
-            async with httpx.AsyncClient(  # noqa: SIM117
-                cookies=cookies,
-                follow_redirects=True,
-                timeout=timeout,
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
+            # Load cookies with domain info for cross-domain redirect handling
+            cookies = load_httpx_cookies(path=self._storage_path)
 
-                    content_type = response.headers.get("content-type", "")
-                    if "text/html" in content_type:
-                        raise ArtifactDownloadError(
-                            "media",
-                            details="Download failed: received HTML instead of media file. "
-                            "Authentication may have expired. Run 'notebooklm login'.",
+            # Use granular timeouts: 10s to connect, 30s per chunk read/write
+            # This allows large files to download without timeout while still
+            # detecting network failures quickly
+            timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+
+            try:
+                # Nested context managers required: client.stream() returns an
+                # async context manager that must run within the client's scope
+                async with httpx.AsyncClient(  # noqa: SIM117
+                    cookies=cookies,
+                    follow_redirects=True,
+                    timeout=timeout,
+                ) as client:
+                    async with client.stream("GET", url) as response:
+                        response.raise_for_status()
+
+                        content_type = response.headers.get("content-type", "")
+                        if "text/html" in content_type:
+                            raise ArtifactDownloadError(
+                                "media",
+                                details="Download failed: received HTML instead of media file. "
+                                "Authentication may have expired. Run 'notebooklm login'.",
+                            )
+
+                        # Stream to file in chunks to handle large files efficiently.
+                        # Each per-chunk write is dispatched to a worker thread so the
+                        # event loop isn't blocked on disk I/O; the loop body awaits
+                        # each write before reading the next chunk so the shared file
+                        # handle is never accessed concurrently in normal execution.
+                        #
+                        # Cancellation: ``asyncio.shield`` keeps the in-flight write
+                        # alive across a CancelledError; the except block awaits the
+                        # shielded task to completion BEFORE letting the with-block
+                        # close the file. Without this, the worker thread could touch
+                        # ``f`` after the with-block has started closing it.
+                        total_bytes = 0
+                        with open(temp_file, "wb") as f:
+                            async for chunk in response.aiter_bytes(chunk_size=65536):
+                                write_task = asyncio.create_task(asyncio.to_thread(f.write, chunk))
+                                try:
+                                    await asyncio.shield(write_task)
+                                except asyncio.CancelledError:
+                                    # Narrow to (CancelledError, Exception) so genuine
+                                    # process-level signals (KeyboardInterrupt, SystemExit)
+                                    # still propagate during cleanup.
+                                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                                        await write_task
+                                    raise
+                                total_bytes += len(chunk)
+
+                        if total_bytes == 0:
+                            raise ArtifactDownloadError(
+                                "media",
+                                details=(
+                                    "Download produced 0 bytes -- the remote file may "
+                                    "be missing or empty"
+                                ),
+                            )
+
+                        # Only move to final location on success.
+                        # ``os.replace`` is atomic on POSIX and overwrites on
+                        # Windows; ``Path.rename`` would raise on Windows when
+                        # ``output_file`` already exists.
+                        os.replace(temp_file, output_file)
+                        # Log host+path only; full URLs may carry capability
+                        # tokens in query params (see _download_urls_batch for
+                        # the same redaction pattern).
+                        logger.debug(
+                            "Downloaded %s%s (%d bytes)",
+                            parsed.netloc,
+                            parsed.path,
+                            total_bytes,
                         )
-
-                    # Stream to file in chunks to handle large files efficiently
-                    total_bytes = 0
-                    with open(temp_file, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=65536):
-                            f.write(chunk)
-                            total_bytes += len(chunk)
-
-                    if total_bytes == 0:
-                        raise ArtifactDownloadError(
-                            "media",
-                            details="Download produced 0 bytes -- the remote file may be missing or empty",
-                        )
-
-                    # Only move to final location on success
-                    temp_file.rename(output_file)
-                    logger.debug("Downloaded %s (%d bytes)", url[:60], total_bytes)
-                    return output_path
-        except Exception:
-            # Clean up partial temp file on any failure
+                        return output_path
+            except httpx.HTTPStatusError as e:
+                # HTTP-level failure (4xx/5xx). Translate to ArtifactDownloadError
+                # so callers see a consistent exception type instead of a raw
+                # httpx subclass. 401/403 get an explicit "re-login" hint,
+                # mirroring the message style used by _download_urls_batch.
+                #
+                # Error details use ``parsed.netloc + parsed.path`` rather than
+                # ``url[:N]`` so capability tokens in query params can't leak
+                # into log lines or wrapped exception messages. ``status_code``
+                # rides on the exception attribute, so the message text doesn't
+                # repeat it.
+                if e.response.status_code in (401, 403):
+                    raise ArtifactDownloadError(
+                        "media",
+                        details=(
+                            f"Authentication required for {parsed.netloc}{parsed.path}"
+                            " -- try `notebooklm login`"
+                        ),
+                        cause=e,
+                        status_code=e.response.status_code,
+                    ) from e
+                raise ArtifactDownloadError(
+                    "media",
+                    details=f"HTTP error downloading {parsed.netloc}{parsed.path}",
+                    cause=e,
+                    status_code=e.response.status_code,
+                ) from e
+            except httpx.RequestError as e:
+                # Transport-level failure: timeouts, DNS, TLS, connection
+                # resets, etc. No HTTP response was received, so no status_code.
+                # ``str(e)`` for httpx errors can include the full request URL
+                # (with capability tokens in query params); rely on ``cause=e``
+                # to carry the original exception and keep the message redacted.
+                raise ArtifactDownloadError(
+                    "media",
+                    details=f"Network error downloading {parsed.netloc}{parsed.path}",
+                    cause=e,
+                ) from e
+        except BaseException:
+            # Clean up partial temp file on any failure, including asyncio.CancelledError
+            # (which is a BaseException, not an Exception, in Python 3.8+).
             temp_file.unlink(missing_ok=True)
             raise
 
-    def _parse_generation_result(self, result: Any) -> GenerationStatus:
+    def _parse_generation_result(
+        self,
+        result: Any,
+        *,
+        method_id: str,
+        source: str = "_parse_generation_result",
+    ) -> GenerationStatus:
         """Parse generation API result into GenerationStatus.
 
         The API returns a single ID that serves as both the task_id (for polling
         during generation) and the artifact_id (once complete). This ID is at
         position [0][0] in the response and becomes Artifact.id in the list.
-        """
-        if result and isinstance(result, list) and len(result) > 0:
-            artifact_data = result[0]
-            artifact_id = (
-                artifact_data[0]
-                if isinstance(artifact_data, list) and len(artifact_data) > 0
-                else None
-            )
-            status_code = (
-                artifact_data[4]
-                if isinstance(artifact_data, list) and len(artifact_data) > 4
-                else None
-            )
 
-            if artifact_id:
-                status = (
-                    artifact_status_to_str(status_code) if status_code is not None else "pending"
-                )
-                return GenerationStatus(task_id=artifact_id, status=status)
+        Schema-drift handling is delegated to ``safe_index``: under the default
+        soft-strict mode (``NOTEBOOKLM_STRICT_DECODE=0``) drift returns ``None``
+        and falls through to the legacy "failed" path; under strict mode
+        (``=1``) ``safe_index`` raises ``UnknownRPCMethodError`` so callers can
+        surface schema changes early.
+
+        Args:
+            result: Decoded RPC payload.
+            method_id: Calling RPC method ID (``CREATE_ARTIFACT`` or
+                ``REVISE_SLIDE``) — threaded through to error diagnostics.
+            source: Caller label included in drift logs / exceptions.
+        """
+        artifact_id = safe_index(result, 0, 0, method_id=method_id, source=source)
+
+        if artifact_id:
+            # In every captured CREATE_ARTIFACT / REVISE_SLIDE response we have
+            # observed, ``status_code`` sits at ``result[0][4]``. We treat it
+            # as required: under strict mode, a missing leaf raises
+            # ``UnknownRPCMethodError`` so we learn early if Google starts
+            # omitting it. The ``is not None`` fallback to ``"pending"`` only
+            # exists for soft-mode drift, where ``safe_index`` returns
+            # ``None`` instead of raising.
+            #
+            # Fetching ``status_code`` here (after the ``artifact_id`` check)
+            # avoids emitting a duplicate drift warning when the outer
+            # descent already failed at ``result[0][0]``.
+            status_code = safe_index(result, 0, 4, method_id=method_id, source=source)
+            status = artifact_status_to_str(status_code) if status_code is not None else "pending"
+            return GenerationStatus(task_id=artifact_id, status=status)
 
         return GenerationStatus(
             task_id="", status="failed", error="Generation failed - no artifact_id returned"

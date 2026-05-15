@@ -953,10 +953,16 @@ class TestArtifactErrorPaths:
         auth_tokens,
         httpx_mock: HTTPXMock,
     ):
-        """Test RPC error handling for HTTP 500."""
+        """Test RPC error handling for HTTP 500.
+
+        Uses ``server_error_max_retries=0`` to exercise the immediate-raise
+        path; T3.A adds bounded exponential-backoff retries for 5xx by
+        default, but the error-shape contract on exhaustion is what this test
+        pins down.
+        """
         httpx_mock.add_response(status_code=500)
 
-        async with NotebookLMClient(auth_tokens) as client:
+        async with NotebookLMClient(auth_tokens, server_error_max_retries=0) as client:
             with pytest.raises(RPCError, match="Server error 500"):
                 await client.artifacts.list("nb_123")
 
@@ -1232,10 +1238,12 @@ class TestListMindMapErrorHandling:
         httpx_mock.add_response(content=list_response.encode())
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.artifacts._notes,
-                "list_mind_maps",
-                AsyncMock(side_effect=RPCError("mind map fetch failed")),
+            # After T6.F, ArtifactsAPI reaches mind maps through the
+            # shared ``_mind_map`` module rather than an injected
+            # NotesAPI. Patch the primitive at its consumer-side import.
+            with patch(
+                "notebooklm._artifacts._mind_map.list_mind_maps",
+                new=AsyncMock(side_effect=RPCError("mind map fetch failed")),
             ):
                 result = await client.artifacts.list("nb_123")
 
@@ -1259,10 +1267,9 @@ class TestListMindMapErrorHandling:
         httpx_mock.add_response(content=list_response.encode())
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.artifacts._notes,
-                "list_mind_maps",
-                AsyncMock(side_effect=httpx.HTTPError("connection failed")),
+            with patch(
+                "notebooklm._artifacts._mind_map.list_mind_maps",
+                new=AsyncMock(side_effect=httpx.HTTPError("connection failed")),
             ):
                 result = await client.artifacts.list("nb_123")
 
@@ -1474,14 +1481,21 @@ class TestGenerateMindMapParsing:
         httpx_mock.add_response(content=notebook_response.encode())
         httpx_mock.add_response(content=mindmap_response.encode())
 
-        mock_note = MagicMock()
-        mock_note.id = "note_created_001"
+        from notebooklm.types import Note
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.artifacts._notes,
-                "create",
-                AsyncMock(return_value=mock_note),
+            # After T6.F, mind-map persistence is driven through
+            # ``_mind_map.create_note`` rather than ``NotesAPI.create``.
+            with patch(
+                "notebooklm._artifacts._mind_map.create_note",
+                new=AsyncMock(
+                    return_value=Note(
+                        id="note_created_001",
+                        notebook_id="nb_123",
+                        title="Root Topic",
+                        content=mind_map_json_str,
+                    )
+                ),
             ):
                 result = await client.artifacts.generate_mind_map("nb_123")
 
@@ -1516,14 +1530,19 @@ class TestGenerateMindMapParsing:
         httpx_mock.add_response(content=notebook_response.encode())
         httpx_mock.add_response(content=mindmap_response.encode())
 
-        mock_note = MagicMock()
-        mock_note.id = "note_dict_001"
+        from notebooklm.types import Note
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.artifacts._notes,
-                "create",
-                AsyncMock(return_value=mock_note),
+            with patch(
+                "notebooklm._artifacts._mind_map.create_note",
+                new=AsyncMock(
+                    return_value=Note(
+                        id="note_dict_001",
+                        notebook_id="nb_123",
+                        title="Topic",
+                        content=json.dumps(mind_map_dict),
+                    )
+                ),
             ):
                 result = await client.artifacts.generate_mind_map("nb_123")
 
@@ -2003,8 +2022,13 @@ class TestParseGenerationResult:
         auth_tokens,
         httpx_mock: HTTPXMock,
         build_rpc_response,
+        monkeypatch,
     ):
         """_parse_generation_result returns failed status when result has no artifact_id."""
+        # These tests pin down soft-strict behavior; guard against CI flipping
+        # NOTEBOOKLM_STRICT_DECODE on in the future. Strict-mode coverage of
+        # the same inputs lives in test_artifacts_drift.py.
+        monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
         notebook_response = build_rpc_response(
             RPCMethod.GET_NOTEBOOK,
             [
@@ -2035,8 +2059,10 @@ class TestParseGenerationResult:
         auth_tokens,
         httpx_mock: HTTPXMock,
         build_rpc_response,
+        monkeypatch,
     ):
         """_parse_generation_result returns failed status when result is None."""
+        monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
         notebook_response = build_rpc_response(
             RPCMethod.GET_NOTEBOOK,
             [
@@ -2066,8 +2092,10 @@ class TestParseGenerationResult:
         auth_tokens,
         httpx_mock: HTTPXMock,
         build_rpc_response,
+        monkeypatch,
     ):
         """_parse_generation_result reads status_code from artifact_data[4]."""
+        monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
         notebook_response = build_rpc_response(
             RPCMethod.GET_NOTEBOOK,
             [
@@ -2440,3 +2468,130 @@ class TestWaitForCompletionDeprecated:
                 assert any(issubclass(warning.category, DeprecationWarning) for warning in w)
 
         assert result.status == "completed"
+
+
+def _decoded_request_body(request) -> str:
+    """Return the readable URL-decoded body of the latest CREATE_ARTIFACT POST.
+
+    The batchexecute payload double-encodes the inner params (the f.req
+    array is JSON, and one of its slots is itself a JSON-encoded string),
+    so we further normalise the embedded backslash-escaped quotes back to
+    plain ``"`` to make substring assertions stable.
+    """
+    from urllib.parse import unquote_plus
+
+    raw = unquote_plus(request.content.decode("utf-8"))
+    # Collapse the JSON-in-JSON escaping so that '"ja"' literally appears.
+    return raw.replace('\\"', '"')
+
+
+_LANGUAGE_AWARE_GENERATORS = [
+    "generate_audio",
+    "generate_video",
+    "generate_cinematic_video",
+    "generate_report",
+    "generate_study_guide",
+    "generate_infographic",
+    "generate_slide_deck",
+    "generate_data_table",
+    "generate_mind_map",
+]
+
+
+def _register_generate_responses(method_name: str, httpx_mock, build_rpc_response) -> int:
+    """Register the HTTP responses required for one ``generate_*`` call and
+    return the index of the request that carries the language code.
+
+    Most language-aware generators issue a single CREATE_ARTIFACT call.
+    ``generate_mind_map`` is the outlier: it calls GENERATE_MIND_MAP first,
+    then CREATE_NOTE + UPDATE_NOTE to persist the result. The language code
+    is embedded only in the first request, so the assertion target differs.
+    """
+    if method_name == "generate_mind_map":
+        # GENERATE_MIND_MAP returns mind-map JSON; subsequent note RPCs persist it.
+        httpx_mock.add_response(
+            content=build_rpc_response(
+                RPCMethod.GENERATE_MIND_MAP,
+                [['{"name": "Root", "children": []}', None, ["note_xyz"]]],
+            ).encode()
+        )
+        httpx_mock.add_response(
+            content=build_rpc_response(
+                RPCMethod.CREATE_NOTE,
+                [["note_xyz"]],
+            ).encode()
+        )
+        httpx_mock.add_response(
+            content=build_rpc_response(
+                RPCMethod.UPDATE_NOTE,
+                [["note_xyz"]],
+            ).encode()
+        )
+        return 0  # language travels with the first (GENERATE_MIND_MAP) request
+
+    httpx_mock.add_response(
+        content=build_rpc_response(
+            RPCMethod.CREATE_ARTIFACT,
+            [["artifact_123", "Title", "2024-01-05", None, 1]],
+        ).encode()
+    )
+    return -1  # last (and only) request carries the language
+
+
+class TestGenerateUsesNotebookLMHL:
+    """The 9 language-aware generate_* methods must honor NOTEBOOKLM_HL when
+    the caller does not pass an explicit language argument, and the explicit
+    argument must still win when both are present.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", _LANGUAGE_AWARE_GENERATORS)
+    async def test_generate_uses_env_language_when_none(
+        self,
+        method_name,
+        auth_tokens,
+        httpx_mock: HTTPXMock,
+        build_rpc_response,
+        monkeypatch,
+    ):
+        """NOTEBOOKLM_HL=ja, no language arg -> outgoing RPC carries 'ja'."""
+        monkeypatch.setenv("NOTEBOOKLM_HL", "ja")
+
+        request_index = _register_generate_responses(method_name, httpx_mock, build_rpc_response)
+
+        async with NotebookLMClient(auth_tokens) as client:
+            method = getattr(client.artifacts, method_name)
+            await method(notebook_id="nb_123", source_ids=["src_001"])
+
+        body = _decoded_request_body(httpx_mock.get_requests()[request_index])
+        # The language code is embedded as a quoted JSON string inside the
+        # nested params list. Assert presence/absence.
+        assert '"ja"' in body
+        assert '"en"' not in body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method_name", _LANGUAGE_AWARE_GENERATORS)
+    async def test_generate_explicit_language_overrides_env(
+        self,
+        method_name,
+        auth_tokens,
+        httpx_mock: HTTPXMock,
+        build_rpc_response,
+        monkeypatch,
+    ):
+        """NOTEBOOKLM_HL=ja but explicit language='ko' -> outgoing carries 'ko'."""
+        monkeypatch.setenv("NOTEBOOKLM_HL", "ja")
+
+        request_index = _register_generate_responses(method_name, httpx_mock, build_rpc_response)
+
+        async with NotebookLMClient(auth_tokens) as client:
+            method = getattr(client.artifacts, method_name)
+            await method(
+                notebook_id="nb_123",
+                source_ids=["src_001"],
+                language="ko",
+            )
+
+        body = _decoded_request_body(httpx_mock.get_requests()[request_index])
+        assert '"ko"' in body
+        assert '"ja"' not in body

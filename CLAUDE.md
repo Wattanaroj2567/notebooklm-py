@@ -16,25 +16,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development Commands
 
 ```bash
-# Create/recreate venv with uv (recommended - relocatable venvs)
-uv venv .venv
-uv pip install -e ".[all]"
-playwright install chromium
-
-# Activate virtual environment
+# Canonical contributor install (respects uv.lock; full guide: docs/installation.md)
+uv sync --frozen --extra browser --extra dev --extra markdown
 source .venv/bin/activate
+uv run playwright install chromium
 
 # Run all tests (excluding e2e by default)
-pytest
+uv run pytest
 
 # Run with coverage
-pytest --cov
+uv run pytest --cov
 
 # Run e2e tests (requires authentication)
-pytest tests/e2e -m e2e
+uv run pytest tests/e2e -m e2e
 
 # CLI testing
-notebooklm --help
+uv run notebooklm --help
 ```
 
 ## Pre-Commit Checks (REQUIRED before committing)
@@ -42,22 +39,15 @@ notebooklm --help
 **IMPORTANT:** Always run these checks before committing to avoid CI failures:
 
 ```bash
-# Format code with ruff
-ruff format src/ tests/
-
-# Check for linting issues
-ruff check src/ tests/
-
-# Type checking with mypy
-mypy src/notebooklm --ignore-missing-imports
-
-# Run tests
-pytest
+uv run ruff format .
+uv run ruff check .
+uv run mypy src/notebooklm --ignore-missing-imports
+uv run pytest
 ```
 
 Or use this one-liner:
 ```bash
-ruff format src/ tests/ && ruff check src/ tests/ && mypy src/notebooklm --ignore-missing-imports && pytest
+uv run ruff format . && uv run ruff check . && uv run mypy src/notebooklm --ignore-missing-imports && uv run pytest
 ```
 
 ## Architecture
@@ -121,6 +111,7 @@ src/notebooklm/
 ├── _chat.py             # ChatAPI
 ├── _research.py         # ResearchAPI
 ├── _notes.py            # NotesAPI
+├── notebooklm_cli.py    # Entry-point assembler — imports + registers cli/ groups
 ├── rpc/                 # RPC protocol layer
 │   ├── types.py         # Method IDs and enums
 │   ├── encoder.py       # Request encoding
@@ -181,6 +172,7 @@ Commands are organized as:
 ## Documentation
 
 All docs use lowercase-kebab naming in `docs/`:
+- `docs/installation.md` - Installation, extras matrix, platform notes (canonical install guide)
 - `docs/cli-reference.md` - CLI commands
 - `docs/python-api.md` - Python API reference
 - `docs/configuration.md` - Storage and settings
@@ -235,3 +227,7 @@ gh pr view <PR_NUMBER> --json state,mergeStateStatus,mergeable
 - All CI checks pass
 - All review comments are addressed
 - `mergeStateStatus` is `CLEAN`
+
+### Requesting a Claude review on a PR
+
+Automatic Claude review on every PR is disabled. To request a review, comment `@claude review` on the PR — the `.github/workflows/claude.yml` workflow will pick it up.

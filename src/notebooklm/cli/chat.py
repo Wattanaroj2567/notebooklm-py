@@ -20,10 +20,12 @@ from .helpers import (
     json_output_response,
     require_notebook,
     resolve_notebook_id,
+    resolve_prompt,
     resolve_source_ids,
     set_current_conversation,
     with_client,
 )
+from .options import _complete_sources, json_option, notebook_option, prompt_file_option
 
 logger = logging.getLogger(__name__)
 
@@ -81,37 +83,51 @@ def register_chat_commands(cli):
     """Register chat commands on the main CLI group."""
 
     @cli.command("ask")
-    @click.argument("question")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set)",
-    )
+    @click.argument("question", default="", required=False)
+    @prompt_file_option
+    @notebook_option
     @click.option("--conversation-id", "-c", default=None, help="Continue a specific conversation")
+    @click.option(
+        "--new",
+        "new_conversation",
+        is_flag=True,
+        help="Start a fresh conversation, skipping the auto-resume of the last one.",
+    )
     @click.option(
         "--source",
         "-s",
         "source_ids",
         multiple=True,
         help="Limit to specific source IDs (can be repeated)",
+        shell_complete=_complete_sources,
     )
     @click.option(
         "--json", "json_output", is_flag=True, help="Output as JSON (includes references)"
     )
     @click.option("--save-as-note", is_flag=True, help="Save response as a note")
     @click.option("--note-title", default=None, help="Note title (use with --save-as-note)")
+    @click.option(
+        "--timeout",
+        default=None,
+        type=click.IntRange(min=1),
+        help=(
+            "HTTP request timeout in seconds (default: 30, from the library). "
+            "Increase for long or complex prompts."
+        ),
+    )
     @with_client
     def ask_cmd(
         ctx,
         question,
+        prompt_file,
         notebook_id,
         conversation_id,
+        new_conversation,
         source_ids,
         json_output,
         save_as_note,
         note_title,
+        timeout,
         client_auth,
     ):
         """Ask a notebook a question.
@@ -124,24 +140,40 @@ def register_chat_commands(cli):
         Example:
           notebooklm ask "what are the main themes?"
           notebooklm ask -c <id> "continue this one"
+          notebooklm ask --new "ignore last conversation, start fresh"
           notebooklm ask -s src_001 -s src_002 "question about specific sources"
           notebooklm ask "explain X" --json             # Get answer with source references
           notebooklm ask "explain X" --save-as-note     # Save response as a note
         """
+        if new_conversation and conversation_id:
+            raise click.UsageError(
+                "--new and --conversation-id are mutually exclusive: "
+                "--new starts a fresh conversation while --conversation-id resumes a specific one."
+            )
+        question = resolve_prompt(question, prompt_file, "question", required=True)
         nb_id = require_notebook(notebook_id)
 
+        client_kwargs: dict = {}
+        if timeout is not None:
+            client_kwargs["timeout"] = float(timeout)
+
         async def _run():
-            async with NotebookLMClient(client_auth) as client:
-                nb_id_resolved = await resolve_notebook_id(client, nb_id)
-                effective_conv_id = _determine_conversation_id(
-                    explicit_conversation_id=conversation_id,
-                    explicit_notebook_id=notebook_id,
-                    resolved_notebook_id=nb_id_resolved,
-                    json_output=json_output,
-                )
+            async with NotebookLMClient(client_auth, **client_kwargs) as client:
+                nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+                if new_conversation:
+                    # --new: skip both the local-cache and server-side resume so the
+                    # server treats this turn as the start of a new conversation.
+                    effective_conv_id: str | None = None
+                else:
+                    effective_conv_id = _determine_conversation_id(
+                        explicit_conversation_id=conversation_id,
+                        explicit_notebook_id=notebook_id,
+                        resolved_notebook_id=nb_id_resolved,
+                        json_output=json_output,
+                    )
 
                 resumed_from_server = False
-                if not effective_conv_id:
+                if not new_conversation and not effective_conv_id:
                     # If no conversation ID yet, try to get the most recent one from server
                     effective_conv_id = await _get_latest_conversation_from_server(
                         client, nb_id_resolved, json_output
@@ -149,7 +181,9 @@ def register_chat_commands(cli):
                     if effective_conv_id:
                         resumed_from_server = True
 
-                sources = await resolve_source_ids(client, nb_id_resolved, source_ids)
+                sources = await resolve_source_ids(
+                    client, nb_id_resolved, source_ids, json_output=json_output
+                )
                 result = await client.chat.ask(
                     nb_id_resolved,
                     question,
@@ -199,13 +233,7 @@ def register_chat_commands(cli):
         return _run()
 
     @cli.command("configure")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set)",
-    )
+    @notebook_option
     @click.option(
         "--mode",
         "chat_mode",
@@ -220,8 +248,11 @@ def register_chat_commands(cli):
         default=None,
         help="Response verbosity",
     )
+    @json_option
     @with_client
-    def configure_cmd(ctx, notebook_id, chat_mode, persona, response_length, client_auth):
+    def configure_cmd(
+        ctx, notebook_id, chat_mode, persona, response_length, json_output, client_auth
+    ):
         """Configure chat persona and response settings.
 
         \b
@@ -236,14 +267,15 @@ def register_chat_commands(cli):
           notebooklm configure --mode learning-guide
           notebooklm configure --persona "Act as a chemistry tutor"
           notebooklm configure --mode detailed --response-length longer
+          notebooklm configure --mode concise --json   # Machine-readable output
         """
         nb_id = require_notebook(notebook_id)
 
         async def _run():
-            from ..rpc import ChatGoal, ChatResponseLength
+            from ..types import ChatGoal, ChatResponseLength
 
             async with NotebookLMClient(client_auth) as client:
-                nb_id_resolved = await resolve_notebook_id(client, nb_id)
+                nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
                 if chat_mode:
                     mode_map = {
                         "default": ChatMode.DEFAULT,
@@ -252,6 +284,15 @@ def register_chat_commands(cli):
                         "detailed": ChatMode.DETAILED,
                     }
                     await client.chat.set_mode(nb_id_resolved, mode_map[chat_mode])
+                    if json_output:
+                        json_output_response(
+                            {
+                                "notebook_id": nb_id_resolved,
+                                "mode": chat_mode,
+                                "configured": True,
+                            }
+                        )
+                        return
                     console.print(f"[green]Chat mode set to: {chat_mode}[/green]")
                     return
 
@@ -268,6 +309,22 @@ def register_chat_commands(cli):
                 await client.chat.configure(
                     nb_id_resolved, goal=goal, response_length=length, custom_prompt=persona
                 )
+
+                if json_output:
+                    json_output_response(
+                        {
+                            "notebook_id": nb_id_resolved,
+                            "mode": None,
+                            # Lowercase enum name (e.g. "custom") for a stable,
+                            # human-readable JSON contract. The underlying RPC
+                            # integer is an implementation detail.
+                            "goal": goal.name.lower() if goal else None,
+                            "persona": persona,
+                            "response_length": response_length,
+                            "configured": True,
+                        }
+                    )
+                    return
 
                 parts = []
                 if persona:
@@ -288,19 +345,20 @@ def register_chat_commands(cli):
         return _run()
 
     @cli.command("history")
-    @click.option(
-        "-n",
-        "--notebook",
-        "notebook_id",
-        default=None,
-        help="Notebook ID (uses current if not set)",
-    )
+    @notebook_option
     @click.option("--limit", "-l", default=100, help="Maximum number of Q&A turns to show")
     @click.option("--clear", "clear_cache", is_flag=True, help="Clear local conversation cache")
     @click.option("--save", "save_as_note", is_flag=True, help="Save history as a note")
     @click.option("-t", "--note-title", "note_title", default=None, help="Note title (with --save)")
     @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
     @click.option("--show-all", is_flag=True, help="Show full Q&A content instead of preview")
+    @click.option(
+        "--no-truncate",
+        "no_truncate",
+        is_flag=True,
+        default=False,
+        help="Disable the 50-char preview cap on Question/Answer columns in the table view.",
+    )
     @with_client
     def history_cmd(
         ctx,
@@ -311,6 +369,7 @@ def register_chat_commands(cli):
         note_title,
         json_output,
         show_all,
+        no_truncate,
         client_auth,
     ):
         """Get conversation history or save it as a note.
@@ -326,6 +385,7 @@ def register_chat_commands(cli):
           notebooklm history --save --note-title "Summary"  # Save with custom title
           notebooklm history --json               # Machine-readable JSON output
           notebooklm history --show-all           # Full Q&A content
+          notebooklm history --no-truncate        # Full Q&A content in the table view
         """
 
         async def _run():
@@ -339,7 +399,7 @@ def register_chat_commands(cli):
                     return
 
                 nb_id = require_notebook(notebook_id)
-                nb_id_resolved = await resolve_notebook_id(client, nb_id)
+                nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
                 conv_id = await client.chat.get_conversation_id(nb_id_resolved)
                 qa_pairs = await client.chat.get_history(
                     nb_id_resolved, limit=limit, conversation_id=conv_id
@@ -387,10 +447,21 @@ def register_chat_commands(cli):
                     console.print(f"\n[dim]── {conv_id} ──[/dim]")
                 table = Table()
                 table.add_column("#", style="dim", width=4)
-                table.add_column("Question", style="white", max_width=50)
-                table.add_column("Answer preview", style="dim", max_width=50)
-                for i, (question, answer) in enumerate(qa_pairs, 1):
-                    table.add_row(str(i), question[:50], answer[:50])
+                # P6.T1 / I16: ``--no-truncate`` lifts both the column-level
+                # ``max_width=50`` constraint and the ``[:50]`` cell slice so
+                # the table view can render long Q/A turns in full. Default
+                # behavior is unchanged — the 50-char preview is preserved
+                # to match the existing UX when the flag is not passed.
+                if no_truncate:
+                    table.add_column("Question", style="white", overflow="fold")
+                    table.add_column("Answer", style="dim", overflow="fold")
+                    for i, (question, answer) in enumerate(qa_pairs, 1):
+                        table.add_row(str(i), question, answer)
+                else:
+                    table.add_column("Question", style="white", max_width=50)
+                    table.add_column("Answer preview", style="dim", max_width=50)
+                    for i, (question, answer) in enumerate(qa_pairs, 1):
+                        table.add_row(str(i), question[:50], answer[:50])
                 console.print(table)
                 console.print("\n[dim]Use 'notebooklm history --save' to save as a note.[/dim]")
 

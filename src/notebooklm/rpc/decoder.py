@@ -15,7 +15,10 @@ from ..exceptions import (
     RPCError,
     RPCTimeoutError,
     ServerError,
+    UnknownRPCMethodError,
+    _truncate_response_preview,
 )
+from ._safe_index import safe_index
 
 # Re-export for backward compatibility (imports from notebooklm.rpc.decoder still work)
 __all__ = [
@@ -26,6 +29,7 @@ __all__ = [
     "RateLimitError",
     "ServerError",
     "ClientError",
+    "UnknownRPCMethodError",
     "RPCErrorCode",
     "get_error_message_for_code",
     "strip_anti_xssi",
@@ -33,6 +37,7 @@ __all__ = [
     "collect_rpc_ids",
     "extract_rpc_result",
     "decode_response",
+    "safe_index",
 ]
 
 logger = logging.getLogger(__name__)
@@ -180,18 +185,23 @@ def parse_chunked_response(response: str) -> list[Any]:
         List of parsed JSON chunks
 
     Raises:
-        RPCError: If more than 10% of chunks are malformed, indicating API issues.
+        RPCError: If more than 10% of response records are malformed, indicating API issues.
 
     Note:
-        Malformed chunks are skipped with a warning logged. If the error rate
-        exceeds 10%, raises RPCError as this likely indicates API changes.
+        Malformed chunks are skipped with a warning logged. A byte-count line
+        without a following payload is malformed. A byte-count mismatch is
+        logged but tolerated when the following payload is still valid JSON,
+        because recorded and proxy-transformed streams may not preserve Google's
+        original byte count. If the malformed-record rate exceeds 10%, raises
+        RPCError as this likely indicates API changes.
     """
     if not response or not response.strip():
         return []
 
     chunks = []
     skipped_count = 0
-    lines = response.strip().split("\n")
+    total_records = 0
+    lines = [line.removesuffix("\r") for line in response.strip().split("\n")]
 
     i = 0
     while i < len(lines):
@@ -204,27 +214,44 @@ def parse_chunked_response(response: str) -> list[Any]:
 
         # Try to parse as byte count
         try:
-            int(line)  # Validate it's a byte count (we don't need the value)
+            byte_count = int(line)
+            total_records += 1
             i += 1
 
             # Next line should be JSON payload
-            if i < len(lines):
-                json_str = lines[i]
-                try:
-                    chunk = json.loads(json_str)
-                    chunks.append(chunk)
-                except json.JSONDecodeError as e:
-                    # Skip malformed chunks but warn
-                    skipped_count += 1
-                    logger.warning(
-                        "Skipping malformed chunk at line %d: %s. Preview: %s",
-                        i + 1,
-                        e,
-                        json_str[:100],
-                    )
+            if i >= len(lines):
+                skipped_count += 1
+                logger.warning("Skipping byte-count line %d without payload", i)
+                continue
+
+            json_str = lines[i]
+            actual_byte_count = len(json_str.encode("utf-8"))
+            if actual_byte_count != byte_count:
+                logger.warning(
+                    "Chunk at line %d declares %d bytes but payload is %d bytes; "
+                    "parsing valid JSON payload anyway. Preview: %s",
+                    i + 1,
+                    byte_count,
+                    actual_byte_count,
+                    _truncate_response_preview(json_str),
+                )
+
+            try:
+                chunk = json.loads(json_str)
+                chunks.append(chunk)
+            except json.JSONDecodeError as e:
+                # Skip malformed chunks but warn
+                skipped_count += 1
+                logger.warning(
+                    "Skipping malformed chunk at line %d: %s. Preview: %s",
+                    i + 1,
+                    e,
+                    _truncate_response_preview(json_str),
+                )
             i += 1
         except ValueError:
             # Not a byte count, try to parse as JSON directly
+            total_records += 1
             try:
                 chunk = json.loads(line)
                 chunks.append(chunk)
@@ -235,18 +262,19 @@ def parse_chunked_response(response: str) -> list[Any]:
                     "Skipping non-JSON line at %d: %s. Preview: %s",
                     i + 1,
                     e,
-                    line[:100],
+                    _truncate_response_preview(line),
                 )
             i += 1
 
     # Fail if error rate is too high (indicates API problems)
     if skipped_count > 0:
-        error_rate = skipped_count / len(lines) if lines else 0
+        error_rate = skipped_count / total_records if total_records else 0
         if error_rate > 0.1:  # More than 10% malformed
             raise RPCError(
-                f"Response parsing failed: {skipped_count} of {len(lines)} chunks malformed. "
-                "This may indicate API changes or data corruption.",
-                raw_response=response[:500],
+                f"Response parsing failed: {skipped_count} of {total_records} response records "
+                f"malformed. "
+                f"This may indicate API changes or data corruption.",
+                raw_response=response,
             )
         # Non-critical but warn user results may be incomplete
         logger.warning(
@@ -440,8 +468,13 @@ def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) ->
     chunks = parse_chunked_response(cleaned)
     logger.debug("Parsed %d chunks from response", len(chunks))
 
-    # Create response preview for error context (first 500 chars)
-    response_preview = cleaned[:500] if len(cleaned) > 500 else cleaned
+    # Pass the full cleaned body to exception constructors; ``RPCError.__init__``
+    # routes ``raw_response`` through ``_truncate_response_preview`` so the
+    # truncation contract (and ``NOTEBOOKLM_DEBUG=1`` opt-in) lives in one
+    # place. The one branch that bypasses ``__init__`` (direct attribute set
+    # on an already-constructed exception) calls the helper explicitly at the
+    # call site below.
+    response_preview = cleaned
 
     # Collect all RPC IDs for debugging
     found_ids = collect_rpc_ids(chunks)
@@ -452,22 +485,25 @@ def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) ->
     try:
         result = extract_rpc_result(chunks, rpc_id)
     except RPCError as e:
-        # Add context to errors from extract_rpc_result
+        # Add context to errors from extract_rpc_result. This branch sets
+        # ``raw_response`` directly on an already-constructed exception, so
+        # ``__init__`` does not run again — apply the helper explicitly here
+        # to honor the truncation contract.
         if not e.found_ids:
             e.found_ids = found_ids
         if not e.raw_response:
-            e.raw_response = response_preview
+            e.raw_response = _truncate_response_preview(response_preview)
         raise
 
     if result is None and not allow_null:
         if found_ids and rpc_id not in found_ids:
             # Method ID likely changed - provide actionable error
-            raise RPCError(
+            raise UnknownRPCMethodError(
                 f"No result found for RPC ID '{rpc_id}'. "
                 f"Response contains IDs: {found_ids}. "
                 "The RPC method ID may have changed.",
                 method_id=rpc_id,
-                found_ids=found_ids,
+                found_ids=list(found_ids),
                 raw_response=response_preview,
             )
 

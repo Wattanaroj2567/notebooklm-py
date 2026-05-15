@@ -5,9 +5,11 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ._core import ClientCore
+from ._env import get_base_url
+from ._idempotency import idempotent_create
 from ._settings import build_get_user_settings_params, extract_account_limits
-from .exceptions import NotebookLimitError, RPCError
-from .rpc import RPCMethod
+from .exceptions import NotebookLimitError, NotebookNotFoundError, RPCError
+from .rpc import RPCMethod, safe_index
 from .types import AccountLimits, Notebook, NotebookDescription, SuggestedTopic
 
 if TYPE_CHECKING:
@@ -18,6 +20,11 @@ logger = logging.getLogger(__name__)
 CREATE_NOTEBOOK_QUOTA_RPC_CODE = 3
 
 
+def build_create_notebook_params(title: str) -> list[Any]:
+    """Return the canonical CREATE_NOTEBOOK RPC payload."""
+    return [title, None, None, [2], [1]]
+
+
 class NotebooksAPI:
     """Operations on NotebookLM notebooks.
 
@@ -25,7 +32,7 @@ class NotebooksAPI:
     notebooks, as well as getting AI-generated descriptions.
 
     Usage:
-        async with NotebookLMClient.from_storage() as client:
+        async with await NotebookLMClient.from_storage() as client:
             notebooks = await client.notebooks.list()
             new_nb = await client.notebooks.create("My Research")
             await client.notebooks.rename(new_nb.id, "Better Title")
@@ -68,17 +75,90 @@ class NotebooksAPI:
 
         Returns:
             The created Notebook object.
+
+        Idempotency:
+            T7.B2 — wraps the underlying CREATE_NOTEBOOK RPC in a
+            probe-then-retry loop. On a transient transport failure
+            (5xx / 429 / network), the wrapper lists notebooks and
+            checks whether a new notebook with the requested title
+            appeared since the call started. If exactly one match is
+            found, that notebook is returned without re-issuing the
+            create. If zero matches, the create is retried. If more
+            than one matches, the wrapper raises an :class:`RPCError`
+            because the situation is ambiguous (concurrent creates by
+            other clients) and the caller must intervene.
         """
         logger.debug("Creating notebook: %s", title)
-        params = [title, None, None, [2], [1]]
+        params = build_create_notebook_params(title)
+
+        # Capture the baseline notebook IDs *before* the create so the
+        # probe can distinguish a notebook that landed during this
+        # call from a pre-existing notebook with the same title. The
+        # baseline is best-effort — if listing fails (e.g. transient
+        # 5xx), we fall back to an empty baseline so a brand-new
+        # account behaves correctly.
+        #
+        # Edge case: when the baseline fetch fails AND a pre-existing
+        # notebook with the same title already exists, the probe cannot
+        # tell that notebook apart from one that just landed. The
+        # ambiguous-probe guard only fires when >1 matches appear, so
+        # a single pre-existing same-titled notebook would be returned
+        # as if it were freshly created. This is a doubly-exceptional
+        # scenario (baseline list failure + title collision) and is
+        # accepted as a known limitation; callers needing strict
+        # uniqueness should embed a UUID in the title.
         try:
-            result = await self._core.rpc_call(RPCMethod.CREATE_NOTEBOOK, params)
-        except RPCError as exc:
-            await self._raise_quota_error_if_detected(exc)
-            raise
-        notebook = Notebook.from_api_response(result)
-        logger.debug("Created notebook: %s", notebook.id)
-        return notebook
+            baseline_ids = {nb.id for nb in await self.list()}
+        except Exception:
+            logger.debug(
+                "create: baseline list() failed; falling back to empty baseline",
+                exc_info=True,
+            )
+            baseline_ids = set()
+
+        async def _create() -> Notebook:
+            try:
+                result = await self._core.rpc_call(
+                    RPCMethod.CREATE_NOTEBOOK,
+                    params,
+                    disable_internal_retries=True,
+                )
+            except RPCError as exc:
+                await self._raise_quota_error_if_detected(exc)
+                raise
+            notebook = Notebook.from_api_response(result)
+            logger.debug("Created notebook: %s", notebook.id)
+            return notebook
+
+        async def _probe() -> Notebook | None:
+            try:
+                current = await self.list()
+            except Exception:
+                logger.debug(
+                    "create: probe list() failed; treating as no match",
+                    exc_info=True,
+                )
+                return None
+            matches = [nb for nb in current if nb.id not in baseline_ids and nb.title == title]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                # Ambiguous: more than one new notebook with this title
+                # appeared during the call. We cannot safely pick one;
+                # surface the situation so the caller can resolve it.
+                raise RPCError(
+                    f"Cannot disambiguate notebook with title {title!r}: "
+                    f"probe found {len(matches)} new notebooks with this title "
+                    "after a transport failure. Resolve manually before retrying.",
+                    method_id=RPCMethod.CREATE_NOTEBOOK.value,
+                )
+            return None
+
+        return await idempotent_create(
+            _create,
+            _probe,
+            label=f"notebooks.create[{title!r}]",
+        )
 
     async def _raise_quota_error_if_detected(self, error: RPCError) -> None:
         """Convert CREATE_NOTEBOOK invalid-argument failures into quota errors."""
@@ -144,6 +224,12 @@ class NotebooksAPI:
 
         Returns:
             Notebook object with details.
+
+        Raises:
+            NotebookNotFoundError: If the notebook does not exist. The backend
+                returns an empty / degenerate payload (missing ``id`` and
+                ``title``) for unknown IDs rather than a proper RPC error, so
+                this method post-validates the parsed response.
         """
         params = [notebook_id, None, [2], None, 0]
         result = await self._core.rpc_call(
@@ -153,7 +239,26 @@ class NotebooksAPI:
         )
         # get_notebook returns [nb_info, ...] where nb_info contains the notebook data
         nb_info = result[0] if result and isinstance(result, list) and len(result) > 0 else []
-        return Notebook.from_api_response(nb_info)
+        # Guard the empty-payload case BEFORE parsing. ``Notebook.from_api_response``
+        # currently tolerates ``[]`` but a future tightening could turn that into
+        # an ``IndexError`` that would surface as a confusing crash instead of
+        # the intended ``NotebookNotFoundError``. Raising here keeps the contract
+        # stable regardless of how the parser evolves.
+        if not nb_info:
+            raise NotebookNotFoundError(
+                notebook_id,
+                method_id=RPCMethod.GET_NOTEBOOK.value,
+            )
+        notebook = Notebook.from_api_response(nb_info)
+        # Defense-in-depth: even when the outer list isn't empty, the server can
+        # return a payload whose id and title both parse to ``""``. A valid
+        # notebook always has at least one of the two populated.
+        if not notebook.id and not notebook.title:
+            raise NotebookNotFoundError(
+                notebook_id,
+                method_id=RPCMethod.GET_NOTEBOOK.value,
+            )
+        return notebook
 
     async def delete(self, notebook_id: str) -> bool:
         """Delete a notebook.
@@ -210,14 +315,15 @@ class NotebooksAPI:
             source_path=f"/notebook/{notebook_id}",
         )
         # Response structure: [[[summary_string, ...], topics, ...]]
-        # Summary is at result[0][0][0]
-        try:
-            if result and isinstance(result, list):
-                summary = result[0][0][0]
-                return str(summary) if summary else ""
-        except (IndexError, TypeError):
-            pass
-        return ""
+        summary = safe_index(
+            result,
+            0,
+            0,
+            0,
+            method_id=RPCMethod.SUMMARIZE.value,
+            source="_notebooks.get_summary",
+        )
+        return str(summary) if summary else ""
 
     async def get_description(self, notebook_id: str) -> NotebookDescription:
         """Get AI-generated summary and suggested topics for a notebook.
@@ -269,9 +375,13 @@ class NotebooksAPI:
                                     prompt=str(topic[1]) if topic[1] else "",
                                 )
                             )
-            except (IndexError, TypeError):
+            except (IndexError, TypeError) as e:
                 # A partial result (e.g. summary but no topics) is possible.
-                pass
+                logger.debug(
+                    "Partial description for notebook %s (no topics?): %s",
+                    notebook_id,
+                    e,
+                )
 
         return NotebookDescription(summary=summary, suggested_topics=suggested_topics)
 
@@ -343,7 +453,7 @@ class NotebooksAPI:
         )
 
         # Build share URL
-        base_url = f"https://notebooklm.google.com/notebook/{notebook_id}"
+        base_url = f"{get_base_url()}/notebook/{notebook_id}"
         if public and artifact_id:
             url = f"{base_url}?artifactId={artifact_id}"
         elif public:
@@ -370,7 +480,7 @@ class NotebooksAPI:
         Returns:
             The share URL string.
         """
-        base_url = f"https://notebooklm.google.com/notebook/{notebook_id}"
+        base_url = f"{get_base_url()}/notebook/{notebook_id}"
         if artifact_id:
             return f"{base_url}?artifactId={artifact_id}"
         return base_url
