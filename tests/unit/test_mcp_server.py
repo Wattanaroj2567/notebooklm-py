@@ -486,6 +486,57 @@ class TestAuthStatus:
         source = Path(srv.__file__).read_text()
         assert "logging.basicConfig(" not in source
 
+    def test_mcp_logging_suppresses_tolerant_decoder_noise_by_default(self, monkeypatch):
+        import logging
+
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.delenv("NOTEBOOKLM_MCP_SHOW_TOLERANT_DECODER_WARNINGS", raising=False)
+        srv._configure_mcp_logging()
+        record = logging.LogRecord(
+            "notebooklm.rpc.decoder",
+            logging.WARNING,
+            "decoder.py",
+            230,
+            "Chunk at line %d declares %d bytes but payload is %d bytes; "
+            "parsing valid JSON payload anyway. Preview: %s",
+            (2, 10, 12, "[]"),
+            None,
+        )
+        malformed_record = logging.LogRecord(
+            "notebooklm.rpc.decoder",
+            logging.WARNING,
+            "decoder.py",
+            240,
+            "Skipping malformed chunk at line %d: %s",
+            (2, "bad json"),
+            None,
+        )
+        decoder_logger = logging.getLogger("notebooklm.rpc.decoder")
+
+        assert decoder_logger.filter(record) is False
+        assert decoder_logger.filter(malformed_record) is not False
+
+    def test_mcp_logging_can_show_tolerant_decoder_noise_for_development(self, monkeypatch):
+        import logging
+
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_SHOW_TOLERANT_DECODER_WARNINGS", "1")
+        srv._configure_mcp_logging()
+        record = logging.LogRecord(
+            "notebooklm.rpc.decoder",
+            logging.WARNING,
+            "decoder.py",
+            230,
+            "Chunk at line %d declares %d bytes but payload is %d bytes; "
+            "parsing valid JSON payload anyway. Preview: %s",
+            (2, 10, 12, "[]"),
+            None,
+        )
+
+        assert logging.getLogger("notebooklm.rpc.decoder").filter(record) is not False
+
     @pytest.mark.asyncio
     async def test_check_auth_status_reports_live_auth_failure_authoritatively(self):
         import notebooklm.mcp_server as srv

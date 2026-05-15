@@ -42,10 +42,42 @@ from notebooklm.rpc import (
 from notebooklm.types import Artifact, ShareStatus, source_status_to_str
 
 # Configure logging
+_TOLERANT_DECODER_FILTER_MARKER = "_notebooklm_mcp_tolerant_decoder_filter"
+
+
+class _TolerantDecoderWarningFilter(logging.Filter):
+    """Suppress noisy decoder warnings that are known to be recoverable in MCP logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "notebooklm.rpc.decoder":
+            return True
+        message = record.getMessage()
+        return not (
+            message.startswith("Chunk at line ") and "parsing valid JSON payload anyway" in message
+        )
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _configure_mcp_logging() -> None:
+    logger.setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    decoder_logger = logging.getLogger("notebooklm.rpc.decoder")
+    decoder_logger.filters = [
+        f for f in decoder_logger.filters if not getattr(f, _TOLERANT_DECODER_FILTER_MARKER, False)
+    ]
+    if not _env_truthy("NOTEBOOKLM_MCP_SHOW_TOLERANT_DECODER_WARNINGS"):
+        noise_filter = _TolerantDecoderWarningFilter()
+        setattr(noise_filter, _TOLERANT_DECODER_FILTER_MARKER, True)
+        decoder_logger.addFilter(noise_filter)
+
+
 logger = logging.getLogger("notebooklm-mcp")
-logger.setLevel(logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+_configure_mcp_logging()
 
 # --- NotebookLM AI Framework Configuration ---
 FRAMEWORK_NOTEBOOK_ID_ENV = "NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID"
