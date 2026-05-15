@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -15,11 +17,11 @@ from urllib.parse import parse_qs, urlparse
 
 import uvicorn
 from anyio import ClosedResourceError
-from fastapi import FastAPI
-
+from fastapi import FastAPI, Request
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import Icon
+
 from notebooklm import NotebookLMClient
 from notebooklm.exceptions import ValidationError
 from notebooklm.rpc import (
@@ -438,7 +440,7 @@ def _check_auth_health() -> dict[str, Any]:
         result["status"] = "expired"
         result["fix_command"] = "notebooklm login"
         result["message"] = (
-            f"❌ AUTH EXPIRED — cookies: {', '.join(expired)}. " "Run: notebooklm login"
+            f"❌ AUTH EXPIRED — cookies: {', '.join(expired)}. Run: notebooklm login"
         )
     elif warn:
         result["status"] = "warn"
@@ -520,10 +522,14 @@ async def get_client() -> NotebookLMClient:
     async with _client_lock:
         if _client is None:
             try:
-                _client = await NotebookLMClient.from_storage(timeout=120.0, keepalive=300)
-                await _client.__aenter__()
+                client = await NotebookLMClient.from_storage(timeout=120.0, keepalive=300)
+                await client.__aenter__()
+                _client = client
                 logger.info("NotebookLM client initialized successfully")
             except Exception as e:
+                # Never leave a half-initialized client cached: if __aenter__
+                # failed, _client must stay None so the next call retries.
+                _client = None
                 logger.error(f"Failed to initialize client: {e}")
                 # Force next _get_auth_notice() to re-read disk so callers
                 # immediately see the expired/unknown notice in their response.
@@ -754,22 +760,23 @@ async def read_framework_manual(
 async def run_research_team_workflow(url: str, title: str) -> dict[str, Any]:
     """Direct URL Research Workflow: Minnie->Indy->Vera->Reas->Day. (Write)"""
     client = await get_client()
-    nb = await client.notebooks.create(title)
-    existing = await find_existing_source(client, nb.id, url)
+    nb_result = await get_or_create_notebook(title, reuse_existing=True)
+    notebook_id = nb_result["notebook_id"]
+    existing = await find_existing_source(client, notebook_id, url)
     if existing:
         return with_notebook_url(
             {
-                "notebook_id": nb.id,
+                "notebook_id": notebook_id,
                 "source_id": existing.id,
                 "status": "ready",
                 "workflow": "Duplicate found",
             },
-            nb.id,
+            notebook_id,
         )
 
-    source = await client.sources.add_url(nb.id, url)
+    source = await client.sources.add_url(notebook_id, url)
     try:
-        await client.sources.wait_until_ready(nb.id, source.id, timeout=90)
+        await client.sources.wait_until_ready(notebook_id, source.id, timeout=90)
         status = "ready"
     except Exception:
         status = "processing_background"
@@ -777,7 +784,7 @@ async def run_research_team_workflow(url: str, title: str) -> dict[str, Any]:
     summary = "Workflow executed."
     if status == "ready":
         result = await client.chat.ask(
-            nb.id,
+            notebook_id,
             "สรุปเนื้อหาแหล่งข้อมูลนี้เป็นภาษาไทยทั้งหมดเท่านั้น "
             "(ห้ามตอบเป็นภาษาฝรั่งเศส อังกฤษ หรือภาษาอื่น). "
             "ถ้าเป็นคำศัพท์เฉพาะให้คงศัพท์แล้วอธิบายเป็นภาษาไทย.",
@@ -785,16 +792,26 @@ async def run_research_team_workflow(url: str, title: str) -> dict[str, Any]:
         summary = getattr(result, "answer", str(result))
     return with_notebook_url(
         {
-            "notebook_id": nb.id,
+            "notebook_id": notebook_id,
             "source_id": source.id,
             "status": status,
             "initial_summary": summary,
         },
-        nb.id,
+        notebook_id,
     )
 
 
-_idempotency_store: dict[str, dict[str, Any]] = {}
+# Bounded LRU-ish cache: oldest keys are evicted once the cap is reached so a
+# long-running container can't leak memory through unique idempotency keys.
+_IDEMPOTENCY_MAX_ENTRIES = 512
+_idempotency_store: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+def _idempotency_remember(key: str, value: dict[str, Any]) -> None:
+    _idempotency_store[key] = value
+    _idempotency_store.move_to_end(key)
+    while len(_idempotency_store) > _IDEMPOTENCY_MAX_ENTRIES:
+        _idempotency_store.popitem(last=False)
 
 
 @mcp.tool()
@@ -876,7 +893,7 @@ async def run_deep_search_workflow(
     }
 
     if idempotency_key:
-        _idempotency_store[idempotency_key] = {"notebook_id": notebook_id, "task_id": task_id}
+        _idempotency_remember(idempotency_key, {"notebook_id": notebook_id, "task_id": task_id})
 
     return with_notebook_url(result, notebook_id)
 
@@ -990,9 +1007,10 @@ async def research_wait_and_import(
                     "observed_task_id": last.get("task_id"),
                 }
 
-            # Perform Source Deduplication
+            # Perform Source Deduplication (normalized, consistent with
+            # find_existing_source so trailing-slash/scheme variants dedupe).
             existing_sources = await client.sources.list(notebook_id)
-            existing_urls = {s.url for s in existing_sources if getattr(s, "url", None)}
+            existing_urls = {normalize_url(s.url) for s in existing_sources if s.url}
 
             incoming_sources = last["sources"]
             sources_to_import = []
@@ -1000,7 +1018,7 @@ async def research_wait_and_import(
 
             for src in incoming_sources:
                 url = src.get("url")
-                if url and url in existing_urls:
+                if url and normalize_url(url) in existing_urls:
                     duplicates_skipped.append({"url": url})
                 else:
                     sources_to_import.append(src)
@@ -1068,8 +1086,6 @@ async def get_or_create_notebook(
     notebooks = await client.notebooks.list()
 
     def _normalize(t: str) -> str:
-        import re
-
         return re.sub(r"\s+", " ", t.lower()).strip()
 
     target_title = title if dedupe_strategy == "title_exact" else _normalize(title)
@@ -1230,28 +1246,18 @@ async def delete_notebooks_by_title(
     notebooks = await client.notebooks.list()
 
     def _normalize(t: str) -> str:
-        import re
-
         return re.sub(r"\s+", " ", t.lower()).strip()
 
     matched = []
     for nb in notebooks:
         if (
-            match == "exact"
-            and nb.title == title
-            or match == "normalized_exact"
-            and _normalize(nb.title) == _normalize(title)
-            or match == "prefix"
-            and nb.title.startswith(title)
-            or match == "contains"
-            and title in nb.title
+            (match == "exact" and nb.title == title)
+            or (match == "normalized_exact" and _normalize(nb.title) == _normalize(title))
+            or (match == "prefix" and nb.title.startswith(title))
+            or (match == "contains" and title in nb.title)
+            or (match == "regex" and re.search(title, nb.title))
         ):
             matched.append(nb)
-        elif match == "regex":
-            import re
-
-            if re.search(title, nb.title):
-                matched.append(nb)
 
     if dry_run or not confirm:
         return {
@@ -1274,9 +1280,13 @@ async def delete_notebooks_by_title(
             },
         }
 
-    if match in ("contains", "regex") and not confirm_phrase:
+    if match in ("contains", "regex") and confirm_phrase != title:
         return {
-            "error": f"Match mode '{match}' requires confirm_phrase to execute deletion safely."
+            "error": (
+                f"Match mode '{match}' is broad and requires confirm_phrase to exactly "
+                f"equal the title/pattern ({title!r}) before deletion will run."
+            ),
+            "matched_count": len(matched),
         }
 
     return await delete_notebooks(
@@ -1293,11 +1303,9 @@ async def archive_notebooks(
     notebooks = await client.notebooks.list()
 
     to_archive = [nb for nb in notebooks if nb.id in notebook_ids]
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
 
     if dry_run:
-        from datetime import datetime
-
-        today = datetime.now().strftime("%Y-%m-%d")
         return {
             "dry_run": True,
             "would_archive_count": len(to_archive),
@@ -1314,9 +1322,6 @@ async def archive_notebooks(
 
     archived = []
     failed = []
-    from datetime import datetime
-
-    today = datetime.now().strftime("%Y-%m-%d")
 
     for nb in to_archive:
         try:
@@ -1347,8 +1352,6 @@ async def find_duplicate_notebooks(
     notebooks = await client.notebooks.list()
 
     def _normalize(t: str) -> str:
-        import re
-
         return re.sub(r"\s+", " ", t.lower()).strip()
 
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -1641,10 +1644,14 @@ async def add_text_source(notebook_id: str, title: str, text: str) -> dict[str, 
 
 
 @mcp.tool()
-async def refresh_source(notebook_id: str, source_id: str) -> bool:
+async def refresh_source(notebook_id: str, source_id: str) -> dict[str, Any]:
     """Refresh an existing source. (Write)"""
     client = await get_client()
-    return await client.sources.refresh(notebook_id, source_id)
+    ok = await client.sources.refresh(notebook_id, source_id)
+    return with_notebook_url(
+        {"result": bool(ok), "source_id": source_id},
+        notebook_id,
+    )
 
 
 @mcp.tool()
@@ -1764,14 +1771,52 @@ async def add_drive(
     )
 
 
+FILE_ROOT_ENV = "NOTEBOOKLM_MCP_FILE_ROOT"
+
+
+def _resolve_allowed_file(file_path: str) -> Path:
+    """Resolve *file_path* and confirm it lives inside the configured upload root.
+
+    The MCP server can be exposed publicly (e.g. via a Cloudflare tunnel), so an
+    unconstrained ``add_file`` would let any connected client read arbitrary
+    server files — including ``storage_state.json`` (auth cookies). We therefore
+    require an explicit allow-list root via ``NOTEBOOKLM_MCP_FILE_ROOT`` and
+    reject anything that escapes it (including symlink targets).
+    """
+    root_env = os.environ.get(FILE_ROOT_ENV)
+    if not root_env:
+        raise ValidationError(
+            f"add_file is disabled: set {FILE_ROOT_ENV} to a directory the MCP "
+            "server is allowed to read uploads from."
+        )
+    root = Path(root_env).resolve()
+    resolved = Path(file_path).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValidationError(
+            f"file_path must be inside {FILE_ROOT_ENV} ({root}); refusing to read {resolved}."
+        )
+    if not resolved.is_file():
+        raise ValidationError(f"No such file inside the allowed root: {resolved}")
+    return resolved
+
+
 @mcp.tool()
 async def add_file(
     notebook_id: str,
     file_path: str,
 ) -> dict[str, Any]:
-    """Add a local file from the server's filesystem as a source. (Write)"""
+    """Add a local file from the server's filesystem as a source. (Write)
+
+    Only files inside the directory named by the ``NOTEBOOKLM_MCP_FILE_ROOT``
+    environment variable may be added. If that variable is unset, this tool is
+    disabled.
+    """
     client = await get_client()
-    source = await client.sources.add_file(notebook_id, file_path)
+    try:
+        safe_path = _resolve_allowed_file(file_path)
+    except ValidationError as e:
+        return with_notebook_url({"error": str(e)}, notebook_id)
+    source = await client.sources.add_file(notebook_id, str(safe_path))
     return with_notebook_url(
         {"id": source.id, "title": source.title, "status": source_status_to_str(source.status)},
         notebook_id,
@@ -1982,9 +2027,6 @@ async def get_artifact_content(
             {"error": f"Artifact not complete (status={artifact.status})"},
             notebook_id,
         )
-
-    import os
-    import tempfile
 
     kind = artifact.kind.value if hasattr(artifact.kind, "value") else str(artifact.kind)
     content = ""
@@ -2264,9 +2306,10 @@ app = FastAPI(title="NotebookLM Framework MCP", lifespan=lifespan)
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     """Health check endpoint reporting available MCP transports and auth status."""
     auth_info = _check_auth_health()
+    base = str(request.base_url).rstrip("/")
     return {
         "status": "ok",
         "auth": auth_info,
@@ -2275,8 +2318,8 @@ async def health():
             "sse_legacy": "/sse",
         },
         "clients": {
-            "claude_ai": "https://notebooklm-mcp.tawanlab.site/mcp",
-            "chatgpt": "https://notebooklm-mcp.tawanlab.site/sse/",
+            "claude_ai": f"{base}/mcp",
+            "chatgpt": f"{base}/sse/",
         },
     }
 

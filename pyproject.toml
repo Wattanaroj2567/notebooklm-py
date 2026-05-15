@@ -122,6 +122,11 @@ markers = [
 [tool.coverage.run]
 source = ["src/notebooklm"]
 branch = true
+# mcp_server.py is a server entrypoint (long-running ASGI app, transport
+# proxies, background tasks) that is exercised by tests/mcp/ integration
+# runs rather than line-covered unit tests. Excluding it keeps the global
+# fail_under gate meaningful for the library code.
+omit = ["src/notebooklm/mcp_server.py"]
 
 [tool.coverage.report]
 show_missing = true
