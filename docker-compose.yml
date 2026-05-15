@@ -11,11 +11,16 @@ services:
       # Optional: NotebookLM notebook containing AI-team manuals and MCP workflow docs.
       # Agents query this through ask_framework_manual instead of local framework files.
       - NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID=${NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID:-}
+      # Directory add_file is allowed to read (server-side only). Drop files
+      # to import into ./mcp_imports on the host.
+      - NOTEBOOKLM_MCP_FILE_ROOT=/imports
     volumes:
       # Map the entire .notebooklm directory to handle profiles and config correctly
       - ~/.notebooklm:/root/.notebooklm
       # Map MCP skill hints for deterministic tool-use rules.
       - ./MCP_SKILL.md:/app/MCP_SKILL.md:ro
+      # Host folder for add_file imports (create ./mcp_imports as needed).
+      - ./mcp_imports:/imports
     ports:
       - "8000:8000"
 

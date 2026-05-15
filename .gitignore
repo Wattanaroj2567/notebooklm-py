@@ -35,3 +35,7 @@ downloads/
 # VCR cassettes - committed after security review
 # Cassettes are scrubbed of sensitive data (cookies, tokens, user IDs, emails)
 # See tests/vcr_config.py for scrubbing patterns
+
+# add_file import drop folder (contents not tracked)
+mcp_imports/*
+!mcp_imports/.gitkeep

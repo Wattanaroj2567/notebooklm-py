@@ -544,15 +544,17 @@ async def get_client() -> NotebookLMClient:
         return _client
 
 
-async def _session_refresh_task(interval_seconds: int = 1800) -> None:
-    """Background task: re-fetch the NotebookLM homepage every *interval_seconds* (default 30 min).
+async def _session_refresh_task(interval_seconds: int = 600) -> None:
+    """Background task: re-fetch the NotebookLM homepage every *interval_seconds* (default 10 min).
 
     Google's FdrFJe (f.sid) and SNlM0e (csrf_token) are server-side session tokens
     extracted once at startup. They become stale after a few hours, causing batchexecute
-    to return HTTP 200 but with no valid RPC data — appearing as RPCError in logs but
-    never matching AUTH_ERROR_PATTERNS, so the auto-retry path is never triggered.
+    to return HTTP 200 with a gRPC code-16 (Unauthenticated) payload.
 
-    Periodic refresh keeps both tokens fresh without requiring a client restart.
+    The core layer now auto-detects code 16 (is_auth_error → refresh+retry), so a
+    stale token self-heals on the next call. This periodic refresh is
+    defense-in-depth that keeps idle sessions warm so the first call after a
+    quiet period doesn't pay the refresh+retry round-trip.
     """
     while True:
         await asyncio.sleep(interval_seconds)
@@ -684,12 +686,18 @@ async def ask_framework_manual(
 
 
 @mcp.tool()
-async def check_auth_status() -> dict[str, Any]:
+async def check_auth_status(deep: bool = True) -> dict[str, Any]:
     """Check NotebookLM authentication health and report expiry status. (ReadOnly)
 
     Call this tool when the user asks about authentication status, session
     health, or cookie expiry — or proactively before starting a long workflow
     to avoid mid-task failures.
+
+    ``deep`` (default True) additionally performs a live ``list_notebooks``
+    RPC so the result reflects the real session token (f.sid / csrf_token),
+    not just cookie expiry in storage_state.json. Cookies can look healthy
+    for a year while the session token is already stale — the cookie-only
+    check would wrongly report "ok". Pass deep=False for a fast offline read.
 
     Returns:
       status        : "ok" | "warn" | "expired" | "unknown"
@@ -728,6 +736,28 @@ async def check_auth_status() -> dict[str, Any]:
         )
     else:
         response["advice"] = "Auth state is unknown. Run the fix command to initialise a session."
+
+    if deep:
+        live: dict[str, Any] = {"checked": True}
+        try:
+            client = await get_client()
+            notebooks = await client.notebooks.list()
+            live["ok"] = True
+            live["notebook_count"] = len(notebooks)
+            live["message"] = "Live list_notebooks RPC succeeded — session token is valid."
+        except Exception as exc:
+            live["ok"] = False
+            live["error"] = str(exc)
+            live["message"] = (
+                "Cookie check looked OK but a live RPC failed — the session "
+                "token (f.sid / csrf_token) is likely stale. It auto-refreshes "
+                "on the next call; if it persists, restart the MCP container."
+            )
+            # The live probe is authoritative: a stale session token is the
+            # real failure even when cookies are fine.
+            response["status"] = "expired" if health["status"] == "ok" else health["status"]
+            response["advice"] = live["message"]
+        response["live_probe"] = live
 
     return response
 
@@ -1786,8 +1816,10 @@ def _resolve_allowed_file(file_path: str) -> Path:
     root_env = os.environ.get(FILE_ROOT_ENV)
     if not root_env:
         raise ValidationError(
-            f"add_file is disabled: set {FILE_ROOT_ENV} to a directory the MCP "
-            "server is allowed to read uploads from."
+            f"add_file reads files from the MCP SERVER's own filesystem only; it "
+            f"cannot reach a chat sandbox path like /mnt/data. To enable it, set "
+            f"{FILE_ROOT_ENV} to a server directory (and mount one if running in "
+            f"Docker). To ingest text you already have, use add_text_source instead."
         )
     root = Path(root_env).resolve()
     resolved = Path(file_path).resolve()
@@ -1805,7 +1837,12 @@ async def add_file(
     notebook_id: str,
     file_path: str,
 ) -> dict[str, Any]:
-    """Add a local file from the server's filesystem as a source. (Write)
+    """Add a file from the MCP server's own filesystem as a source. (Write)
+
+    IMPORTANT: this reads the *server's* disk, not the calling agent's
+    sandbox. A ChatGPT/Claude path such as ``/mnt/data/foo.md`` does NOT
+    exist on the server — use ``add_text_source`` to ingest content you
+    generated, or ``add_drive`` for Google Drive files.
 
     Only files inside the directory named by the ``NOTEBOOKLM_MCP_FILE_ROOT``
     environment variable may be added. If that variable is unset, this tool is
@@ -2269,9 +2306,10 @@ async def lifespan(application: FastAPI):
     watcher_task = asyncio.create_task(_auth_watcher(interval_seconds=3600))
     watcher_task.set_name("auth-watcher")
 
-    # --- Startup: launch session token refresh (every 30 min) ---
-    # Prevents stale f.sid / csrf_token that cause RPC decode failures in Docker.
-    refresh_task = asyncio.create_task(_session_refresh_task(interval_seconds=1800))
+    # --- Startup: launch session token refresh (every 10 min) ---
+    # Keeps idle f.sid / csrf_token warm; the core layer also self-heals
+    # stale tokens via the code-16 refresh+retry path.
+    refresh_task = asyncio.create_task(_session_refresh_task(interval_seconds=600))
     refresh_task.set_name("session-refresh")
 
     # Start the Streamable HTTP session manager task group.

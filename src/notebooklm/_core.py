@@ -100,9 +100,15 @@ AUTH_ERROR_PATTERNS = (
     "authentication",
     "expired",
     "unauthorized",
+    "unauthenticated",
     "login",
     "re-authenticate",
 )
+
+# gRPC canonical status code for an expired/invalid session. A stale
+# NotebookLM session token (f.sid / SNlM0e) returns HTTP 200 whose decoded
+# batchexecute payload carries this code — see rpc/decoder.py.
+_GRPC_UNAUTHENTICATED = 16
 
 
 @dataclass(frozen=True)
@@ -255,8 +261,16 @@ def is_auth_error(error: Exception) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return error.response.status_code in (400, 401, 403)
 
-    # RPCError with auth-related message
+    # RPCError carrying an explicit UNAUTHENTICATED (gRPC code 16) status,
+    # or an auth-related message. Stale session tokens surface as a 200 OK
+    # whose decoded RPCError has rpc_code=16 and the message
+    # "...returned null result with status code 16 (Unauthenticated)." —
+    # the message form previously missed AUTH_ERROR_PATTERNS so the
+    # refresh+retry path never fired (the original Docker auth-drop bug).
     if isinstance(error, RPCError):
+        rpc_code = getattr(error, "rpc_code", None)
+        if rpc_code is not None and str(rpc_code) == str(_GRPC_UNAUTHENTICATED):
+            return True
         message = str(error).lower()
         return any(pattern in message for pattern in AUTH_ERROR_PATTERNS)
 
