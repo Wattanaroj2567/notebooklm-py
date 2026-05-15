@@ -25,6 +25,24 @@
 >
 > Best for prototypes, research, and personal projects. See [Troubleshooting](docs/troubleshooting.md) for debugging tips.
 
+> **🔱 Fork note (Wattanaroj2567/notebooklm-py)**
+>
+> This fork adds a long-running **MCP server** (`notebooklm-mcp`,
+> `src/notebooklm/mcp_server.py`) exposing the NotebookLM API as MCP tools over
+> Streamable HTTP (Claude AI) and SSE (ChatGPT), plus an AI-team framework layer
+> (`ask_framework_manual`, role routing, dedup-aware workflows).
+>
+> Branch model:
+>
+> - **`main`** — a clean mirror of upstream `teng-lin/notebooklm-py`,
+>   auto-fast-forwarded daily by `.github/workflows/sync-upstream.yml`. Do not
+>   commit fork work here.
+> - **`mcp`** — the MCP server and fork-specific changes. Pull upstream updates
+>   in with `git merge main`.
+>
+> Run the server with `notebooklm-mcp` (configure auth via `notebooklm login`
+> first). `add_file` is sandboxed to `NOTEBOOKLM_MCP_FILE_ROOT`.
+
 ## What You Can Build
 
 🤖 **AI Agent Tools** - Integrate NotebookLM into Claude Code, Codex, and other LLM agents. Ships with a root [NotebookLM skill](SKILL.md) for GitHub and `npx skills add` discovery, local `notebooklm skill install` support for Claude Code and `.agents` skill directories, and repo-level Codex guidance in [`AGENTS.md`](AGENTS.md).
