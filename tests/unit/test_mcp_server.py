@@ -414,6 +414,36 @@ class TestGetClient:
             srv._client = original
 
     @pytest.mark.asyncio
+    async def test_get_client_sanitizes_google_redirect_url_on_auth_failure(self, caplog):
+        import notebooklm.mcp_server as srv
+
+        original = srv._client
+        srv._client = None
+        caplog.set_level("ERROR", logger="notebooklm-mcp")
+        try:
+            with (
+                patch(
+                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
+                    side_effect=RuntimeError(
+                        "Authentication expired or invalid. Redirected to: "
+                        "https://accounts.google.com/v3/signin/accountchooser?continue=..."
+                    ),
+                ),
+                pytest.raises(RuntimeError) as exc_info,
+            ):
+                await srv.get_client()
+
+            message = str(exc_info.value)
+            assert "accounts.google.com" not in message
+            assert "signin/accountchooser" not in message
+            assert "notebooklm login --fresh" in message
+            assert "notebooklm login --browser-cookies chrome" in message
+            assert "accounts.google.com" not in caplog.text
+            assert "signin/accountchooser" not in caplog.text
+        finally:
+            srv._client = original
+
+    @pytest.mark.asyncio
     async def test_get_client_returns_same_instance_on_second_call(self):
         import notebooklm.mcp_server as srv
 
@@ -432,6 +462,54 @@ class TestGetClient:
                 assert c1 is c2
         finally:
             srv._client = original
+
+
+# ---------------------------------------------------------------------------
+# Auth status
+# ---------------------------------------------------------------------------
+
+
+class TestAuthStatus:
+    def test_httpx_info_logs_are_suppressed_to_avoid_google_redirect_urls(self):
+        import logging
+
+        import notebooklm.mcp_server  # noqa: F401
+
+        assert logging.getLogger("httpx").level >= logging.WARNING
+
+    @pytest.mark.asyncio
+    async def test_check_auth_status_reports_live_auth_failure_authoritatively(self):
+        import notebooklm.mcp_server as srv
+
+        health = {
+            "status": "ok",
+            "days_until_expiry": 364.9,
+            "soonest_expiry": "2027-05-15T12:07:06+00:00",
+            "expired_cookies": [],
+            "warn_cookies": [],
+            "fix_command": None,
+            "message": "Auth cookies look healthy.",
+        }
+
+        with (
+            patch("notebooklm.mcp_server._check_auth_health", return_value=health),
+            patch(
+                "notebooklm.mcp_server.get_client",
+                side_effect=RuntimeError(
+                    "Authentication expired or invalid. Redirected to: "
+                    "https://accounts.google.com/v3/signin/accountchooser"
+                ),
+            ),
+        ):
+            result = await srv.check_auth_status(deep=True)
+
+        assert result["file_check"] == "ok"
+        assert result["status"] == "expired"
+        assert result["fix_command"] == "notebooklm login"
+        assert result["live_probe"]["ok"] is False
+        assert "Google rejected" in result["live_probe"]["message"]
+        assert result["cookie_rotator"]["active"] == "mcp_container"
+        assert result["cookie_rotator"]["host_systemd_timer"] == "disabled"
 
 
 # ---------------------------------------------------------------------------

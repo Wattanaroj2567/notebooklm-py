@@ -44,6 +44,8 @@ from notebooklm.types import Artifact, ShareStatus, source_status_to_str
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("notebooklm-mcp")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # --- NotebookLM AI Framework Configuration ---
 FRAMEWORK_NOTEBOOK_ID_ENV = "NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID"
@@ -360,6 +362,35 @@ _AUTH_NOTICE_TTL = 300  # 5 minutes
 # Cache entry: (notice_dict | None, monotonic_expiry)
 _auth_notice_cache: tuple[dict[str, Any] | None, float] = (None, 0.0)
 
+_CONTAINER_KEEPALIVE_SECONDS = 300
+
+
+def _is_hard_auth_failure(exc: BaseException) -> bool:
+    """Return True when Google rejected the stored cookies, not just a stale token."""
+    message = str(exc).lower()
+    return (
+        "authentication expired or invalid" in message
+        or "accounts.google.com/v3/signin" in message
+        or "signin/accountchooser" in message
+        or "run 'notebooklm login'" in message
+    )
+
+
+def _live_auth_failure_message(exc: BaseException) -> str:
+    if _is_hard_auth_failure(exc):
+        return (
+            "Cookie file exists, but Google rejected it during a live auth check. "
+            "This is not healthy auth. Do not click Google redirect URLs from logs; "
+            "they cannot update the MCP storage_state.json. Run `notebooklm login --fresh` "
+            "or `notebooklm login --browser-cookies chrome`, verify with "
+            "`notebooklm auth check --test`, then restart the MCP container."
+        )
+    return (
+        "Cookie file exists, but a live NotebookLM RPC failed. Restart the MCP "
+        "container; if it still fails, run `notebooklm auth check --test` and "
+        "re-authenticate."
+    )
+
 
 def _check_auth_health() -> dict[str, Any]:
     """Inspect storage_state.json and return auth health summary.
@@ -522,7 +553,9 @@ async def get_client() -> NotebookLMClient:
     async with _client_lock:
         if _client is None:
             try:
-                client = await NotebookLMClient.from_storage(timeout=120.0, keepalive=300)
+                client = await NotebookLMClient.from_storage(
+                    timeout=120.0, keepalive=_CONTAINER_KEEPALIVE_SECONDS
+                )
                 await client.__aenter__()
                 _client = client
                 logger.info("NotebookLM client initialized successfully")
@@ -530,7 +563,7 @@ async def get_client() -> NotebookLMClient:
                 # Never leave a half-initialized client cached: if __aenter__
                 # failed, _client must stay None so the next call retries.
                 _client = None
-                logger.error(f"Failed to initialize client: {e}")
+                logger.error("Failed to initialize client: %s", _live_auth_failure_message(e))
                 # Force next _get_auth_notice() to re-read disk so callers
                 # immediately see the expired/unknown notice in their response.
                 _invalidate_auth_notice_cache()
@@ -540,7 +573,9 @@ async def get_client() -> NotebookLMClient:
                     raise RuntimeError(
                         f"NotebookLM client not ready. {auth_info['message']}"
                     ) from e
-                raise RuntimeError("NotebookLM client not ready.") from e
+                raise RuntimeError(
+                    f"NotebookLM client not ready. {_live_auth_failure_message(e)}"
+                ) from e
         return _client
 
 
@@ -707,7 +742,7 @@ async def check_auth_status(deep: bool = True) -> dict[str, Any]:
       soonest_expiry    : ISO-8601 timestamp of that cookie, or null
       expired_cookies   : list of already-expired cookie names
       warn_cookies      : list of cookies expiring within 7 days
-      keepalive_timer   : reminder about the systemd timer that auto-refreshes cookies
+      cookie_rotator    : which process should rotate short-lived cookies
     """
     # Always bypass cache here so the user gets a live reading on demand.
     _invalidate_auth_notice_cache()
@@ -715,11 +750,17 @@ async def check_auth_status(deep: bool = True) -> dict[str, Any]:
 
     response: dict[str, Any] = {
         **health,
-        "keepalive_timer": (
-            "systemd user timer 'notebooklm-keepalive.timer' runs "
-            "'notebooklm auth refresh' every 20 min to rotate short-lived cookies. "
-            "Check with: systemctl --user status notebooklm-keepalive.timer"
-        ),
+        "file_check": health["status"],
+        "cookie_rotator": {
+            "active": "mcp_container",
+            "container_keepalive_seconds": _CONTAINER_KEEPALIVE_SECONDS,
+            "host_systemd_timer": "disabled",
+            "message": (
+                "Use one cookie rotator only. This deployment expects the MCP "
+                "container keepalive to rotate cookies; keep "
+                "`notebooklm-keepalive.timer` disabled on the host."
+            ),
+        },
     }
 
     if health["status"] == "ok":
@@ -748,14 +789,11 @@ async def check_auth_status(deep: bool = True) -> dict[str, Any]:
         except Exception as exc:
             live["ok"] = False
             live["error"] = str(exc)
-            live["message"] = (
-                "Cookie check looked OK but a live RPC failed — the session "
-                "token (f.sid / csrf_token) is likely stale. It auto-refreshes "
-                "on the next call; if it persists, restart the MCP container."
-            )
+            live["message"] = _live_auth_failure_message(exc)
             # The live probe is authoritative: a stale session token is the
-            # real failure even when cookies are fine.
+            # real failure even when cookies are fine on disk.
             response["status"] = "expired" if health["status"] == "ok" else health["status"]
+            response["fix_command"] = "notebooklm login"
             response["advice"] = live["message"]
         response["live_probe"] = live
 
@@ -2301,6 +2339,16 @@ async def lifespan(application: FastAPI):
         logger.warning("[startup] %s", auth_info["message"])
     else:
         logger.info("[startup] %s", auth_info["message"])
+
+    # The file-level check above only proves that storage_state.json exists and
+    # has unexpired cookie timestamps. A live token fetch is the honest signal:
+    # Google can revoke cookies server-side while their local expiry still looks
+    # healthy.
+    try:
+        await get_client()
+        logger.info("[startup] Live NotebookLM auth probe succeeded.")
+    except Exception as exc:
+        logger.error("[startup] Live NotebookLM auth probe failed: %s", exc)
 
     # --- Startup: launch background auth watcher (every 1 h) ---
     watcher_task = asyncio.create_task(_auth_watcher(interval_seconds=3600))
