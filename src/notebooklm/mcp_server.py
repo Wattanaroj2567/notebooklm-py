@@ -520,7 +520,7 @@ async def get_client() -> NotebookLMClient:
     async with _client_lock:
         if _client is None:
             try:
-                _client = await NotebookLMClient.from_storage(timeout=120.0)
+                _client = await NotebookLMClient.from_storage(timeout=120.0, keepalive=300)
                 await _client.__aenter__()
                 logger.info("NotebookLM client initialized successfully")
             except Exception as e:
@@ -536,6 +536,28 @@ async def get_client() -> NotebookLMClient:
                     ) from e
                 raise RuntimeError("NotebookLM client not ready.") from e
         return _client
+
+
+async def _session_refresh_task(interval_seconds: int = 1800) -> None:
+    """Background task: re-fetch the NotebookLM homepage every *interval_seconds* (default 30 min).
+
+    Google's FdrFJe (f.sid) and SNlM0e (csrf_token) are server-side session tokens
+    extracted once at startup. They become stale after a few hours, causing batchexecute
+    to return HTTP 200 but with no valid RPC data — appearing as RPCError in logs but
+    never matching AUTH_ERROR_PATTERNS, so the auto-retry path is never triggered.
+
+    Periodic refresh keeps both tokens fresh without requiring a client restart.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            client = await get_client()
+            await client.refresh_auth()
+            logger.info("[session-refresh] ✅ Session tokens (csrf_token, session_id) refreshed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[session-refresh] ⚠️ Failed to refresh session tokens: %s", exc)
 
 
 # --- Framework Tools ---
@@ -2205,6 +2227,11 @@ async def lifespan(application: FastAPI):
     watcher_task = asyncio.create_task(_auth_watcher(interval_seconds=3600))
     watcher_task.set_name("auth-watcher")
 
+    # --- Startup: launch session token refresh (every 30 min) ---
+    # Prevents stale f.sid / csrf_token that cause RPC decode failures in Docker.
+    refresh_task = asyncio.create_task(_session_refresh_task(interval_seconds=1800))
+    refresh_task.set_name("session-refresh")
+
     # Start the Streamable HTTP session manager task group.
     try:
         if mcp._session_manager:
@@ -2215,12 +2242,14 @@ async def lifespan(application: FastAPI):
             logger.warning("⚠️ Streamable HTTP session manager is None, skipping run()")
             yield
     finally:
-        # Shutdown: cancel background watcher
+        # Shutdown: cancel background tasks
         watcher_task.cancel()
-        try:
-            await watcher_task
-        except asyncio.CancelledError:
-            pass
+        refresh_task.cancel()
+        for task in (watcher_task, refresh_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         # Shutdown: clean up the NotebookLM client
         global _client

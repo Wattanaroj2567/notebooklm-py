@@ -534,7 +534,7 @@ class ClientCore:
                 if refreshed is not None:
                     return refreshed
 
-            logger.error("RPC %s failed after %.3fs", method.name, elapsed)
+            logger.error("RPC %s failed after %.3fs: %s", method.name, elapsed, e)
             raise
         except Exception as e:
             elapsed = time.perf_counter() - start
