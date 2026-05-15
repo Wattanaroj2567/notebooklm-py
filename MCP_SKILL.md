@@ -36,6 +36,25 @@ before complex work.
 
 ## Core Workflow Rules
 
+### Readiness First
+
+Before multi-step work, call:
+
+```text
+check_mcp_readiness
+```
+
+Use its booleans directly:
+
+```text
+ready_for_read
+ready_for_text_write
+ready_for_file_ingestion
+```
+
+If `overall_status` is `blocked`, stop and follow `blocking_issues` and
+`recommended_workflow`. Do not guess from logs.
+
 ### Research
 
 For a new research notebook:
@@ -66,6 +85,19 @@ if error_count > 0: report partial source failure
 ```
 
 Use `add_url_source(wait=false)` for URL/YouTube ingestion, then poll readiness.
+
+### File Ingestion
+
+`add_file` reads the MCP server filesystem, not the calling chat sandbox.
+
+- Docker deployments mount host `./mcp_imports` as server `/imports`.
+- To ingest a local file through MCP, copy it to `./mcp_imports` on the host and
+  call `add_file(file_path="/imports/<filename>")`.
+- A path such as `/mnt/data/...` belongs to a chat sandbox and is not directly
+  visible to the MCP server.
+- If the content is already available in the chat, prefer `add_text_source`.
+- When `add_file` fails, read its structured `diagnostics` and `next_action`
+  fields before suggesting a workaround.
 
 ### Artifact Generation
 
@@ -110,6 +142,26 @@ delete_*(dry_run=true)
 ```
 
 This applies to notebook, source, and note deletion.
+
+## Authentication Health
+
+When authentication fails, distinguish file health from live auth health.
+
+- Cookie expiry checks and `profile authenticated=true` only mean
+  `storage_state.json` exists and parses.
+- The authoritative checks are `check_auth_status(deep=true)` through MCP or
+  `notebooklm auth check --test` on the host/container.
+- Do not tell users to click Google redirect URLs from logs. Those URLs are
+  diagnostic only and do not update the MCP `storage_state.json`.
+- If live auth fails, instruct the user to run one of:
+  - `notebooklm login --fresh`
+  - `notebooklm login --browser-cookies chrome`
+  - `notebooklm login --browser-cookies firefox`
+- After re-authentication, verify with `notebooklm auth check --test`, then
+  restart the MCP container.
+- Use only one cookie rotator for the shared profile. This deployment expects
+  the MCP container keepalive; keep host `notebooklm-keepalive.timer` disabled
+  unless container keepalive is disabled.
 
 ## Language
 

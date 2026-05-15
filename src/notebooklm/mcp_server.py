@@ -42,8 +42,8 @@ from notebooklm.rpc import (
 from notebooklm.types import Artifact, ShareStatus, source_status_to_str
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("notebooklm-mcp")
+logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -798,6 +798,133 @@ async def check_auth_status(deep: bool = True) -> dict[str, Any]:
         response["live_probe"] = live
 
     return response
+
+
+def _source_readiness_summary(sources: list[Any]) -> dict[str, Any]:
+    ready = 0
+    processing = 0
+    errors = 0
+    for source in sources:
+        raw_status = getattr(source, "status", None)
+        status = source_status_to_str(raw_status) if raw_status is not None else "unknown"
+        if status == "ready":
+            ready += 1
+        elif status in {"processing", "new", "pending"}:
+            processing += 1
+        elif status == "error":
+            errors += 1
+    return {
+        "count": len(sources),
+        "ready_count": ready,
+        "processing_count": processing,
+        "error_count": errors,
+    }
+
+
+def _file_ingestion_capability() -> dict[str, Any]:
+    root_env = os.environ.get(FILE_ROOT_ENV)
+    diagnostics = _file_root_diagnostics("<file_path>", root_env)
+    if not root_env:
+        return {
+            "ok": False,
+            "code": "FILE_ROOT_NOT_CONFIGURED",
+            "diagnostics": diagnostics,
+            "message": f"Set {FILE_ROOT_ENV} or use add_text_source.",
+        }
+    root = Path(root_env)
+    return {
+        "ok": root.exists() and root.is_dir(),
+        "code": "OK" if root.exists() and root.is_dir() else "FILE_ROOT_NOT_FOUND",
+        "diagnostics": diagnostics,
+        "message": (
+            "Copy files into ./mcp_imports and call add_file with /imports/<filename>."
+            if str(root_env) == DEFAULT_DOCKER_FILE_ROOT
+            else f"Use files under {root.resolve()} for add_file."
+        ),
+    }
+
+
+@mcp.tool()
+async def check_mcp_readiness(notebook_id: str | None = None) -> dict[str, Any]:
+    """Summarize MCP readiness for auth, read, text write, and file ingestion. (ReadOnly)
+
+    This is the first tool an agent should call before a multi-step workflow.
+    It is non-destructive: it does not create notebooks, add sources, or clean
+    anything up. ``ready_for_text_write`` means the live NotebookLM client is
+    authenticated and write tools should be usable; it is not a write probe.
+    """
+    _invalidate_auth_notice_cache()
+    health = _check_auth_health()
+    file_capability = _file_ingestion_capability()
+    capabilities: dict[str, Any] = {
+        "auth": {
+            "file_status": health["status"],
+            "live_ok": False,
+            "message": health["message"],
+        },
+        "notebooks": {"ok": False},
+        "sources": {"checked": False},
+        "text_source_write": {"ok": False, "probe": "not_run"},
+        "file_ingestion": file_capability,
+    }
+    blocking_issues: list[dict[str, str]] = []
+
+    try:
+        client = await get_client()
+        notebooks = await client.notebooks.list()
+        capabilities["auth"]["live_ok"] = True
+        capabilities["notebooks"] = {"ok": True, "count": len(notebooks)}
+        capabilities["text_source_write"] = {
+            "ok": True,
+            "probe": "not_run",
+            "message": "Live auth succeeded; add_text_source should be available.",
+        }
+        if notebook_id:
+            sources = await client.sources.list(notebook_id)
+            capabilities["sources"] = {
+                "checked": True,
+                "notebook_id": notebook_id,
+                **_source_readiness_summary(sources),
+            }
+    except Exception as exc:
+        message = _live_auth_failure_message(exc)
+        capabilities["auth"]["message"] = message
+        blocking_issues.append({"code": "LIVE_AUTH_FAILED", "message": message})
+
+    ready_for_read = bool(capabilities["auth"]["live_ok"] and capabilities["notebooks"]["ok"])
+    ready_for_text_write = bool(capabilities["text_source_write"]["ok"])
+    ready_for_file_ingestion = bool(ready_for_read and file_capability["ok"])
+    if blocking_issues:
+        overall_status = "blocked"
+    elif ready_for_read and ready_for_text_write:
+        overall_status = "ready" if ready_for_file_ingestion else "degraded"
+    else:
+        overall_status = "degraded"
+
+    recommended_workflow = [
+        {"tool": "check_mcp_readiness", "args": {"notebook_id": notebook_id}},
+        {"tool": "get_or_create_notebook", "when": "ready_for_read is true"},
+        {"tool": "add_text_source", "when": "ready_for_text_write is true"},
+        {"tool": "list_sources", "when": "after each write, verify readiness"},
+    ]
+    if ready_for_file_ingestion:
+        recommended_workflow.append(
+            {
+                "tool": "add_file",
+                "when": "file is under the configured MCP file root",
+                "path_template": file_capability["diagnostics"].get("server_import_path"),
+            }
+        )
+
+    return {
+        "overall_status": overall_status,
+        "ready_for_read": ready_for_read,
+        "ready_for_text_write": ready_for_text_write,
+        "ready_for_file_ingestion": ready_for_file_ingestion,
+        "capabilities": capabilities,
+        "blocking_issues": blocking_issues,
+        "recommended_workflow": recommended_workflow,
+    }
 
 
 @mcp.tool()
@@ -1840,6 +1967,50 @@ async def add_drive(
 
 
 FILE_ROOT_ENV = "NOTEBOOKLM_MCP_FILE_ROOT"
+DEFAULT_DOCKER_FILE_ROOT = "/imports"
+DEFAULT_HOST_IMPORT_DIR = "./mcp_imports"
+
+
+def _file_root_diagnostics(file_path: str, root_env: str | None) -> dict[str, Any]:
+    return {
+        "file_root_env": FILE_ROOT_ENV,
+        "requested_path": file_path,
+        "allowed_root": str(Path(root_env).resolve()) if root_env else None,
+        "host_import_dir": DEFAULT_HOST_IMPORT_DIR
+        if root_env == DEFAULT_DOCKER_FILE_ROOT
+        else None,
+        "server_import_path": DEFAULT_DOCKER_FILE_ROOT
+        if root_env == DEFAULT_DOCKER_FILE_ROOT
+        else None,
+    }
+
+
+def _add_file_error_response(file_path: str, code: str, message: str) -> dict[str, Any]:
+    root_env = os.environ.get(FILE_ROOT_ENV)
+    diagnostics = _file_root_diagnostics(file_path, root_env)
+    next_message = (
+        "Copy the file into ./mcp_imports on the host, then call add_file with "
+        f"`{DEFAULT_DOCKER_FILE_ROOT}/<filename>`."
+        if root_env == DEFAULT_DOCKER_FILE_ROOT
+        else (
+            f"Copy the file into the directory configured by {FILE_ROOT_ENV}, then call "
+            "add_file with that server-side path."
+        )
+        if root_env
+        else f"Set {FILE_ROOT_ENV} to a server directory, or use add_text_source."
+    )
+    return {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+        "diagnostics": diagnostics,
+        "next_action": {
+            "message": next_message,
+            "fallback_tool": "add_text_source",
+        },
+    }
 
 
 def _resolve_allowed_file(file_path: str) -> Path:
@@ -1853,20 +2024,13 @@ def _resolve_allowed_file(file_path: str) -> Path:
     """
     root_env = os.environ.get(FILE_ROOT_ENV)
     if not root_env:
-        raise ValidationError(
-            f"add_file reads files from the MCP SERVER's own filesystem only; it "
-            f"cannot reach a chat sandbox path like /mnt/data. To enable it, set "
-            f"{FILE_ROOT_ENV} to a server directory (and mount one if running in "
-            f"Docker). To ingest text you already have, use add_text_source instead."
-        )
+        raise ValidationError("FILE_ROOT_NOT_CONFIGURED")
     root = Path(root_env).resolve()
     resolved = Path(file_path).resolve()
     if resolved != root and root not in resolved.parents:
-        raise ValidationError(
-            f"file_path must be inside {FILE_ROOT_ENV} ({root}); refusing to read {resolved}."
-        )
+        raise ValidationError("FILE_OUTSIDE_ALLOWED_ROOT")
     if not resolved.is_file():
-        raise ValidationError(f"No such file inside the allowed root: {resolved}")
+        raise ValidationError("FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT")
     return resolved
 
 
@@ -1890,7 +2054,25 @@ async def add_file(
     try:
         safe_path = _resolve_allowed_file(file_path)
     except ValidationError as e:
-        return with_notebook_url({"error": str(e)}, notebook_id)
+        code = str(e)
+        messages = {
+            "FILE_ROOT_NOT_CONFIGURED": (
+                "add_file is disabled because NOTEBOOKLM_MCP_FILE_ROOT is not configured. "
+                "This tool reads files from the MCP server filesystem, not a chat sandbox."
+            ),
+            "FILE_OUTSIDE_ALLOWED_ROOT": (
+                "file_path is outside the configured MCP file root. Chat sandbox paths "
+                "such as /mnt/data are not visible to the MCP server."
+            ),
+            "FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT": (
+                "No readable file exists at that server-side path inside the configured "
+                "MCP file root."
+            ),
+        }
+        return with_notebook_url(
+            _add_file_error_response(file_path, code, messages.get(code, str(e))),
+            notebook_id,
+        )
     source = await client.sources.add_file(notebook_id, str(safe_path))
     return with_notebook_url(
         {"id": source.id, "title": source.title, "status": source_status_to_str(source.status)},

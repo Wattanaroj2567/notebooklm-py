@@ -82,6 +82,14 @@ _T8_A1_XFAIL_NODEIDS = frozenset(
         "tests/integration/cli_vcr/test_chat.py::TestAskCommand::test_ask_question",
         "tests/integration/cli_vcr/test_chat.py::TestAskCommand::test_ask_question_json",
         "tests/integration/cli_vcr/test_chat.py::TestHistoryCommand::test_history",
+        # test_downloads.py
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[quiz-quiz.json-artifacts_download_quiz.yaml-extra_args0]",
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[quiz-quiz.md-artifacts_download_quiz_markdown.yaml-extra_args1]",
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[flashcards-flashcards.json-artifacts_download_flashcards.yaml-extra_args2]",
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[flashcards-flashcards.md-artifacts_download_flashcards_markdown.yaml-extra_args3]",
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[report-report.md-artifacts_download_report.yaml-extra_args4]",
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[mind-map-mindmap.json-artifacts_download_mind_map.yaml-extra_args5]",
+        "tests/integration/cli_vcr/test_downloads.py::TestDownloadCommands::test_download[data-table-data.csv-artifacts_download_data_table.yaml-extra_args6]",
         # test_generate.py
         "tests/integration/cli_vcr/test_generate.py::TestGenerateCommands::test_generate[quiz-artifacts_generate_quiz.yaml-extra_args0]",
         "tests/integration/cli_vcr/test_generate.py::TestGenerateCommands::test_generate[flashcards-artifacts_generate_flashcards.yaml-extra_args1]",

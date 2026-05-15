@@ -97,6 +97,7 @@ EXPECTED_TOOLS = frozenset(
         "add_drive",
         "add_file",
         "check_auth_status",
+        "check_mcp_readiness",
     }
 )
 
@@ -477,6 +478,14 @@ class TestAuthStatus:
 
         assert logging.getLogger("httpx").level >= logging.WARNING
 
+    def test_mcp_server_does_not_configure_root_logging(self):
+        from pathlib import Path
+
+        import notebooklm.mcp_server as srv
+
+        source = Path(srv.__file__).read_text()
+        assert "logging.basicConfig(" not in source
+
     @pytest.mark.asyncio
     async def test_check_auth_status_reports_live_auth_failure_authoritatively(self):
         import notebooklm.mcp_server as srv
@@ -511,6 +520,36 @@ class TestAuthStatus:
         assert result["cookie_rotator"]["active"] == "mcp_container"
         assert result["cookie_rotator"]["host_systemd_timer"] == "disabled"
 
+    @pytest.mark.asyncio
+    async def test_check_mcp_readiness_reports_auth_blocker(self, monkeypatch):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setattr(
+            srv,
+            "_check_auth_health",
+            lambda: {
+                "status": "ok",
+                "days_until_expiry": 30.0,
+                "soonest_expiry": "2026-06-01T00:00:00+00:00",
+                "expired_cookies": [],
+                "warn_cookies": [],
+                "fix_command": None,
+                "message": "Auth cookies look healthy.",
+            },
+        )
+
+        with patch(
+            "notebooklm.mcp_server.get_client",
+            side_effect=RuntimeError("NotebookLM client not ready"),
+        ):
+            result = await srv.check_mcp_readiness()
+
+        assert result["overall_status"] == "blocked"
+        assert result["ready_for_read"] is False
+        assert result["ready_for_text_write"] is False
+        assert result["capabilities"]["auth"]["live_ok"] is False
+        assert result["blocking_issues"][0]["code"] == "LIVE_AUTH_FAILED"
+
 
 # ---------------------------------------------------------------------------
 # Tool logic (mocked client)
@@ -527,6 +566,38 @@ class TestToolLogic:
         srv._client = mock
         yield mock
         srv._client = original
+
+    @pytest.mark.asyncio
+    async def test_check_mcp_readiness_reports_capabilities(
+        self, patch_client, monkeypatch, tmp_path
+    ):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", str(tmp_path))
+        monkeypatch.setattr(
+            srv,
+            "_check_auth_health",
+            lambda: {
+                "status": "ok",
+                "days_until_expiry": 30.0,
+                "soonest_expiry": "2026-06-01T00:00:00+00:00",
+                "expired_cookies": [],
+                "warn_cookies": [],
+                "fix_command": None,
+                "message": "Auth cookies look healthy.",
+            },
+        )
+
+        result = await srv.check_mcp_readiness(notebook_id="nb-1")
+
+        assert result["overall_status"] == "ready"
+        assert result["ready_for_read"] is True
+        assert result["ready_for_text_write"] is True
+        assert result["ready_for_file_ingestion"] is True
+        assert result["capabilities"]["auth"]["live_ok"] is True
+        assert result["capabilities"]["notebooks"]["count"] == 1
+        assert result["capabilities"]["sources"]["ready_count"] == 1
+        assert result["recommended_workflow"][0]["tool"] == "check_mcp_readiness"
 
     @pytest.mark.asyncio
     async def test_list_notebooks_returns_list_of_dicts(self):
@@ -821,6 +892,40 @@ class TestToolLogic:
         assert result["result"] is True
         assert result["deleted"]["note_id"] == "note-1"
         patch_client.notes.delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_add_file_reports_actionable_diagnostics_for_chat_sandbox_path(
+        self, patch_client, monkeypatch
+    ):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", "/imports")
+
+        result = await srv.add_file("nb-1", "/mnt/data/report.md")
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "FILE_OUTSIDE_ALLOWED_ROOT"
+        assert result["diagnostics"]["requested_path"] == "/mnt/data/report.md"
+        assert result["diagnostics"]["allowed_root"] == "/imports"
+        assert result["diagnostics"]["host_import_dir"] == "./mcp_imports"
+        assert "copy" in result["next_action"]["message"].lower()
+        assert "add_text_source" in result["next_action"]["fallback_tool"]
+        patch_client.sources.add_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_file_reports_disabled_file_root_diagnostics(self, patch_client, monkeypatch):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.delenv("NOTEBOOKLM_MCP_FILE_ROOT", raising=False)
+
+        result = await srv.add_file("nb-1", "/mnt/data/report.md")
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "FILE_ROOT_NOT_CONFIGURED"
+        assert result["diagnostics"]["file_root_env"] == "NOTEBOOKLM_MCP_FILE_ROOT"
+        assert result["diagnostics"]["allowed_root"] is None
+        assert "add_text_source" in result["next_action"]["fallback_tool"]
+        patch_client.sources.add_file.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_read_framework_manual_is_deprecated(self):
