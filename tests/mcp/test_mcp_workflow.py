@@ -48,7 +48,7 @@ async def main():
             )
             wait_data = json.loads(_extract_text(wait_res.content[0]))
             print(
-                f"Poll {i+1}: status={wait_data.get('status')} is_ready={wait_data.get('is_ready')}"
+                f"Poll {i + 1}: status={wait_data.get('status')} is_ready={wait_data.get('is_ready')}"
             )
 
             if wait_data.get("is_ready"):

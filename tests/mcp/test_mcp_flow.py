@@ -24,7 +24,7 @@ async def main():
         ready = False
         for i in range(20):  # Max 1 minute polling
             s = await client.sources.get(nb.id, source.id)
-            print(f"Poll {i+1}: {s.status}")
+            print(f"Poll {i + 1}: {s.status}")
             if s.is_ready:
                 ready = True
                 print("✅ Source is ready!")

@@ -35,7 +35,7 @@ def _die(msg: str, code: int = 2) -> None:
 def _normalize_sse_url(url: str) -> str:
     u = url.strip().rstrip("/")
     if not u.endswith("/sse"):
-        _die(f"SSE URL must end with /sse (got {url!r}). " "Example: http://127.0.0.1:8000/sse")
+        _die(f"SSE URL must end with /sse (got {url!r}). Example: http://127.0.0.1:8000/sse")
     return u
 
 
