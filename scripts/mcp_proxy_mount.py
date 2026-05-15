@@ -1,6 +1,5 @@
 import uvicorn
 from fastapi import FastAPI
-
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("test")
