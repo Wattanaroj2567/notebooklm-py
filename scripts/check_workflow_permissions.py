@@ -28,6 +28,8 @@ ALLOWLIST = {
     "publish.yml",
     "rpc-health.yml",
     "testpypi-publish.yml",
+    # Fork-only: pushes the mirrored `main`; permissions are job-scoped.
+    "sync-upstream.yml",
 }
 
 

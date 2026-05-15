@@ -5,13 +5,13 @@ on:
     - cron: "0 2 * * *"  # daily at 02:00 UTC
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   sync:
     name: Fast-forward main from upstream
     runs-on: ubuntu-latest
+    # Job-scoped (this fork-only workflow needs to push the mirrored main).
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
         with:
