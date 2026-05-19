@@ -43,6 +43,24 @@
 > Run the server with `notebooklm-mcp` (configure auth via `notebooklm login`
 > first). `add_file` is sandboxed to `NOTEBOOKLM_MCP_FILE_ROOT`.
 
+## 🤖 Model Context Protocol (MCP) Server
+
+This project includes a fully-featured **MCP server** (`notebooklm-mcp`) that exposes NotebookLM's capabilities as tools to AI agents. 
+
+You can connect NotebookLM directly to:
+* **Claude Code & Claude Desktop** (via standard stdio transport)
+* **ChatGPT Web** (via SSE using Docker + Cloudflare Tunnel)
+* **Custom AI Agents** (Full programmatic access to research workflows and artifact generation)
+
+**What AI Agents can do with this MCP:**
+- Create and manage notebooks
+- Bulk-import sources (URLs, PDFs, YouTube)
+- Trigger and poll deep research workflows
+- Generate artifacts (Audio Overviews, Videos, Study Guides)
+- Perform RAG-based Q&A against NotebookLM sources
+
+👉 [Read the MCP Quickstart Guide](docs/mcp_quickstart.md) for setup instructions.
+
 ## What You Can Build
 
 🤖 **AI Agent Tools** - Integrate NotebookLM into Claude Code, Codex, and other LLM agents. Ships with a root [NotebookLM skill](SKILL.md) for GitHub and `npx skills add` discovery, local `notebooklm skill install` support for Claude Code and `.agents` skill directories, and repo-level Codex guidance in [`AGENTS.md`](AGENTS.md).
