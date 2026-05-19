@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +106,80 @@ class TestLoginUrlValidation:
 
 
 class TestLoginCommand:
+    def test_chromium_preflight_installs_for_new_playwright_dry_run_format(
+        self, tmp_path, monkeypatch
+    ):
+        """Newer Playwright dry-run output lists paths without saying "will download"."""
+        from notebooklm.cli import session
+
+        install_location = tmp_path / "chromium-1200"
+        dry_run = subprocess.CompletedProcess(
+            args=["python", "-m", "playwright", "install", "--dry-run", "chromium"],
+            returncode=0,
+            stdout=(
+                "browser: chromium version 143.0.7499.4\n"
+                f"  Install location:    {install_location}\n"
+                "  Download url:        https://example.test/chromium.zip\n\n"
+                "browser: chromium-headless-shell version 143.0.7499.4\n"
+                f"  Install location:    {tmp_path / 'chromium_headless_shell-1200'}\n"
+            ),
+            stderr="",
+        )
+        install = subprocess.CompletedProcess(
+            args=["python", "-m", "playwright", "install", "chromium"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if "--dry-run" in args:
+                return dry_run
+            return install
+
+        monkeypatch.setattr(session.subprocess, "run", fake_run)
+
+        session._ensure_chromium_installed()
+
+        assert calls == [
+            [sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+        ]
+
+    def test_chromium_preflight_skips_install_when_executable_exists(
+        self, tmp_path, monkeypatch
+    ):
+        from notebooklm.cli import session
+
+        install_location = tmp_path / "chromium-1200"
+        executable = session._chromium_executable_candidates(install_location)[0]
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+        dry_run = subprocess.CompletedProcess(
+            args=["python", "-m", "playwright", "install", "--dry-run", "chromium"],
+            returncode=0,
+            stdout=(
+                "browser: chromium version 143.0.7499.4\n"
+                f"  Install location:    {install_location}\n"
+            ),
+            stderr="",
+        )
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return dry_run
+
+        monkeypatch.setattr(session.subprocess, "run", fake_run)
+
+        session._ensure_chromium_installed()
+
+        assert calls == [
+            [sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"]
+        ]
+
     def test_login_playwright_import_error_handling(self, runner, tmp_path, monkeypatch):
         """Test that ImportError for playwright is handled gracefully.
 

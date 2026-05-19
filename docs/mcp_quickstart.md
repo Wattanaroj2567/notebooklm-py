@@ -42,8 +42,35 @@ export TUNNEL_TOKEN=<your-cloudflare-tunnel-token>
 docker compose up -d --build
 ```
 
-- Service **notebooklm-mcp** exposes port **8000** and mounts `~/.notebooklm` into the container as `/root/.notebooklm` so the same login session as on your machine is used.
+- Service **mcp-auth-sync** runs first, copies your host NotebookLM auth into
+  `./.notebooklm-docker`, and verifies live auth before the MCP server starts.
+- Service **notebooklm-mcp** exposes port **8000** and mounts
+  `./.notebooklm-docker` into the container as `/root/.notebooklm`.
 - Service **mcp-tunnel** runs `cloudflared` and forwards traffic to `http://notebooklm-mcp:8000`.
+
+After any `notebooklm login --fresh` or browser-cookie refresh while the stack
+is already running, refresh the MCP auth mirror with:
+
+```bash
+scripts/sync_mcp_auth.sh
+```
+
+The MCP server detects a changed `storage_state.json` and reloads its
+NotebookLM client before the next tool call. If you use Docker Desktop's UI,
+running the **mcp-auth-sync** service is enough to refresh the auth mirror.
+
+If the MCP logs say Google rejected the cookie file, verify both sides:
+
+```bash
+uv run notebooklm auth check --test --json
+docker exec notebooklm-mcp sh -lc 'notebooklm auth check --test --json'
+```
+
+When the host passes but the container fails, run:
+
+```bash
+scripts/sync_mcp_auth.sh
+```
 
 Point your MCP client at the tunnel hostname with path **`/sse`** (see below).
 

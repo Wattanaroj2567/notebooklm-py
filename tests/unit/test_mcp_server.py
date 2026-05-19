@@ -404,7 +404,9 @@ class TestGetClient:
         import notebooklm.mcp_server as srv
 
         original = srv._client
+        original_signature = srv._client_storage_signature
         srv._client = None
+        srv._client_storage_signature = None
         try:
             with (
                 patch(
@@ -416,13 +418,16 @@ class TestGetClient:
                 await srv.get_client()
         finally:
             srv._client = original
+            srv._client_storage_signature = original_signature
 
     @pytest.mark.asyncio
     async def test_get_client_sanitizes_google_redirect_url_on_auth_failure(self, caplog):
         import notebooklm.mcp_server as srv
 
         original = srv._client
+        original_signature = srv._client_storage_signature
         srv._client = None
+        srv._client_storage_signature = None
         caplog.set_level("ERROR", logger="notebooklm-mcp")
         try:
             with (
@@ -446,6 +451,7 @@ class TestGetClient:
             assert "signin/accountchooser" not in caplog.text
         finally:
             srv._client = original
+            srv._client_storage_signature = original_signature
 
     @pytest.mark.asyncio
     async def test_get_client_returns_same_instance_on_second_call(self):
@@ -455,17 +461,66 @@ class TestGetClient:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
 
         original = srv._client
+        original_signature = srv._client_storage_signature
         srv._client = None
+        srv._client_storage_signature = None
         try:
-            with patch(
-                "notebooklm.mcp_server.NotebookLMClient.from_storage",
-                return_value=mock_client,
+            with (
+                patch("notebooklm.mcp_server._storage_state_signature", return_value=None),
+                patch(
+                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
+                    return_value=mock_client,
+                ),
             ):
                 c1 = await srv.get_client()
                 c2 = await srv.get_client()
                 assert c1 is c2
         finally:
             srv._client = original
+            srv._client_storage_signature = original_signature
+
+    @pytest.mark.asyncio
+    async def test_get_client_reloads_when_storage_state_changes(self):
+        import notebooklm.mcp_server as srv
+
+        first_client = _make_mock_client()
+        first_client.__aenter__ = AsyncMock(return_value=first_client)
+        first_client.__aexit__ = AsyncMock(return_value=None)
+        second_client = _make_mock_client()
+        second_client.__aenter__ = AsyncMock(return_value=second_client)
+
+        original = srv._client
+        original_signature = srv._client_storage_signature
+        srv._client = None
+        srv._client_storage_signature = None
+        try:
+            with (
+                patch(
+                    "notebooklm.mcp_server._storage_state_signature",
+                    side_effect=[
+                        ("storage.json", 1, 100),
+                        ("storage.json", 1, 100),
+                        ("storage.json", 2, 100),
+                    ],
+                ),
+                patch(
+                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
+                    side_effect=[first_client, second_client],
+                ) as from_storage,
+            ):
+                c1 = await srv.get_client()
+                c2 = await srv.get_client()
+                c3 = await srv.get_client()
+
+        finally:
+            srv._client = original
+            srv._client_storage_signature = original_signature
+
+        assert c1 is first_client
+        assert c2 is first_client
+        assert c3 is second_client
+        assert from_storage.call_count == 2
+        first_client.__aexit__.assert_awaited_once_with(None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -612,14 +667,18 @@ class TestAuthStatus:
 
 class TestToolLogic:
     @pytest.fixture(autouse=True)
-    def patch_client(self):
+    def patch_client(self, monkeypatch):
         import notebooklm.mcp_server as srv
 
         mock = _make_mock_client()
         original = srv._client
+        original_signature = srv._client_storage_signature
         srv._client = mock
+        srv._client_storage_signature = None
+        monkeypatch.setattr(srv, "_storage_state_signature", lambda: None)
         yield mock
         srv._client = original
+        srv._client_storage_signature = original_signature
 
     @pytest.mark.asyncio
     async def test_check_mcp_readiness_reports_capabilities(

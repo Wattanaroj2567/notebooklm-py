@@ -24,6 +24,7 @@ from mcp.types import Icon
 
 from notebooklm import NotebookLMClient
 from notebooklm.exceptions import ValidationError
+from notebooklm.paths import get_storage_path
 from notebooklm.rpc import (
     AudioFormat,
     AudioLength,
@@ -370,6 +371,7 @@ except Exception as e:
 # Global client state
 _client: NotebookLMClient | None = None
 _client_lock = asyncio.Lock()
+_client_storage_signature: tuple[str, int, int] | None = None
 
 # --- Auth Health Monitoring ---
 
@@ -581,8 +583,18 @@ async def _auth_watcher(interval_seconds: int = 3600) -> None:
 
 
 async def get_client() -> NotebookLMClient:
-    global _client
+    global _client, _client_storage_signature
     async with _client_lock:
+        storage_signature = _storage_state_signature()
+        if _client is not None and _client_storage_signature != storage_signature:
+            logger.info(
+                "storage_state.json changed; reloading NotebookLM client from refreshed auth"
+            )
+            await _client.__aexit__(None, None, None)
+            _client = None
+            _client_storage_signature = None
+            _invalidate_auth_notice_cache()
+
         if _client is None:
             try:
                 client = await NotebookLMClient.from_storage(
@@ -590,11 +602,13 @@ async def get_client() -> NotebookLMClient:
                 )
                 await client.__aenter__()
                 _client = client
+                _client_storage_signature = storage_signature
                 logger.info("NotebookLM client initialized successfully")
             except Exception as e:
                 # Never leave a half-initialized client cached: if __aenter__
                 # failed, _client must stay None so the next call retries.
                 _client = None
+                _client_storage_signature = None
                 logger.error("Failed to initialize client: %s", _live_auth_failure_message(e))
                 # Force next _get_auth_notice() to re-read disk so callers
                 # immediately see the expired/unknown notice in their response.
@@ -609,6 +623,16 @@ async def get_client() -> NotebookLMClient:
                     f"NotebookLM client not ready. {_live_auth_failure_message(e)}"
                 ) from e
         return _client
+
+
+def _storage_state_signature() -> tuple[str, int, int] | None:
+    """Return the current auth file identity used to detect live auth refreshes."""
+    try:
+        storage_path = get_storage_path().expanduser().resolve()
+        stat = storage_path.stat()
+    except OSError:
+        return None
+    return (str(storage_path), stat.st_mtime_ns, stat.st_size)
 
 
 async def _session_refresh_task(interval_seconds: int = 600) -> None:
@@ -2759,9 +2783,11 @@ async def lifespan(application: FastAPI):
                 pass
 
         # Shutdown: clean up the NotebookLM client
-        global _client
+        global _client, _client_storage_signature
         if _client:
             await _client.__aexit__(None, None, None)
+            _client = None
+            _client_storage_signature = None
 
 
 app = FastAPI(title="NotebookLM Framework MCP", lifespan=lifespan)

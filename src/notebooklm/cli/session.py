@@ -585,9 +585,10 @@ def _ensure_chromium_installed() -> None:
             capture_output=True,
             text=True,
         )
-        # Check if dry-run indicates browser needs installing
-        stdout_lower = result.stdout.lower()
-        if "chromium" not in stdout_lower or "will download" not in stdout_lower:
+        # Check if dry-run indicates browser needs installing. Older
+        # Playwright versions printed "will download"; newer versions list the
+        # install location even when the executable is absent.
+        if not _playwright_chromium_needs_install(result.stdout):
             return
 
         console.print("[yellow]Chromium browser not installed. Installing now...[/yellow]")
@@ -611,6 +612,54 @@ def _ensure_chromium_installed() -> None:
         console.print(
             f"[dim]Warning: Chromium pre-flight check failed: {e}. Proceeding anyway.[/dim]"
         )
+
+
+def _playwright_chromium_needs_install(dry_run_stdout: str) -> bool:
+    """Return True when Playwright's bundled Chromium executable is absent."""
+    stdout_lower = dry_run_stdout.lower()
+    if "chromium" not in stdout_lower:
+        return False
+    if "will download" in stdout_lower:
+        return True
+
+    install_location = _playwright_chromium_install_location(dry_run_stdout)
+    if install_location is None:
+        return False
+
+    return not any(path.exists() for path in _chromium_executable_candidates(install_location))
+
+
+def _playwright_chromium_install_location(dry_run_stdout: str) -> Path | None:
+    """Extract the bundled Chromium install location from Playwright dry-run output."""
+    in_chromium_block = False
+    for line in dry_run_stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("browser: "):
+            in_chromium_block = stripped.lower().startswith("browser: chromium ")
+            continue
+        if in_chromium_block and stripped.startswith("Install location:"):
+            return Path(stripped.split(":", 1)[1].strip())
+    return None
+
+
+def _chromium_executable_candidates(install_location: Path) -> tuple[Path, ...]:
+    """Platform-specific Chromium executable locations under Playwright's cache."""
+    if sys.platform == "win32":
+        return (
+            install_location / "chrome-win" / "chrome.exe",
+            install_location / "chrome-win64" / "chrome.exe",
+        )
+    if sys.platform == "darwin":
+        return (
+            install_location / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+            install_location
+            / "chrome-mac-arm64"
+            / "Chromium.app"
+            / "Contents"
+            / "MacOS"
+            / "Chromium",
+        )
+    return (install_location / "chrome-linux64" / "chrome",)
 
 
 def _recover_page(context: BrowserContext, console: Console) -> Page:

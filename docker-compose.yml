@@ -1,4 +1,67 @@
 services:
+  mcp-auth-sync:
+    build:
+      context: .
+    container_name: notebooklm-mcp-auth-sync
+    restart: "no"
+    environment:
+      - NOTEBOOKLM_PROFILE=${NOTEBOOKLM_PROFILE:-default}
+    volumes:
+      # Read the user's freshly logged-in host profile.
+      - ~/.notebooklm:/host-notebooklm:ro
+      # Write the stable workspace-local mirror consumed by notebooklm-mcp.
+      - ./.notebooklm-docker:/target-notebooklm
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+
+        rm -rf "/target-notebooklm/.sync-tmp"
+
+        if [ ! -f "/host-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json" ]; then
+          echo "Missing host auth file: /host-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json" >&2
+          echo "Run: notebooklm login --fresh" >&2
+          exit 1
+        fi
+
+        mkdir -p "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}"
+        cp "/host-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json" \
+          "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json"
+        chmod 600 "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json"
+
+        if [ -f /host-notebooklm/config.json ]; then
+          cp /host-notebooklm/config.json /target-notebooklm/.sync-tmp/config.json
+          chmod 600 /target-notebooklm/.sync-tmp/config.json
+        fi
+
+        if [ -f "/host-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json" ]; then
+          cp "/host-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json" \
+            "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json"
+          chmod 600 "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json"
+        fi
+
+        NOTEBOOKLM_HOME=/target-notebooklm/.sync-tmp notebooklm auth check --test --json >/dev/null
+
+        mkdir -p "/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}"
+        cp "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json" \
+          "/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json"
+        chmod 600 "/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json"
+
+        if [ -f /target-notebooklm/.sync-tmp/config.json ]; then
+          cp /target-notebooklm/.sync-tmp/config.json /target-notebooklm/config.json
+          chmod 600 /target-notebooklm/config.json
+        fi
+
+        if [ -f "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json" ]; then
+          cp "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json" \
+            "/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json"
+          chmod 600 "/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json"
+        fi
+
+        rm -rf "/target-notebooklm/.sync-tmp"
+        echo "MCP auth mirror synced and verified."
+
   notebooklm-mcp:
     build:
       context: .
@@ -8,6 +71,7 @@ services:
       - PORT=8000
       - HOST=0.0.0.0
       - NOTEBOOKLM_HOME=/root/.notebooklm
+      - NOTEBOOKLM_PROFILE=${NOTEBOOKLM_PROFILE:-default}
       # Optional: NotebookLM notebook containing AI-team manuals and MCP workflow docs.
       # Agents query this through ask_framework_manual instead of local framework files.
       - NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID=${NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID:-}
@@ -15,14 +79,19 @@ services:
       # to import into ./mcp_imports on the host.
       - NOTEBOOKLM_MCP_FILE_ROOT=/imports
     volumes:
-      # Map the entire .notebooklm directory to handle profiles and config correctly
-      - ~/.notebooklm:/root/.notebooklm
+      # Use a workspace-local auth mirror to avoid stale home-directory mounts
+      # in Docker Desktop / sandboxed environments. Refresh it with:
+      #   scripts/sync_mcp_auth.sh
+      - ./.notebooklm-docker:/root/.notebooklm
       # Map MCP skill hints for deterministic tool-use rules.
       - ./MCP_SKILL.md:/app/MCP_SKILL.md:ro
       # Host folder for add_file imports (create ./mcp_imports as needed).
       - ./mcp_imports:/imports
     ports:
       - "8000:8000"
+    depends_on:
+      mcp-auth-sync:
+        condition: service_completed_successfully
 
   # Dedicated tunnel for notebooklm-mcp.tawanlab.site
   # This separates it from the 'notebooklm-backend' tunnel.
