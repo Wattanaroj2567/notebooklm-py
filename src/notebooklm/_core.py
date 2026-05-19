@@ -2,279 +2,174 @@
 
 import asyncio
 import logging
-import math
-import random
+import random  # noqa: F401 - tests patch this for _backoff jitter
 import threading
 import time
 import warnings
-from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn, cast
-from urllib.parse import urlencode
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
 
-from ._env import get_default_language
-from ._logging import reset_request_id, set_request_id
+from ._core_auth import AuthRefreshCoordinator
+
+# Re-exports for the public-on-private import contract. ``_core.py``'s preamble
+# historically held the ``DEFAULT_*`` constants, the auth-error helpers, and the
+# test-only synthetic-error transport plumbing inline. They now live in
+# dedicated seam modules; the imports below preserve the
+# ``from notebooklm._core import …`` surface that tests and first-party callers
+# rely on. Each ``as`` alias keeps ruff's ``unused-import`` lint satisfied while
+# making the re-export intent explicit at the source.
+from ._core_constants import (
+    DEFAULT_CONNECT_TIMEOUT as DEFAULT_CONNECT_TIMEOUT,
+)
+from ._core_constants import (
+    DEFAULT_KEEPALIVE_MIN_INTERVAL as DEFAULT_KEEPALIVE_MIN_INTERVAL,
+)
+from ._core_constants import (
+    DEFAULT_MAX_CONCURRENT_RPCS as DEFAULT_MAX_CONCURRENT_RPCS,
+)
+from ._core_constants import (
+    DEFAULT_MAX_CONCURRENT_UPLOADS as DEFAULT_MAX_CONCURRENT_UPLOADS,
+)
+from ._core_constants import (
+    DEFAULT_TIMEOUT as DEFAULT_TIMEOUT,
+)
+from ._core_cookie_persistence import CookiePersistence
+from ._core_drain import TransportDrainTracker
+
+# Re-exported so the existing import path ``from notebooklm._core import
+# _TransportOperationToken`` keeps working after the dataclass moved into
+# ``_core_drain``. ``_core_drain`` is the source of truth for the token
+# shape; the alias below is the backwards-compat anchor.
+from ._core_drain import _TransportOperationToken as _TransportOperationToken
+
+# Synthetic-error transport plumbing — re-exported so
+# ``tests/unit/test_vcr_config.py``, ``tests/conftest.py``, and
+# ``tests/unit/test_core_lifecycle.py`` (which monkeypatches
+# ``_get_error_injection_mode`` through the ``_core`` module attribute) keep
+# resolving these names as documented. ``_core_lifecycle.ClientLifecycle.open``
+# also reads ``_get_error_injection_mode`` / ``_SyntheticErrorTransport`` via
+# ``from . import _core as _core_module`` at call time so the monkeypatch
+# surface remains hot.
+from ._core_error_injection import (
+    ERROR_INJECT_ENV_VAR as ERROR_INJECT_ENV_VAR,
+)
+from ._core_error_injection import (
+    _get_error_injection_mode as _get_error_injection_mode,
+)
+from ._core_error_injection import (
+    _refuse_synthetic_error_outside_test_context as _refuse_synthetic_error_outside_test_context,
+)
+from ._core_error_injection import (
+    _SyntheticErrorTransport as _SyntheticErrorTransport,
+)
+
+# Cross-seam helpers — re-exported so ``from notebooklm._core import
+# is_auth_error`` keeps working for sub-clients and tests.
+from ._core_helpers import (
+    AUTH_ERROR_PATTERNS as AUTH_ERROR_PATTERNS,
+)
+from ._core_helpers import (
+    _resolve_keepalive_interval as _resolve_keepalive_interval,
+)
+from ._core_helpers import (
+    is_auth_error as is_auth_error,
+)
+from ._core_lifecycle import ClientLifecycle
+from ._core_metrics import ClientMetrics
+from ._core_polling import PendingPolls, PollRegistry
+from ._core_reqid import DEFAULT_STEP as _REQID_DEFAULT_STEP
+from ._core_reqid import ReqidCounter
+from ._core_rpc import RpcExecutor
+from ._core_transport import (
+    MAX_RETRY_AFTER_SECONDS as MAX_RETRY_AFTER_SECONDS,
+)
+from ._core_transport import (
+    AuthedTransport,
+    _AuthSnapshot,
+    _BuildRequest,
+)
+from ._core_transport import (
+    _parse_retry_after as _parse_retry_after,
+)
+from ._core_transport import (
+    _TransportAuthExpired as _TransportAuthExpired,
+)
+from ._core_transport import (
+    _TransportRateLimited as _TransportRateLimited,
+)
+from ._core_transport import (
+    _TransportServerError as _TransportServerError,
+)
+from ._sources import fetch_source_ids
+
+# ``save_cookies_to_storage`` is re-exported as ``notebooklm._core.save_cookies_to_storage``
+# so existing ``monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", …)``
+# sites in tests keep working (used in 8+ test files). The lifecycle helper
+# (``_core_lifecycle.ClientLifecycle.save_cookies``) reads the attribute via
+# ``from . import _core; _core.save_cookies_to_storage`` at call time so the
+# monkeypatched value is what runs on the live save path.
+#
+# ``_rotate_cookies`` is re-exported on the same module-level attribute surface
+# so ``tests/unit/concurrency/test_close_cancellation_leak.py:138``'s
+# ``monkeypatch.setattr("notebooklm._core._rotate_cookies", …)`` keeps
+# affecting the live keepalive loop (the lifecycle helper resolves it via
+# ``from . import _core; _core._rotate_cookies`` at call time).
 from .auth import (
     AuthTokens,
-    CookieSaveResult,
     CookieSnapshot,
-    _rotate_cookies,
-    advance_cookie_snapshot_after_save,
-    build_cookie_jar,
-    format_authuser_value,
-    save_cookies_to_storage,
-    snapshot_cookie_jar,
 )
+from .auth import (
+    _rotate_cookies as _rotate_cookies,
+)
+from .auth import (
+    authuser_query as _authuser_query_value,
+)
+from .auth import (
+    build_cookie_jar as build_cookie_jar,
+)
+from .auth import (
+    format_authuser_value as _format_authuser_header_value,
+)
+from .auth import (
+    save_cookies_to_storage as save_cookies_to_storage,
+)
+from .types import ClientMetricsSnapshot, RpcTelemetryEvent
 
 if TYPE_CHECKING:
     from .types import ConnectionLimits
 
 from .rpc import (
-    AuthError,
-    ClientError,
-    NetworkError,
-    RateLimitError,
-    RPCError,
     RPCMethod,
-    RPCTimeoutError,
-    ServerError,
-    build_request_body,
     decode_response,
-    encode_rpc_request,
-    get_batchexecute_url,
-    resolve_rpc_id,
 )
 
 logger = logging.getLogger(__name__)
-
-# Maximum number of conversations to cache (FIFO eviction)
-MAX_CONVERSATION_CACHE_SIZE = 100
-
-# Default HTTP timeouts in seconds
-DEFAULT_TIMEOUT = 30.0
-DEFAULT_CONNECT_TIMEOUT = 10.0  # Connection establishment timeout
-
-# Minimum keepalive interval to avoid accidentally rate-limiting accounts.google.com
-DEFAULT_KEEPALIVE_MIN_INTERVAL = 60.0
-
-# Auth error detection patterns (case-insensitive)
-# Upper bound on Retry-After wait. Caps both integer-seconds and HTTP-date forms
-# so a malicious or buggy server can't force a multi-hour pause.
-MAX_RETRY_AFTER_SECONDS = 300
-
-
-def _parse_retry_after(value: str | None) -> int | None:
-    """Parse RFC 7231 Retry-After: integer-seconds OR HTTP-date.
-
-    Returns seconds-until-retry as a non-negative int, clamped to
-    ``MAX_RETRY_AFTER_SECONDS``. Returns ``None`` for empty or unparseable input.
-    """
-    if not value:
-        return None
-    value = value.strip()
-    # Integer-seconds form (most common)
-    try:
-        return min(MAX_RETRY_AFTER_SECONDS, max(0, int(value)))
-    except ValueError:
-        pass
-    # HTTP-date form (RFC 7231 §7.1.1.1)
-    try:
-        dt = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    delta = (dt - datetime.now(timezone.utc)).total_seconds()
-    return min(MAX_RETRY_AFTER_SECONDS, max(0, int(delta)))
+_OBSERVABILITY_INIT_LOCK = threading.Lock()
+# Guards ``_auth_coord`` backfill on ``__new__``-built fixtures. Mirrors the
+# observability init lock so two threads can't both observe ``hasattr is False``
+# and race to construct competing :class:`AuthRefreshCoordinator` instances.
+#
+# Dual-implementation sites (kept identical for AST guards in
+# ``tests/unit/test_concurrency_refresh_race.py`` that inspect
+# ``inspect.getsource(ClientCore.update_auth_tokens)`` /
+# ``ClientCore._snapshot``):
+#   - ``ClientCore._snapshot`` (this file) ↔ ``AuthRefreshCoordinator.snapshot``
+#   - ``ClientCore.update_auth_tokens`` (this file) ↔ ``AuthRefreshCoordinator.update_auth_tokens``
+# Any change to auth-snapshot invariants must be applied to BOTH sites. Grep
+# anchor for future maintainers: ``_AUTH_COORD_INIT_LOCK``.
+_AUTH_COORD_INIT_LOCK = threading.Lock()
 
 
-AUTH_ERROR_PATTERNS = (
-    "authentication",
-    "expired",
-    "unauthorized",
-    "unauthenticated",
-    "login",
-    "re-authenticate",
-)
-
-# gRPC canonical status code for an expired/invalid session. A stale
-# NotebookLM session token (f.sid / SNlM0e) returns HTTP 200 whose decoded
-# batchexecute payload carries this code — see rpc/decoder.py.
-_GRPC_UNAUTHENTICATED = 16
+def _decode_response_late_bound(raw: str, rpc_id: str, *, allow_null: bool = False) -> Any:
+    return decode_response(raw, rpc_id, allow_null=allow_null)
 
 
-@dataclass(frozen=True)
-class _AuthSnapshot:
-    """Point-in-time view of auth headers used to build a single request.
-
-    Captured once per HTTP attempt by ``_perform_authed_post`` and passed
-    into the caller-supplied ``build_request`` factory so the URL/body are
-    consistent for that attempt. On retry, a *new* snapshot is taken so
-    refreshed credentials are picked up before the rebuild.
-    """
-
-    csrf_token: str
-    session_id: str
-    authuser: int
-    account_email: str | None
-
-
-class _TransportAuthExpired(Exception):
-    """Raised by ``_perform_authed_post`` when the refresh callback itself
-    failed during an auth recovery attempt.
-
-    ``original`` is the transport-layer ``httpx.HTTPStatusError`` that
-    triggered the refresh attempt — :func:`is_auth_error` only flags
-    ``HTTPStatusError`` responses, so network-level ``RequestError``s never
-    reach this path. The refresh callback's error is attached via
-    ``__cause__``.
-
-    Callers map this onto their own error domain:
-
-    - ``rpc_call`` re-raises ``original`` so legacy callers that catch
-      :class:`httpx.HTTPStatusError` keep working byte-for-byte.
-    - ``query_post`` translates this into :class:`ChatError`.
-    """
-
-    def __init__(self, message: str, *, original: Exception):
-        super().__init__(message)
-        self.original = original
-
-
-class _TransportRateLimited(Exception):
-    """Raised by ``_perform_authed_post`` when the 429 retry budget is
-    exhausted (or no retries are configured).
-
-    ``retry_after`` carries the parsed (clamped) Retry-After value when the
-    server provided one; ``response`` is the final httpx response so callers
-    can read status / reason for their own error message.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        retry_after: int | None,
-        response: httpx.Response,
-        original: httpx.HTTPStatusError,
-    ):
-        super().__init__(message)
-        self.retry_after = retry_after
-        self.response = response
-        self.original = original
-
-
-class _TransportServerError(Exception):
-    """Raised by ``_perform_authed_post`` when the server-error retry budget
-    is exhausted.
-
-    Covers two retryable failure modes that share an exponential-backoff
-    schedule (synthesis C4 / T4):
-
-    - ``isinstance(original, httpx.HTTPStatusError)`` with a 5xx status —
-      the response is available via ``response`` / ``status_code``.
-    - ``isinstance(original, httpx.RequestError)`` — a network-layer failure
-      (timeout, connect error, ...). ``response`` and ``status_code`` are
-      ``None`` in this case.
-
-    Callers map this onto their own error domain:
-
-    - ``rpc_call`` translates this back into the historical :class:`ServerError`
-      / :class:`NetworkError` shapes the RPC API has always raised.
-    - ``query_post`` translates this into :class:`ChatError` /
-      :class:`NetworkError` to match the chat API contract.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        original: Exception,
-        response: httpx.Response | None = None,
-        status_code: int | None = None,
-    ):
-        super().__init__(message)
-        self.original = original
-        self.response = response
-        self.status_code = status_code
-
-
-# Build-request factory: receives a fresh ``_AuthSnapshot`` and returns the
-# triple (url, body, extra_headers) for one HTTP attempt. ``_perform_authed_post``
-# invokes this once per attempt so refreshed snapshots are picked up on retry.
-_BuildRequest = Callable[[_AuthSnapshot], tuple[str, str, dict[str, str]]]
-
-
-def _resolve_keepalive_interval(keepalive: float | None, min_interval: float) -> float | None:
-    """Validate and clamp the keepalive interval.
-
-    ``None`` disables the background task. Otherwise both values must be
-    positive finite numbers; the effective interval is ``max(keepalive,
-    min_interval)`` so callers can't accidentally lower the rate-limit floor.
-    """
-    if not (math.isfinite(min_interval) and min_interval > 0):
-        raise ValueError(
-            f"keepalive_min_interval must be a positive finite number, got {min_interval!r}"
-        )
-    if keepalive is None:
-        return None
-    if not (math.isfinite(keepalive) and keepalive > 0):
-        raise ValueError(f"keepalive must be None or a positive finite number, got {keepalive!r}")
-    return max(keepalive, min_interval)
-
-
-def is_auth_error(error: Exception) -> bool:
-    """Check if an exception indicates an authentication failure.
-
-    Args:
-        error: The exception to check.
-
-    Returns:
-        True if the error is likely due to authentication issues.
-    """
-    # AuthError is always an auth error
-    if isinstance(error, AuthError):
-        return True
-
-    # Don't treat network/rate limit/server errors as auth errors
-    # even if they're subclasses of RPCError
-    if isinstance(
-        error,
-        NetworkError | RPCTimeoutError | RateLimitError | ServerError | ClientError,
-    ):
-        return False
-
-    # HTTP 400/401/403 are auth errors.
-    # Google returns 400 for expired CSRF tokens (not 401/403). Layer-1
-    # recovery (refresh_auth) re-extracts SNlM0e from the NotebookLM
-    # homepage and retries with a fresh token. The retry guard
-    # (``_is_retry`` in ``rpc_call``) bounds wasted refreshes on legitimate
-    # 400s (bad payload) to one extra GET per call.
-    if isinstance(error, httpx.HTTPStatusError):
-        return error.response.status_code in (400, 401, 403)
-
-    # RPCError carrying an explicit UNAUTHENTICATED (gRPC code 16) status,
-    # or an auth-related message. Stale session tokens surface as a 200 OK
-    # whose decoded RPCError has rpc_code=16 and the message
-    # "...returned null result with status code 16 (Unauthenticated)." —
-    # the message form previously missed AUTH_ERROR_PATTERNS so the
-    # refresh+retry path never fired (the original Docker auth-drop bug).
-    if isinstance(error, RPCError):
-        rpc_code = getattr(error, "rpc_code", None)
-        if rpc_code is not None and str(rpc_code) == str(_GRPC_UNAUTHENTICATED):
-            return True
-        message = str(error).lower()
-        return any(pattern in message for pattern in AUTH_ERROR_PATTERNS)
-
-    return False
+def _sleep_late_bound(seconds: float) -> Awaitable[Any]:
+    return asyncio.sleep(seconds)
 
 
 class ClientCore:
@@ -300,9 +195,12 @@ class ClientCore:
         keepalive: float | None = None,
         keepalive_min_interval: float = DEFAULT_KEEPALIVE_MIN_INTERVAL,
         keepalive_storage_path: Path | None = None,
-        rate_limit_max_retries: int = 0,
+        rate_limit_max_retries: int = 3,
         server_error_max_retries: int = 3,
         limits: "ConnectionLimits | None" = None,
+        max_concurrent_uploads: int | None = DEFAULT_MAX_CONCURRENT_UPLOADS,
+        max_concurrent_rpcs: int | None = DEFAULT_MAX_CONCURRENT_RPCS,
+        on_rpc_event: Callable[[RpcTelemetryEvent], object] | None = None,
     ):
         """Initialize the core client.
 
@@ -325,14 +223,17 @@ class ClientCore:
                 Must be a positive finite number.
             keepalive_storage_path: Optional storage path to persist rotated cookies
                 to from the keepalive loop. Falls back to ``auth.storage_path``.
-            rate_limit_max_retries: Max automatic retries when a 429 response carries
-                a parseable ``Retry-After`` header. ``0`` (default) preserves the
-                pre-Phase-3 contract of raising ``RateLimitError`` immediately —
-                opt in to a positive value to enable bounded sleep-and-retry.
-                Each retry sleeps for the (clamped) ``Retry-After`` value; that
-                per-attempt value is capped at ``MAX_RETRY_AFTER_SECONDS``, but
-                the cumulative sleep across N retries is ``N * cap``, so pick
-                ``rate_limit_max_retries`` accordingly.
+            rate_limit_max_retries: Max automatic retries on HTTP 429.
+                Defaults to ``3`` so programmatic users
+                inherit "smart retry" behavior without having to opt in. Set
+                to ``0`` to raise ``RateLimitError`` immediately. Each retry
+                sleeps for the
+                ``Retry-After`` value when the server provides a parseable
+                header (clamped at ``MAX_RETRY_AFTER_SECONDS``); when the
+                header is absent or unparseable, the loop falls back to
+                capped exponential backoff ``min(2 ** attempt, 30)`` seconds
+                with ±20% jitter, matching the 5xx path so the positive
+                default is still useful when Google omits the hint.
             server_error_max_retries: Max automatic retries for retryable transient
                 transport failures: HTTP 5xx responses and network-layer
                 ``httpx.RequestError`` (timeouts, connect errors). Defaults to
@@ -348,19 +249,76 @@ class ClientCore:
                 explicit ``ConnectionLimits(...)`` to widen the pool for
                 heavy batch workloads (e.g. FastAPI/Django services that
                 share one client across many concurrent requests).
+            max_concurrent_uploads: Ceiling on simultaneous in-flight
+                ``SourcesAPI.add_file`` uploads. Defaults to
+                ``DEFAULT_MAX_CONCURRENT_UPLOADS`` (4). ``None`` resolves to
+                the default — unbounded uploads are intentionally rejected
+                because each in-flight upload holds one open file
+                descriptor for the duration of the upload, and an
+                unbounded fan-out exhausts the per-process FD limit. Must
+                be ``>= 1`` when supplied. Independent
+                of the RPC connection pool because uploads use their own
+                ``httpx.AsyncClient`` (Scotty endpoint) and don't share
+                the RPC pool.
+            max_concurrent_rpcs: Ceiling on simultaneous in-flight
+                ``_perform_authed_post`` RPC POSTs. Defaults to
+                ``DEFAULT_MAX_CONCURRENT_RPCS`` (16) — well below the
+                default httpx pool size (``max_connections=100``) so
+                short-lived helper requests (refresh GETs, upload
+                preflights) outside this gate still have pool headroom.
+                Pass ``None`` to disable the gate entirely (callers with
+                an external rate-limiter or single-shot CLI work).
+                Must be ``>= 1`` when supplied. Before this gate was added,
+                heavy fan-out workloads tripped opaque
+                ``httpx.PoolTimeout`` errors before the connection pool
+                could surface clean back-pressure. Cross-
+                validation with ``limits.max_connections`` is enforced at
+                the ``NotebookLMClient`` boundary (so the constraint
+                applies whether ``limits`` is explicit or auto-defaulted
+                inside ``ClientCore``).
+            on_rpc_event: Optional callback invoked after each logical
+                ``rpc_call`` succeeds or fails. The callback receives a
+                backend-agnostic :class:`RpcTelemetryEvent`; exceptions raised
+                by the callback are logged and never mask the RPC result.
 
         Raises:
             ValueError: If ``keepalive`` or ``keepalive_min_interval`` is not a
-                positive finite number.
+                positive finite number, or if ``max_concurrent_uploads`` /
+                ``max_concurrent_rpcs`` is a non-positive integer.
+            RuntimeError: If ``NOTEBOOKLM_VCR_RECORD_ERRORS`` is set to a
+                recognised mode without a ``PYTEST_CURRENT_TEST`` environment
+                marker. The env var is test-only — see
+                :func:`_refuse_synthetic_error_outside_test_context`.
         """
+        # P1-12: refuse instantiation if the test-only synthetic-error env var
+        # is set without pytest context. Catches leaked deploy envs at the
+        # earliest opportunity, before any HTTP client is constructed. The
+        # guard is a no-op for the normal production path (env var unset)
+        # and for legitimate pytest contexts (PYTEST_CURRENT_TEST set).
+        _refuse_synthetic_error_outside_test_context()
         # Lazy import to break the types.py -> _core.py cycle.
         from .types import ConnectionLimits
 
         self.auth = auth
-        self._timeout = timeout
-        self._connect_timeout = connect_timeout
-        self._limits = limits if limits is not None else ConnectionLimits()
-        self._refresh_callback = refresh_callback
+        # HTTP timeouts, connection limits, keepalive interval / storage_path,
+        # the live ``httpx.AsyncClient``, the captured ``_bound_loop``, and
+        # the keepalive background task all live on ``self._lifecycle``
+        # (constructed below alongside the other extracted helpers so the
+        # inter-helper dependency order is obvious). Compat properties further
+        # down preserve the legacy ``_timeout`` / ``_http_client`` /
+        # ``_bound_loop`` / ``_keepalive_task`` / ``_keepalive_interval`` /
+        # ``_keepalive_storage_path`` ivar names for tests and first-party
+        # callers that probe or assign them directly. The
+        # ``_connect_timeout`` / ``_limits`` bridges were dropped in
+        # D1-audit-full; access them via ``self._lifecycle`` if needed.
+        _resolved_limits = limits if limits is not None else ConnectionLimits()
+        # ``_refresh_retry_delay`` stays here directly — it is read on the
+        # RPC retry path by ``RpcExecutor`` and ``AuthedTransport`` and SET
+        # by integration tests against ``client._core``. The refresh
+        # callback + the four refresh/auth-snapshot ivars (``_refresh_lock``,
+        # ``_refresh_task``, ``_refresh_callback``, ``_auth_snapshot_lock``)
+        # live on ``self._auth_coord``, constructed below alongside the other
+        # extracted helpers so the inter-helper dependency order is obvious.
         self._refresh_retry_delay = refresh_retry_delay
         if rate_limit_max_retries < 0:
             raise ValueError(f"rate_limit_max_retries must be >= 0, got {rate_limit_max_retries}")
@@ -370,57 +328,398 @@ class ClientCore:
                 f"server_error_max_retries must be >= 0, got {server_error_max_retries}"
             )
         self._server_error_max_retries = server_error_max_retries
-        self._refresh_lock: asyncio.Lock | None = asyncio.Lock() if refresh_callback else None
-        self._refresh_task: asyncio.Task[AuthTokens] | None = None
-        self._http_client: httpx.AsyncClient | None = None
+        # ``None`` resolves to the default (``DEFAULT_MAX_CONCURRENT_UPLOADS``)
+        # rather than meaning "unbounded" — the FD-exhaustion guard is the
+        # whole point of the knob; an unbounded fan-out of ``add_file`` would
+        # exhaust the per-process FD limit before the upload semaphore could
+        # save us. Reject ``<= 0`` loudly at construction
+        # rather than allowing a silently-misconfigured pipeline.
+        if max_concurrent_uploads is None:
+            self._max_concurrent_uploads = DEFAULT_MAX_CONCURRENT_UPLOADS
+        else:
+            if max_concurrent_uploads < 1:
+                raise ValueError(
+                    f"max_concurrent_uploads must be >= 1, got {max_concurrent_uploads!r}"
+                )
+            self._max_concurrent_uploads = max_concurrent_uploads
+        # Lazily-created (``asyncio.Semaphore()`` needs a running loop in
+        # some Python versions, and ``ClientCore`` can be constructed
+        # outside one). Use ``get_upload_semaphore()`` to fetch the live
+        # semaphore on demand. Per-instance — never module-global — so two
+        # ``NotebookLMClient`` instances in the same process have
+        # independent upload budgets.
+        self._upload_semaphore: asyncio.Semaphore | None = None
+        # RPC-fanout throttle. ``None`` means "no
+        # gate" (caller has an external rate-limiter, or this is a
+        # single-shot CLI invocation). Default ``DEFAULT_MAX_CONCURRENT_RPCS``
+        # (16) sits well below the default ``ConnectionLimits.max_connections``
+        # so helper GET/POSTs outside the RPC pipeline still have pool
+        # headroom. Cross-validation with ``limits.max_connections`` is
+        # enforced one layer up at ``NotebookLMClient.__init__`` because
+        # ``ClientCore`` synthesizes its own ``ConnectionLimits()`` when
+        # ``limits=None``, masking the relationship at this layer.
+        if max_concurrent_rpcs is None:
+            self._max_concurrent_rpcs: int | None = None
+        else:
+            if max_concurrent_rpcs < 1:
+                raise ValueError(f"max_concurrent_rpcs must be >= 1, got {max_concurrent_rpcs!r}")
+            self._max_concurrent_rpcs = max_concurrent_rpcs
+        # Lazily-created for the same reason as ``_upload_semaphore``
+        # (``asyncio.Semaphore()`` binds to the running loop in some
+        # Python versions). Per-instance, never module-global. When
+        # ``_max_concurrent_rpcs is None``, the accessor returns a
+        # ``contextlib.nullcontext`` instead — see ``_get_rpc_semaphore``.
+        self._rpc_semaphore: asyncio.Semaphore | None = None
+        # Observability counters + telemetry callback. Compat properties
+        # below (``_metrics_lock`` / ``_metrics`` / ``_on_rpc_event``) bridge
+        # the legacy ivar names back into this helper.
+        self._metrics_obj = ClientMetrics(on_rpc_event=on_rpc_event)
+        # Transport drain bookkeeping (in-flight posts, drain condition,
+        # per-task operation depth, draining flag). Compat properties below
+        # (``_in_flight_posts`` / ``_drain_condition`` / ``_draining``)
+        # bridge the legacy ivar names back into this helper. The
+        # ``_operation_depths`` bridge was dropped in D1-audit-full; access
+        # the WeakKeyDictionary on ``self._drain_tracker`` directly. The
+        # helper's ``__init__`` is event-loop-agnostic; the
+        # ``asyncio.Condition`` is created lazily on first
+        # ``get_drain_condition`` call.
+        self._drain_tracker = TransportDrainTracker()
         # Request ID counter for chat API (must be unique per request).
-        # Access via the ``next_reqid()`` async method, which guards mutation
-        # under ``_reqid_lock``. Direct mutation through the ``_reqid_counter``
-        # property setter emits a ``DeprecationWarning``; bypass the warning
-        # for legitimate test setup by writing to ``_reqid_counter_value``.
-        self._reqid_counter_value: int = 100000
-        # Lazily-created — ``asyncio.Lock()`` needs a running loop in some
-        # Python versions, and this object can be constructed outside one.
-        self._reqid_lock: asyncio.Lock | None = None
-        # OrderedDict for FIFO eviction when cache exceeds MAX_CONVERSATION_CACHE_SIZE
-        self._conversation_cache: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
-        # Keepalive background task configuration
-        self._keepalive_interval: float | None = _resolve_keepalive_interval(
-            keepalive, keepalive_min_interval
-        )
-        # Prefer the explicit storage_path if provided (e.g. NotebookLMClient(storage_path=...)
-        # with a manually-built AuthTokens), otherwise fall back to auth.storage_path.
-        self._keepalive_storage_path: Path | None = (
+        # The :class:`ReqidCounter` helper owns the monotonic ``_value`` and
+        # the lazily-allocated ``asyncio.Lock`` that serialises mutation.
+        # The ``_reqid_counter`` compat property below bridges the legacy
+        # ivar name back into this helper; ``_reqid_counter_value`` and
+        # ``_reqid_lock`` bridges were dropped in D1-audit-full (access
+        # ``self._reqid.value`` / ``self._reqid._lock`` directly if needed).
+        # The ``on_lock_wait`` hook keeps the
+        # cumulative ``lock_wait_seconds_*`` metrics ticking inside
+        # ``self._metrics_obj`` even though the counter is now extracted.
+        self._reqid = ReqidCounter(on_lock_wait=self._record_lock_wait)
+        # Auth refresh coordination — single-flight refresh task, snapshot
+        # serialization, and cookie-jar sync. The coordinator owns
+        # ``_refresh_lock``, ``_refresh_task``, ``_refresh_callback``, and
+        # ``_auth_snapshot_lock``; field names match the legacy
+        # ``ClientCore`` ivars so the surviving compat properties
+        # (``_refresh_lock``, ``_refresh_task``, ``_refresh_callback``)
+        # delegate cleanly. The ``_auth_snapshot_lock`` bridge was dropped
+        # in D1-audit-full; the live lock is reachable via
+        # :meth:`_get_auth_snapshot_lock`.
+        # The auth snapshot lock is intentionally distinct from
+        # ``_refresh_lock`` — mixing them would re-introduce the
+        # reentrancy ambiguity that snapshot-side serialization was added
+        # to avoid. The attribute name ``_auth_coord`` is part of the
+        # inter-helper contract for the upcoming B2/C1 extractions; do not
+        # rename.
+        self._auth_coord = AuthRefreshCoordinator(refresh_callback=refresh_callback)
+        # HTTP-client lifecycle — owns ``_http_client``, ``_bound_loop``,
+        # ``_keepalive_task``, ``_keepalive_interval``,
+        # ``_keepalive_storage_path``, ``_timeout``, ``_connect_timeout``,
+        # ``_limits``. Compat properties further down preserve the legacy
+        # ivar names. The ``_resolve_keepalive_interval`` clamp now lives in
+        # :mod:`notebooklm._core_helpers` and is re-exported above so
+        # ``from notebooklm._core import _resolve_keepalive_interval`` keeps
+        # resolving; we call it through the re-exported binding here.
+        #
+        # Event-loop affinity guard rationale: the lifecycle captures
+        # ``asyncio.get_running_loop()`` in ``_bound_loop`` at ``open()`` time
+        # and the cross-loop check in ``_perform_authed_post`` (via
+        # :class:`AuthedTransport`) does a cheap ``is`` comparison against
+        # it. Each client is per-loop — the asyncio primitives we hold
+        # (``_reqid_lock``, ``_refresh_lock``, ``_auth_snapshot_lock``,
+        # ``_upload_semaphore``, ``_rpc_semaphore``, the ``httpx.AsyncClient``
+        # pool, in-flight tasks like ``_refresh_task`` / ``_keepalive_task``)
+        # are all bound to the loop that ``open()`` ran on; reusing them
+        # under a different loop produces hangs and ``RuntimeError`` deep
+        # in httpx instead of an actionable message at the call site.
+        #
+        # Prefer the explicit storage_path if provided (e.g.
+        # ``NotebookLMClient(storage_path=...)`` with a manually-built
+        # ``AuthTokens``), otherwise fall back to ``auth.storage_path``.
+        _resolved_storage_path: Path | None = (
             keepalive_storage_path if keepalive_storage_path is not None else auth.storage_path
         )
-        self._keepalive_task: asyncio.Task[None] | None = None
-        # Serializes keepalive's worker-thread save with close()'s on-close save
-        # so that newer state always wins. Without this, an in-flight keepalive
-        # save kicked off before close() can finish *after* close()'s own save
-        # and clobber it (an older snapshot overwriting the freshest state).
-        self._save_lock = threading.Lock()
-        # Open-time cookie snapshot — the input to the dirty-flag/delta merge
-        # in save_cookies_to_storage. Captured in ``open()`` and forwarded
-        # through every ``save_cookies`` call so a stale in-memory jar can't
-        # clobber sibling-process writes (docs/auth-keepalive.md §3.4.1).
-        # Per-instance, never module-global.
-        self._loaded_cookie_snapshot: CookieSnapshot | None = None
-        # Leader/follower polling-dedupe registry for
-        # ``ArtifactsAPI.wait_for_completion`` (audit §21 / T7.E2).
-        # Keyed by ``(notebook_id, task_id)``. Each entry is a
-        # ``(future, task)`` pair: the first caller for a key is the
-        # *leader* and spawns the ``task`` (a shielded ``_poll_loop`` task);
-        # subsequent callers (*followers*) attach to ``future`` via
-        # ``asyncio.shield(future)`` so their per-caller cancellations
-        # don't propagate to the underlying poll. The task reference is
-        # kept alongside the future so the running poll task can't be
-        # GC'd if the leader is cancelled with no followers attached
-        # (Python's task-GC contract is permissive). Per-instance —
-        # never module-global, so a fresh ``ClientCore`` cannot inherit
-        # a dangling entry from a prior instance.
-        self._pending_polls: dict[
-            tuple[str, str], tuple[asyncio.Future[Any], asyncio.Task[Any]]
-        ] = {}
+        self._lifecycle = ClientLifecycle(
+            timeout=timeout,
+            connect_timeout=connect_timeout,
+            limits=_resolved_limits,
+            keepalive_interval=_resolve_keepalive_interval(keepalive, keepalive_min_interval),
+            keepalive_storage_path=_resolved_storage_path,
+        )
+        # Owns the in-process save lock and open-time cookie baseline while
+        # compatibility properties below keep the legacy private attribute
+        # names observable for current tests and first-party callers.
+        self.cookie_persistence = CookiePersistence(self.auth, _resolved_storage_path)
+        self.poll_registry: PollRegistry = PollRegistry()
+        self._authed_transport: AuthedTransport | None = None
+        self._rpc_executor: RpcExecutor | None = None
+
+    @property
+    def _save_lock(self) -> threading.Lock:
+        """Compatibility bridge to ``CookiePersistence``'s in-process save lock."""
+        return self.cookie_persistence.save_lock
+
+    # ``_save_lock`` setter dropped in arch-d2-cutover: zero external callers.
+
+    @property
+    def _loaded_cookie_snapshot(self) -> CookieSnapshot | None:
+        """Compatibility bridge to the cookie save baseline."""
+        return self.cookie_persistence.loaded_cookie_snapshot
+
+    @_loaded_cookie_snapshot.setter
+    def _loaded_cookie_snapshot(self, value: CookieSnapshot | None) -> None:
+        self.cookie_persistence.loaded_cookie_snapshot = value
+
+    # ``ClientMetrics`` compat bridges. The three observability ivars now live
+    # on ``self._metrics_obj``; each setter calls ``_ensure_observability_state``
+    # first so a ``__new__``-built fixture (no ``__init__`` ran) can still
+    # assign ``core._on_rpc_event = cb`` and have it write through.
+    @property
+    def _metrics_lock(self) -> threading.Lock:
+        self._ensure_observability_state()
+        return self._metrics_obj._metrics_lock
+
+    @_metrics_lock.setter
+    def _metrics_lock(self, value: threading.Lock) -> None:
+        self._ensure_observability_state()
+        self._metrics_obj._metrics_lock = value
+
+    @property
+    def _metrics(self) -> ClientMetricsSnapshot:
+        self._ensure_observability_state()
+        return self._metrics_obj._metrics
+
+    @_metrics.setter
+    def _metrics(self, value: ClientMetricsSnapshot) -> None:
+        self._ensure_observability_state()
+        self._metrics_obj._metrics = value
+
+    @property
+    def _on_rpc_event(self) -> Callable[[RpcTelemetryEvent], object] | None:
+        self._ensure_observability_state()
+        return self._metrics_obj._on_rpc_event
+
+    @_on_rpc_event.setter
+    def _on_rpc_event(self, value: Callable[[RpcTelemetryEvent], object] | None) -> None:
+        self._ensure_observability_state()
+        self._metrics_obj._on_rpc_event = value
+
+    # ``TransportDrainTracker`` compat bridges. The four drain ivars now live
+    # on ``self._drain_tracker``; each setter calls
+    # ``_ensure_observability_state`` first so a ``__new__``-built fixture
+    # (no ``__init__`` ran) can still assign (e.g.) ``core._draining = True``
+    # or ``core._drain_condition = asyncio.Condition()`` and have it write
+    # through to a real helper.
+    @property
+    def _in_flight_posts(self) -> int:
+        self._ensure_observability_state()
+        return self._drain_tracker._in_flight_posts
+
+    @_in_flight_posts.setter
+    def _in_flight_posts(self, value: int) -> None:
+        self._ensure_observability_state()
+        self._drain_tracker._in_flight_posts = value
+
+    @property
+    def _draining(self) -> bool:
+        self._ensure_observability_state()
+        return self._drain_tracker._draining
+
+    @_draining.setter
+    def _draining(self, value: bool) -> None:
+        self._ensure_observability_state()
+        self._drain_tracker._draining = value
+
+    @property
+    def _drain_condition(self) -> asyncio.Condition | None:
+        self._ensure_observability_state()
+        return self._drain_tracker._drain_condition
+
+    @_drain_condition.setter
+    def _drain_condition(self, value: asyncio.Condition | None) -> None:
+        self._ensure_observability_state()
+        self._drain_tracker._drain_condition = value
+
+    # ``_operation_depths`` compat bridge dropped (D1-audit-full): zero
+    # external callers; direct ivar lives on ``self._drain_tracker``.
+
+    # ------------------------------------------------------------------
+    # ``AuthRefreshCoordinator`` compat bridges. Refresh/auth-snapshot state
+    # now lives on ``self._auth_coord``; the four legacy ivar names are
+    # preserved as writeable properties so the dozens of test sites that
+    # do ``core._refresh_callback = stub`` / ``core._refresh_lock = asyncio.Lock()``
+    # keep working without modification. ``_ensure_auth_coord`` mirrors the
+    # ``_ensure_observability_state`` backfill so ``__new__``-built fixtures
+    # (no ``__init__`` ran) still resolve cleanly.
+    # ------------------------------------------------------------------
+
+    def _ensure_auth_coord(self) -> None:
+        """Backfill ``_auth_coord`` for tests that construct via ``__new__``.
+
+        Mirrors :meth:`_ensure_observability_state` — uses a module-level
+        threading lock for double-checked locking so two threads racing
+        through ``hasattr`` cannot both decide they need to construct a
+        coordinator and silently discard each other's locks/refresh task.
+
+        Also primes ``_metrics_obj`` because every coordinator method reaches
+        into ``host._metrics_obj`` (e.g. ``record_lock_wait`` inside
+        :meth:`AuthRefreshCoordinator.snapshot` /
+        :meth:`AuthRefreshCoordinator.update_auth_tokens`). Without this,
+        a ``__new__``-built fixture that calls ``_await_refresh`` /
+        ``_snapshot`` / ``update_auth_tokens`` before any observability
+        compat-bridge setter would surface as
+        ``AttributeError: '_StubCore' has no attribute '_metrics_obj'``
+        rather than backfilling gracefully.
+        """
+        if hasattr(self, "_auth_coord"):
+            return
+        self._ensure_observability_state()
+        with _AUTH_COORD_INIT_LOCK:
+            if not hasattr(self, "_auth_coord"):
+                self._auth_coord = AuthRefreshCoordinator(refresh_callback=None)
+
+    @property
+    def _refresh_lock(self) -> asyncio.Lock | None:
+        self._ensure_auth_coord()
+        return self._auth_coord._refresh_lock
+
+    @_refresh_lock.setter
+    def _refresh_lock(self, value: asyncio.Lock | None) -> None:
+        self._ensure_auth_coord()
+        self._auth_coord._refresh_lock = value
+
+    @property
+    def _refresh_task(self) -> asyncio.Task[AuthTokens] | None:
+        self._ensure_auth_coord()
+        return self._auth_coord._refresh_task
+
+    # ``_refresh_task`` setter dropped in arch-d2-cutover: zero external callers.
+
+    @property
+    def _refresh_callback(self) -> Callable[[], Awaitable[AuthTokens]] | None:
+        self._ensure_auth_coord()
+        return self._auth_coord._refresh_callback
+
+    @_refresh_callback.setter
+    def _refresh_callback(self, value: Callable[[], Awaitable[AuthTokens]] | None) -> None:
+        self._ensure_auth_coord()
+        self._auth_coord._refresh_callback = value
+
+    # ``_auth_snapshot_lock`` compat bridge dropped (D1-audit-full): zero
+    # external callers. Live accessor remains ``_get_auth_snapshot_lock()`` /
+    # ``AuthRefreshCoordinator.get_auth_snapshot_lock()``.
+
+    # ------------------------------------------------------------------
+    # ``ClientLifecycle`` compat bridges. HTTP-client lifecycle state now
+    # lives on ``self._lifecycle``; the six surviving legacy ivar names
+    # (``_http_client``, ``_bound_loop``, ``_keepalive_task``,
+    # ``_keepalive_interval``, ``_keepalive_storage_path``, ``_timeout``)
+    # are preserved here as ``@property`` bridges. The
+    # ``_connect_timeout`` / ``_limits`` bridges were dropped in
+    # D1-audit-full (zero external callers). The ``_timeout`` bridge is
+    # retained because ``RpcExecutor`` (``_core_rpc.py``) reads
+    # ``self._owner._timeout`` via the :class:`RpcOwner` Protocol; removing
+    # it would surface as ``AttributeError`` on every RPC call.
+    # ``_ensure_lifecycle`` mirrors the ``_ensure_observability_state`` /
+    # ``_ensure_auth_coord`` backfill so ``__new__``-built fixtures (no
+    # ``__init__`` ran) still resolve cleanly.
+    # ------------------------------------------------------------------
+
+    def _ensure_lifecycle(self) -> None:
+        """Backfill ``_lifecycle`` for tests that construct via ``__new__``.
+
+        Uses a module-level threading lock (the existing
+        ``_OBSERVABILITY_INIT_LOCK``) for double-checked locking so two
+        threads racing through ``hasattr`` cannot both decide they need to
+        construct a lifecycle and silently discard each other's
+        ``_http_client`` references.
+
+        ``__new__``-built fixtures may not have the underlying timeout /
+        limits attributes; we synthesise a minimally-configured lifecycle
+        in that case (the same shape ``ClientCore.__init__`` would produce
+        for default args).
+        """
+        if hasattr(self, "_lifecycle"):
+            return
+        with _OBSERVABILITY_INIT_LOCK:
+            if not hasattr(self, "_lifecycle"):
+                # Lazy import to break the types.py -> _core.py cycle.
+                from .types import ConnectionLimits
+
+                self._lifecycle = ClientLifecycle(
+                    timeout=DEFAULT_TIMEOUT,
+                    connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+                    limits=ConnectionLimits(),
+                    keepalive_interval=None,
+                    keepalive_storage_path=None,
+                )
+
+    @property
+    def _http_client(self) -> httpx.AsyncClient | None:
+        self._ensure_lifecycle()
+        return self._lifecycle._http_client
+
+    @_http_client.setter
+    def _http_client(self, value: httpx.AsyncClient | None) -> None:
+        self._ensure_lifecycle()
+        self._lifecycle._http_client = value
+
+    @property
+    def _bound_loop(self) -> asyncio.AbstractEventLoop | None:
+        self._ensure_lifecycle()
+        return self._lifecycle._bound_loop
+
+    @_bound_loop.setter
+    def _bound_loop(self, value: asyncio.AbstractEventLoop | None) -> None:
+        # Required by the ``_AuthedTransportHost`` Protocol (declares
+        # ``_bound_loop`` as a settable variable). No external SET sites,
+        # but the Protocol contract demands a settable property.
+        self._ensure_lifecycle()
+        self._lifecycle._bound_loop = value
+
+    @property
+    def _keepalive_task(self) -> asyncio.Task[None] | None:
+        self._ensure_lifecycle()
+        return self._lifecycle._keepalive_task
+
+    # ``_keepalive_task`` setter dropped in arch-d2-cutover: zero external callers.
+
+    @property
+    def _keepalive_interval(self) -> float | None:
+        self._ensure_lifecycle()
+        return self._lifecycle._keepalive_interval
+
+    @_keepalive_interval.setter
+    def _keepalive_interval(self, value: float | None) -> None:
+        self._ensure_lifecycle()
+        self._lifecycle._keepalive_interval = value
+
+    @property
+    def _keepalive_storage_path(self) -> Path | None:
+        self._ensure_lifecycle()
+        return self._lifecycle._keepalive_storage_path
+
+    # ``_keepalive_storage_path`` setter dropped in arch-d2-cutover: zero
+    # external callers.
+
+    @property
+    def _timeout(self) -> float:
+        self._ensure_lifecycle()
+        return self._lifecycle._timeout
+
+    @_timeout.setter
+    def _timeout(self, value: float) -> None:
+        # Required by ``RpcOwner`` Protocol (``_core_rpc.py``) which
+        # declares ``_timeout: float`` as a settable variable. Pre-extraction
+        # ``_timeout`` was a plain ivar so attribute assignment worked
+        # implicitly; the property bridge needs an explicit setter to
+        # preserve that contract.
+        self._ensure_lifecycle()
+        self._lifecycle._timeout = value
+
+    # ``_connect_timeout`` and ``_limits`` compat bridges dropped
+    # (D1-audit-full): zero external callers; live values remain on
+    # ``self._lifecycle`` (and the lifecycle helper reads them as plain
+    # ivars when it builds the ``httpx.AsyncClient``).
 
     # ------------------------------------------------------------------
     # Request-id counter (chat API requires a monotonic ``_reqid`` URL param).
@@ -428,13 +727,18 @@ class ClientCore:
     # Historical contract: callers did ``self._core._reqid_counter += 100000``
     # then read the new value. Two concurrent ``ChatAPI.ask`` calls on the same
     # core would race on the read-modify-write, producing duplicate ``_reqid``
-    # values that Google rejects (audit C3 / synthesis §6 Tier-2 item 2).
+    # values that Google rejects.
     #
     # New contract: ``await core.next_reqid()`` performs the increment under
-    # ``_reqid_lock`` and returns the post-increment value. The lock is
-    # created lazily so a ``ClientCore`` can be constructed outside a running
-    # event loop. Direct mutation of ``_reqid_counter`` still works for
-    # backwards compatibility but emits ``DeprecationWarning``.
+    # ``ReqidCounter._lock`` and returns the post-increment value. The state
+    # lives in :class:`notebooklm._core_reqid.ReqidCounter` (``self._reqid``);
+    # the ``_reqid_counter`` property below is the last surviving read/write
+    # bridge — direct mutation of ``_reqid_counter`` still works for
+    # backwards compatibility but emits ``DeprecationWarning``. The
+    # ``_reqid_counter_value`` / ``_reqid_lock`` compat bridges were dropped
+    # (D1-audit-full): zero external callers; tests that need to seed the
+    # counter or substitute the lock should reach through ``self._reqid``
+    # directly.
     # ------------------------------------------------------------------
 
     @property
@@ -442,7 +746,7 @@ class ClientCore:
         """Current request-id counter value. Read access is safe; write access
         via the property setter emits ``DeprecationWarning``.
         """
-        return self._reqid_counter_value
+        return self._reqid.value
 
     @_reqid_counter.setter
     def _reqid_counter(self, value: int) -> None:
@@ -452,356 +756,431 @@ class ClientCore:
             DeprecationWarning,
             stacklevel=2,
         )
-        self._reqid_counter_value = value
+        self._reqid.set_value(value)
 
-    async def next_reqid(self, step: int = 100000) -> int:
+    @property
+    def _pending_polls(self) -> PendingPolls:
+        """Deprecated compatibility view of ``poll_registry.pending``.
+
+        Feature APIs now access polling state through ``poll_registry`` or a
+        narrow capability adapter. This bridge remains for external callers and
+        tests that still read or assign ``ClientCore._pending_polls`` directly.
+        """
+        return self.poll_registry.pending
+
+    @_pending_polls.setter
+    def _pending_polls(self, value: PendingPolls) -> None:
+        self.poll_registry.pending = value
+
+    async def next_reqid(self, step: int = _REQID_DEFAULT_STEP) -> int:
         """Atomically increment the request-id counter and return the new value.
 
-        Args:
-            step: Increment applied to the counter. Defaults to ``100000`` to
-                match the historical bump used by ``ChatAPI.ask``. Must be a
-                positive ``int`` (not ``bool``); ``step <= 0`` would break
-                monotonicity / uniqueness guarantees that Google's chat
-                backend relies on.
-
-        Returns:
-            The post-increment counter value. Successive calls return strictly
-            monotonic, distinct values even under ``asyncio.gather``.
-
-        Raises:
-            TypeError: If ``step`` is not an ``int`` (bool is rejected even
-                though it is a subclass of ``int``).
-            ValueError: If ``step`` is not positive.
+        Thin facade over :meth:`ReqidCounter.next_reqid`. The default ``step``
+        is sourced from :data:`notebooklm._core_reqid.DEFAULT_STEP` so the
+        facade and the underlying helper cannot silently drift apart; see
+        :class:`notebooklm._core_reqid.ReqidCounter` for the full contract,
+        validation rules, and lazy-lock semantics.
         """
-        # ``bool`` is a subclass of ``int`` in Python — reject it explicitly so
-        # ``next_reqid(step=True)`` doesn't silently degrade to ``step=1``.
-        if not isinstance(step, int) or isinstance(step, bool):
-            raise TypeError(f"step must be int, got {type(step).__name__}")
-        if step <= 0:
-            raise ValueError(f"step must be positive, got {step!r}")
-        # Safe: no await between check and assign, so no other coroutine can race us here.
-        if self._reqid_lock is None:
-            # Lazy init — safe to construct here because we're already in an
-            # async context (caller is awaiting us).
-            self._reqid_lock = asyncio.Lock()
-        async with self._reqid_lock:
-            self._reqid_counter_value += step
-            return self._reqid_counter_value
+        return await self._reqid.next_reqid(step)
+
+    def metrics_snapshot(self) -> ClientMetricsSnapshot:
+        """Return cumulative observability counters for this client instance."""
+        self._ensure_observability_state()
+        return self._metrics_obj.snapshot()
+
+    def _ensure_observability_state(self) -> None:
+        """Backfill observability fields for tests that construct via ``__new__``.
+
+        Gates on ``_metrics_obj`` AND ``_drain_tracker`` (both real instance
+        attributes) — the property-bridged ivars' ``hasattr`` probes are
+        always True because the descriptors live on the class.
+        """
+        if hasattr(self, "_metrics_obj") and hasattr(self, "_drain_tracker"):
+            return
+        with _OBSERVABILITY_INIT_LOCK:
+            if not hasattr(self, "_metrics_obj"):
+                self._metrics_obj = ClientMetrics(on_rpc_event=None)
+            if not hasattr(self, "_drain_tracker"):
+                self._drain_tracker = TransportDrainTracker()
+
+    def _increment_metrics(self, **increments: int | float) -> None:
+        self._ensure_observability_state()
+        self._metrics_obj.increment(**increments)
+
+    def _record_rpc_queue_wait(self, wait_seconds: float) -> None:
+        self._ensure_observability_state()
+        self._metrics_obj.record_rpc_queue_wait(wait_seconds)
+
+    def record_upload_queue_wait(self, wait_seconds: float) -> None:
+        """Record time spent waiting for the upload semaphore."""
+        self._ensure_observability_state()
+        self._metrics_obj.record_upload_queue_wait(wait_seconds)
+
+    # Sub-client capability surface — satisfies the narrow Protocols in
+    # :mod:`notebooklm._capabilities` directly so sub-clients consume
+    # ``ClientCore`` itself (see ADR-002).
+    @property
+    def authuser(self) -> int:
+        return self.auth.authuser
+
+    @property
+    def account_email(self) -> str | None:
+        return self.auth.account_email
+
+    def authuser_query(self) -> str:
+        return _authuser_query_value(self.authuser, self.account_email)
+
+    def authuser_header(self) -> str:
+        return _format_authuser_header_value(self.authuser, self.account_email)
+
+    def live_cookies(self) -> httpx.Cookies:
+        return self.get_http_client().cookies
+
+    @property
+    def bound_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Return the open-time captured event loop (``LoopAffinityProvider``).
+
+        Defensive ``isinstance`` so a ``MagicMock``-shaped fixture whose
+        ``_lifecycle`` auto-vivifies into a mock doesn't synthesize a fake
+        loop object that the affinity helper would otherwise treat as a
+        real (mismatched) loop. Returns ``None`` when the underlying core
+        has no lifecycle or has not been opened; the affinity helper
+        treats ``None`` as a silent no-op.
+        """
+        lifecycle = getattr(self, "_lifecycle", None)
+        if lifecycle is None:
+            return None
+        loop = lifecycle.get_bound_loop()
+        return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
+
+    def _record_lock_wait(self, wait_seconds: float) -> None:
+        self._ensure_observability_state()
+        self._metrics_obj.record_lock_wait(wait_seconds)
+
+    async def _emit_rpc_event(self, event: RpcTelemetryEvent) -> None:
+        """Invoke the optional telemetry callback without affecting RPC behavior."""
+        self._ensure_observability_state()
+        await self._metrics_obj.emit_rpc_event(event)
+
+    def _get_drain_condition(self) -> asyncio.Condition:
+        self._ensure_observability_state()
+        return self._drain_tracker.get_drain_condition()
+
+    def _current_operation_depth(self, task: asyncio.Task[Any] | None) -> int:
+        self._ensure_observability_state()
+        return self._drain_tracker.current_operation_depth(task)
+
+    async def _begin_transport_post(self, log_label: str) -> _TransportOperationToken:
+        """Reject new top-level transport work once graceful drain has started."""
+        self._ensure_observability_state()
+        return await self._drain_tracker.begin_transport_post(log_label)
+
+    async def _begin_transport_task(
+        self,
+        task: asyncio.Task[Any],
+        log_label: str,
+    ) -> _TransportOperationToken:
+        """Admit an internally-spawned task as part of the current operation."""
+        self._ensure_observability_state()
+        return await self._drain_tracker.begin_transport_task(task, log_label)
+
+    async def _finish_transport_post(self, token: _TransportOperationToken) -> None:
+        self._ensure_observability_state()
+        await self._drain_tracker.finish_transport_post(token)
+
+    async def drain(self, timeout: float | None = None) -> None:
+        """Stop accepting new client operations and wait for in-flight ones to finish.
+
+        If ``timeout`` expires, ``TimeoutError`` is raised and the client
+        remains in draining mode so shutdown callers do not accidentally admit
+        new work after a missed deadline.
+        """
+        self._ensure_observability_state()
+        await self._drain_tracker.drain(timeout)
+
+    def get_upload_semaphore(self) -> asyncio.Semaphore:
+        """Return the per-instance upload semaphore, creating it on first use.
+
+        The semaphore caps the number of in-flight ``SourcesAPI.add_file``
+        uploads at ``max_concurrent_uploads`` (default
+        ``DEFAULT_MAX_CONCURRENT_UPLOADS``). Each in-flight upload holds
+        one open file descriptor for its duration, so the cap is also an
+        FD-exhaustion guard.
+
+        Scope of the cap:
+          - The ``async with`` block in ``add_file`` covers FD-open,
+            the two pre-upload RPCs (``_register_file_source`` and
+            ``_start_resumable_upload``), and the streaming upload. The
+            semaphore therefore also serializes those two RPCs — a side
+            effect of the FD guard, not a separate quota.
+          - The cap applies to the *blocking* ``add_file`` call. On
+            post-finalize cancel, the shielded background
+            ``finalize_task`` continues running with the FD still open
+            after ``add_file``'s ``async with`` exits, so the
+            instantaneous open-FD count can briefly exceed
+            ``max_concurrent_uploads`` by the number of concurrently
+            draining background tasks.
+
+        Lazy construction is required because ``asyncio.Semaphore()`` in
+        some Python versions binds to the running event loop at creation
+        time, and ``ClientCore`` can be constructed outside any loop.
+        Callers must invoke this from inside the loop where the upload
+        will run — typically inside the ``async with`` block of
+        ``add_file``.
+        """
+        if self._upload_semaphore is None:
+            self._upload_semaphore = asyncio.Semaphore(self._max_concurrent_uploads)
+        return self._upload_semaphore
+
+    def _get_rpc_semaphore(self) -> AbstractAsyncContextManager[Any]:
+        """Return the per-instance RPC semaphore (or a null-context).
+
+        When ``max_concurrent_rpcs`` was set to ``None`` at construction
+        time, this returns a :class:`contextlib.nullcontext` so the
+        ``async with`` wrapper in :meth:`_perform_authed_post` collapses
+        to a no-op (callers with their own external rate-limiter opted
+        out of the gate). Otherwise it lazily constructs an
+        ``asyncio.Semaphore`` bound to the running loop on first use,
+        mirroring the lazy-init pattern of :attr:`_reqid_lock` /
+        :attr:`_auth_snapshot_lock` / :meth:`get_upload_semaphore`.
+
+        The check-then-assign is safe without an outer lock because
+        asyncio is single-threaded: no other coroutine can execute
+        between the ``is None`` check and the assignment unless we
+        ``await`` (and we don't).
+        """
+        if self._max_concurrent_rpcs is None:
+            return nullcontext()
+        if self._rpc_semaphore is None:
+            self._rpc_semaphore = asyncio.Semaphore(self._max_concurrent_rpcs)
+        return self._rpc_semaphore
+
+    def _get_authed_transport(self) -> AuthedTransport:
+        """Return the authenticated transport collaborator, lazily initialized.
+
+        The adapters intentionally resolve through this module at call time so
+        existing tests and private callers that monkeypatch
+        ``notebooklm._core.is_auth_error`` or ``notebooklm._core.asyncio.sleep``
+        still affect live transport behavior after the collaborator has been
+        constructed. Backoff jitter routes through ``notebooklm._backoff``,
+        which in turn calls ``random.uniform`` on the shared module.
+        ``tests/unit/test_core_transport.py`` relies on monkeypatching
+        ``notebooklm._core.random.uniform`` to reach that jitter path; keep the
+        otherwise-unused module import so the path stays available. Attribute
+        patches on the singleton ``random`` module are visible to all importers.
+        """
+        transport = getattr(self, "_authed_transport", None)
+        if transport is None:
+            transport = AuthedTransport(
+                self,
+                is_auth_error=lambda exc: is_auth_error(exc),
+                sleep=lambda seconds: asyncio.sleep(seconds),
+                logger=logger,
+            )
+            self._authed_transport = transport
+        return transport
+
+    def _get_rpc_executor(self) -> RpcExecutor:
+        """Return the RPC execution collaborator, lazily initialized.
+
+        The adapters resolve through this module at call time so existing
+        monkeypatches of ``notebooklm._core.decode_response``,
+        ``notebooklm._core.is_auth_error``, and
+        ``notebooklm._core.asyncio.sleep`` keep affecting live RPC behavior
+        after the collaborator has been constructed.
+        """
+        executor = getattr(self, "_rpc_executor", None)
+        if executor is None:
+            executor = RpcExecutor(
+                self,
+                decode_response_late_bound=_decode_response_late_bound,
+                is_auth_error=lambda exc: is_auth_error(exc),
+                sleep=_sleep_late_bound,
+            )
+            self._rpc_executor = executor
+        return executor
 
     async def open(self) -> None:
         """Open the HTTP client connection.
 
-        Called automatically by NotebookLMClient.__aenter__.
-        Uses httpx.Cookies jar to properly handle cross-domain redirects
-        (e.g., to accounts.google.com for auth token refresh).
+        Called automatically by NotebookLMClient.__aenter__. Delegates to
+        :meth:`ClientLifecycle.open` — that helper builds the
+        ``httpx.AsyncClient`` (with the opt-in
+        :class:`_SyntheticErrorTransport` wrap when
+        ``NOTEBOOKLM_VCR_RECORD_ERRORS`` is set), captures the running
+        event loop into ``self._bound_loop``, and spawns the keepalive
+        task. Idempotent — calling ``open()`` while already open is a
+        no-op. Re-opening after a prior :meth:`close` intentionally
+        replaces the loop binding; :meth:`close` does not unbind so an
+        accidental cross-loop call after close still raises actionably.
         """
-        if self._http_client is None:
-            # Use granular timeouts: shorter connect timeout helps detect network issues
-            # faster, while longer read/write timeouts accommodate slow responses
-            timeout = httpx.Timeout(
-                connect=self._connect_timeout,
-                read=self._timeout,
-                write=self._timeout,
-                pool=self._timeout,
-            )
-            # Build cookies jar for cross-domain redirect support
-            # Use pre-built jar if available, otherwise build one
-            cookies = self.auth.cookie_jar or build_cookie_jar(
-                cookies=self.auth.cookies,
-                storage_path=self.auth.storage_path,
-            )
-            self._http_client = httpx.AsyncClient(
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                },
-                cookies=cookies,
-                timeout=timeout,
-                follow_redirects=True,
-                limits=self._limits.to_httpx_limits(),
-            )
-
-            # Capture the open-time snapshot AFTER the AsyncClient is built
-            # (httpx normalizes domains on ingest) but BEFORE any rotation
-            # could possibly fire. When AuthTokens carries a snapshot from a
-            # failed pre-client save, keep it so the unpersisted delta can be
-            # retried instead of treating the already-mutated jar as clean.
-            self._loaded_cookie_snapshot = (
-                dict(self.auth.cookie_snapshot)
-                if self.auth.cookie_snapshot is not None
-                else snapshot_cookie_jar(self._http_client.cookies)
-            )
-            self.auth.cookie_snapshot = self._loaded_cookie_snapshot
-
-            # Spawn the keepalive task once the client is ready
-            if self._keepalive_interval is not None:
-                self._keepalive_task = asyncio.create_task(
-                    self._keepalive_loop(self._keepalive_interval)
-                )
+        self._ensure_lifecycle()
+        await self._lifecycle.open(self)
 
     async def save_cookies(self, jar: httpx.Cookies, path: Path | None = None) -> None:
-        """Persist a cookie jar through the shared save lock.
+        """Persist a cookie jar through the shared cookie-persistence collaborator.
 
-        Single chokepoint used by ``close()``, the keepalive loop, and
-        ``NotebookLMClient.refresh_auth``. Routes every save through:
-
-        1. **Snapshot the jar** on the event-loop thread so the worker isn't
-           iterating a live ``AsyncClient.cookies`` that may be mutating
-           (RPC redirects, the next poke iteration).
-        2. **Hold ``self._save_lock``** (a ``threading.Lock``) for the duration
-           of the off-loaded write. Multiple writers in the same process
-           serialize through this lock so the newer caller always wins.
-        3. **Off-load** the actual save to a worker thread via
-           ``asyncio.to_thread`` so disk I/O never stalls the event loop.
-        4. **Refresh the baseline snapshot** on success so that a subsequent
-           save in this client computes deltas against what we just
-           persisted — not against the open-time snapshot. Without this
-           step the same delta would re-apply on every save, silently
-           clobbering any sibling-process write that landed between two of
-           our own saves (the keepalive + close common case).
-
-        Cross-process serialization is handled at a different layer — the
-        OS-level file lock inside :func:`save_cookies_to_storage` itself.
-
-        Args:
-            jar: The cookie jar to persist. A copy is taken on the loop thread
-                before the worker reads it.
-            path: Storage path. Falls back to ``self._keepalive_storage_path``,
-                which itself falls back to ``self.auth.storage_path``. If both
-                are ``None``, the call is a no-op.
+        Thin facade over :meth:`ClientLifecycle.save_cookies`. The storage
+        writer ``save_cookies_to_storage`` is resolved from this module at
+        call time inside the lifecycle helper so existing
+        ``monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", …)``
+        sites continue to affect the live save path.
         """
-        effective_path = path if path is not None else self._keepalive_storage_path
-        if effective_path is None:
-            return
-        save_path: Path = effective_path
-
-        jar_copy = httpx.Cookies(jar)
-        # Computed on the loop thread off ``jar_copy`` so the worker can refresh
-        # the baseline without re-snapshotting a jar that may have mutated in
-        # the meantime (next keepalive poke, in-flight RPC redirect).
-        post_save_snapshot = snapshot_cookie_jar(jar_copy)
-
-        def _save(
-            s: httpx.Cookies = jar_copy,
-            p: Path = save_path,
-            lock: threading.Lock = self._save_lock,
-            post: CookieSnapshot = post_save_snapshot,
-            client: ClientCore = self,
-        ) -> None:
-            """Worker-thread save: hold the in-process lock around the disk write."""
-            with lock:
-                # Read the baseline INSIDE the lock so a prior save that
-                # completed while we were queued advances ours too. Capturing
-                # this on the loop thread would let a concurrent save observe
-                # a stale baseline, compute deltas against pre-prior-save
-                # state, hit CAS rejection on every key, and silently lose
-                # the local rotation.
-                snap = client._loaded_cookie_snapshot
-                # Advance successful keys while preserving CAS-rejected ones.
-                # A silent I/O error leaves the baseline untouched; an
-                # exception does too. See class-level
-                # ``_loaded_cookie_snapshot``.
-                result = save_cookies_to_storage(
-                    s,
-                    p,
-                    original_snapshot=snap,
-                    return_result=True,
-                )
-                if isinstance(result, CookieSaveResult):
-                    if result.ok:
-                        client._loaded_cookie_snapshot = post
-                    elif result.cas_rejected_keys:
-                        client._loaded_cookie_snapshot = advance_cookie_snapshot_after_save(
-                            snap, post, result.cas_rejected_keys
-                        )
-                    if client._loaded_cookie_snapshot is not None:
-                        client.auth.cookie_snapshot = client._loaded_cookie_snapshot
-                elif result:
-                    client._loaded_cookie_snapshot = post
-                    client.auth.cookie_snapshot = post
-
-        await asyncio.to_thread(_save)
+        self._ensure_lifecycle()
+        await self._lifecycle.save_cookies(self, jar, path)
 
     async def close(self) -> None:
         """Close the HTTP client connection.
 
-        Called automatically by NotebookLMClient.__aexit__.
+        Called automatically by NotebookLMClient.__aexit__. Delegates to
+        :meth:`ClientLifecycle.close`, which:
 
-        Cancellation safety (T7.B4 / audit §7):
-        the entire close sequence is wrapped in ``try/finally`` and the
-        final ``self._http_client.aclose()`` is wrapped in
-        ``asyncio.shield`` — without the shield, a ``CancelledError``
-        arriving during keepalive teardown or the cookie save would
-        skip ``aclose()`` and leak the underlying httpx transport.
-        ``self._http_client = None`` runs in an inner ``finally`` so
-        the instance is consistently marked closed even if the
-        shielded ``aclose`` itself raises.
+        1. Cancels and joins the keepalive task (so the loop can't issue a
+           poke against an already-closed transport).
+        2. Drains in-flight artifact poll tasks held by ``self.poll_registry``.
+        3. Saves cookies one last time through ``save_cookies``.
+        4. Calls ``aclose()`` under :func:`asyncio.shield` so cancellation
+           arriving mid-close cannot leak the underlying httpx transport.
+        5. Nulls out ``_http_client``, ``_authed_transport`` and
+           ``_rpc_executor`` so a follow-up :meth:`open` rebuilds the
+           transport collaborators against the new ``httpx.AsyncClient``.
         """
-        try:
-            # Stop the keepalive task before tearing down the HTTP client so
-            # the loop can't issue a poke against an already-closed transport.
-            if self._keepalive_task is not None:
-                self._keepalive_task.cancel()
-                await asyncio.gather(self._keepalive_task, return_exceptions=True)
-                self._keepalive_task = None
-
-            if self._http_client:
-                try:
-                    # Single source of truth for the on-close save: takes the
-                    # in-process lock, snapshots, off-loads. Serializes
-                    # naturally with any keepalive save still finishing in a
-                    # worker thread — close() owns the freshest jar and must
-                    # win, not the older snapshot.
-                    await self.save_cookies(self._http_client.cookies)
-                except Exception as e:
-                    logger.warning("Failed to sync refreshed cookies during close: %s", e)
-        finally:
-            if self._http_client:
-                try:
-                    # Shield: cancellation arriving mid-aclose must not leak
-                    # the transport. The shielded aclose runs to completion;
-                    # ``self._http_client = None`` then makes ``is_open``
-                    # return False correctly.
-                    await asyncio.shield(self._http_client.aclose())
-                finally:
-                    self._http_client = None
+        self._ensure_lifecycle()
+        await self._lifecycle.close(self)
 
     async def _keepalive_loop(self, interval: float) -> None:
         """Background loop that periodically pokes the identity surface.
 
-        Sleeps ``interval`` seconds between iterations, then calls
-        :func:`notebooklm.auth._rotate_cookies` to elicit ``__Secure-1PSIDTS``
-        rotation. Any rotated cookies are persisted to ``storage_state.json``
-        immediately (off-loop, via :func:`asyncio.to_thread`) so a long-lived
-        client's freshness survives a crash.
-
-        Error handling is split by failure mode:
-
-        - Poke failures (network blips, ``accounts.google.com`` downtime) are
-          opportunistic and logged at DEBUG. The next iteration retries.
-        - Persistence failures hide the most important class of bug — a
-          rotated cookie that exists in memory but not on disk — so they are
-          logged at WARNING with the storage path.
-
-        Both classes never propagate; the loop only exits via
-        :class:`asyncio.CancelledError` from :meth:`close`.
+        Thin facade over :meth:`ClientLifecycle._keepalive_loop`. Retained
+        as a ``ClientCore`` method so ``test_client_keepalive`` and other
+        tests that introspect ``core._keepalive_loop`` continue to resolve.
         """
-        logger.debug("Keepalive task started (interval=%.1fs)", interval)
-        try:
-            while True:
-                await asyncio.sleep(interval)
-                client = self._http_client
-                if client is None:
-                    # Client closed concurrently; exit gracefully.
-                    return
-
-                try:
-                    # Bypass the layer-1 dedup guards: this loop is self-paced
-                    # by ``keepalive_min_interval`` and never runs concurrently
-                    # with itself. Pass the storage path so the bare call
-                    # bumps the *per-profile* in-process timestamp, letting
-                    # concurrent layer-1 callers (e.g. spawned ``fetch_tokens``
-                    # tasks on the same profile) and other keepalive loops on
-                    # the same profile see the fresh rotation and skip.
-                    await _rotate_cookies(client, self._keepalive_storage_path)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - opportunistic best-effort
-                    logger.debug("Keepalive poke failed (non-fatal): %s", exc)
-                    continue
-
-                if self._keepalive_storage_path is None:
-                    continue
-
-                try:
-                    # save_cookies handles snapshot + lock + off-load.
-                    await self.save_cookies(client.cookies)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Keepalive cookie persistence to %s failed: %s",
-                        self._keepalive_storage_path,
-                        exc,
-                    )
-        except asyncio.CancelledError:
-            logger.debug("Keepalive task cancelled")
-            raise
+        self._ensure_lifecycle()
+        await self._lifecycle._keepalive_loop(self, interval)
 
     @property
     def is_open(self) -> bool:
         """Check if the HTTP client is open."""
-        return self._http_client is not None
+        self._ensure_lifecycle()
+        return self._lifecycle.is_open()
 
     def update_auth_headers(self) -> None:
         """Refresh auth metadata without resetting the live cookie jar.
 
         Call this after modifying auth tokens (e.g., after refresh_auth())
-        to ensure the HTTP client uses the updated credentials.
-
-        The httpx client's cookie jar is authoritative once the session is
-        open. Re-injecting startup cookies here can overwrite cookies refreshed
-        during redirects to accounts.google.com.
+        to ensure the HTTP client uses the updated credentials. Delegates
+        to :meth:`AuthRefreshCoordinator.update_auth_headers`; the cookie
+        jar source is fetched via ``self.get_http_client()`` so the open()
+        precondition (and its ``RuntimeError`` if not initialised) is
+        enforced at one site.
 
         Raises:
             RuntimeError: If client is not initialized.
         """
-        if not self._http_client:
-            raise RuntimeError("Client not initialized. Use 'async with' context.")
+        self._ensure_auth_coord()
+        self._auth_coord.update_auth_headers(self)
 
-        self.auth.cookie_jar = self._http_client.cookies
+    def _get_auth_snapshot_lock(self) -> asyncio.Lock:
+        """Return the lazily-initialised auth-snapshot lock.
 
-    def _snapshot(self) -> _AuthSnapshot:
+        Delegates to :meth:`AuthRefreshCoordinator.get_auth_snapshot_lock`.
+        The check-then-assign there is safe without an outer lock because
+        asyncio is single-threaded — no other coroutine can execute between
+        the ``is None`` check and the assignment unless we ``await`` (and
+        the accessor does not).
+        """
+        self._ensure_auth_coord()
+        return self._auth_coord.get_auth_snapshot_lock()
+
+    def _get_refresh_lock(self) -> asyncio.Lock:
+        """Return the lazily-initialised refresh lock.
+
+        Delegates to :meth:`AuthRefreshCoordinator.get_refresh_lock`. Every
+        concurrent caller resolves to the *same* lock instance because the
+        check-then-assign is race-free in a single-threaded asyncio loop,
+        so the single-flight refresh dedupe in :meth:`_await_refresh` is
+        preserved.
+        """
+        self._ensure_auth_coord()
+        return self._auth_coord.get_refresh_lock()
+
+    async def _snapshot(self) -> _AuthSnapshot:
         """Capture the current auth headers as a frozen snapshot.
 
         Used by ``_perform_authed_post`` to make a single HTTP attempt's
         URL/body consistent (no mid-attempt mutation from refresh /
         keepalive). A fresh snapshot is taken on each retry.
+
+        Acquires :attr:`_auth_snapshot_lock` for the four scalar reads so
+        a concurrent ``refresh_auth`` can't interleave between
+        ``csrf_token``/``session_id``/``authuser``/``account_email``
+        reads. The critical section is purely synchronous attribute
+        reads — no ``await``s — so the lock is uncontested in steady
+        state and refresh's tiny write block can't block RPC throughput.
+
+        Body is kept here as real code (rather than delegating to
+        :meth:`AuthRefreshCoordinator.snapshot`) so the AST guard at
+        ``tests/unit/test_concurrency_refresh_race.py::test_snapshot_acquires_auth_snapshot_lock``
+        — which inspects this method's source and asserts it contains an
+        ``async with`` over ``_auth_snapshot_lock`` — keeps operating on
+        the real implementation. The coordinator method has the same
+        semantic shape (lock acquire → scalar reads → return) but routes
+        the lock-wait metric through the host's ``_metrics_obj`` directly
+        rather than via the ``_record_lock_wait`` facade.
+
+        Whole-request atomicity for ``(csrf, sid, cookies)`` on the wire
+        still depends on the no-await invariant between this method
+        returning and ``client.post(...)`` inside
+        :meth:`_perform_authed_post` (see the related AST guard in
+        ``tests/unit/test_concurrency_refresh_race.py``).
         """
-        return _AuthSnapshot(
-            csrf_token=self.auth.csrf_token,
-            session_id=self.auth.session_id,
-            authuser=self.auth.authuser,
-            account_email=self.auth.account_email,
-        )
+        wait_start = time.perf_counter()
+        async with self._get_auth_snapshot_lock():
+            self._record_lock_wait(time.perf_counter() - wait_start)
+            return _AuthSnapshot(
+                csrf_token=self.auth.csrf_token,
+                session_id=self.auth.session_id,
+                authuser=self.auth.authuser,
+                account_email=self.auth.account_email,
+            )
+
+    async def update_auth_tokens(self, csrf: str, session_id: str) -> None:
+        """Atomically update auth token scalars under the snapshot lock.
+
+        The body is kept here as real code (rather than a delegate to
+        :meth:`AuthRefreshCoordinator.update_auth_tokens`) so the AST
+        guard at ``tests/unit/test_concurrency_refresh_race.py:304-334``
+        — which inspects the source of this method and asserts there is
+        no ``await`` inside the csrf/session_id mutation block — keeps
+        operating on the real implementation. The coordinator method
+        has the same semantic shape (lock acquire → two scalar writes)
+        but routes the lock-wait metric through the host's
+        ``_metrics_obj`` directly rather than via ``_record_lock_wait``.
+        """
+        lock = self._get_auth_snapshot_lock()
+        wait_start = time.perf_counter()
+        await lock.acquire()
+        self._record_lock_wait(time.perf_counter() - wait_start)
+        try:
+            self.auth.csrf_token = csrf
+            self.auth.session_id = session_id
+        finally:
+            lock.release()
 
     def _build_url(
         self,
         rpc_method: RPCMethod,
+        snapshot: _AuthSnapshot,
         source_path: str = "/",
         rpc_id_override: str | None = None,
     ) -> str:
-        """Build the batchexecute URL for an RPC call.
-
-        Args:
-            rpc_method: The RPC method to call.
-            source_path: The source path parameter (usually notebook path).
-            rpc_id_override: Optional resolved RPC id string used in the
-                ``rpcids=`` query param. When provided, the SAME string must
-                also be passed to :func:`encode_rpc_request` so the URL and
-                body stay in sync. See ``resolve_rpc_id`` for the
-                ``NOTEBOOKLM_RPC_OVERRIDES`` plumbing.
-
-        Returns:
-            Full URL with query parameters.
-        """
-        rpc_id = rpc_id_override if rpc_id_override is not None else rpc_method.value
-        params: dict[str, str] = {
-            "rpcids": rpc_id,
-            "source-path": source_path,
-            "f.sid": self.auth.session_id,
-            "hl": get_default_language(),
-            "rt": "c",
-        }
-        # Multi-account: route batchexecute to the same Google account the
-        # auth tokens were minted for. Email is preferred when known because
-        # Google's integer account indices can change as browser accounts are
-        # added or removed.
-        if self.auth.account_email or self.auth.authuser:
-            params["authuser"] = format_authuser_value(
-                self.auth.authuser,
-                self.auth.account_email,
-            )
-        return f"{get_batchexecute_url()}?{urlencode(params)}"
+        """Compatibility wrapper around :class:`RpcExecutor` URL building."""
+        return self._get_rpc_executor().build_url(
+            rpc_method,
+            snapshot,
+            source_path,
+            rpc_id_override=rpc_id_override,
+        )
 
     async def _perform_authed_post(
         self,
@@ -810,340 +1189,30 @@ class ClientCore:
         log_label: str,
         disable_internal_retries: bool = False,
     ) -> httpx.Response:
-        """Run an authed POST through the shared retry/refresh pipeline.
-
-        The pipeline is the transport-level core that both ``rpc_call`` and
-        ``query_post`` share. Per-attempt behavior:
-
-        1. Take a fresh ``_AuthSnapshot`` via :meth:`_snapshot`.
-        2. Invoke ``build_request(snapshot)`` to assemble ``(url, body,
-           extra_headers)``. The factory is called *once per attempt* so that
-           retries pick up refreshed credentials instead of replaying a stale
-           pre-refresh URL/body — see synthesis §6 Tier-2 item 4.
-        3. POST via the underlying ``httpx.AsyncClient`` and call
-           ``raise_for_status()``.
-
-        Error-boundary contract (callers must wrap into their own typed
-        exceptions):
-
-        - **Auth refresh path** — when a refresh callback is configured and
-          the failure looks like an auth error (HTTP 400/401/403, see
-          :func:`is_auth_error`), the helper awaits a shared refresh task and
-          retries once with a fresh snapshot. If the refresh callback itself
-          raises, the original transport exception is wrapped in
-          :class:`_TransportAuthExpired` (refresh error chained via
-          ``__cause__``) so callers can re-raise the original unchanged
-          (``rpc_call``) or translate to their own typed error
-          (``query_post``). If the post-refresh retry's POST fails for a
-          non-auth reason, that exception propagates as-is.
-        - **Rate-limit path** — on HTTP 429 with a parseable Retry-After,
-          sleeps and retries until ``rate_limit_max_retries`` is reached;
-          after that, raises :class:`_TransportRateLimited` with the final
-          response and parsed retry-after value. With no parseable header or
-          ``rate_limit_max_retries == 0``, raises immediately.
-        - **Server-error path** — on HTTP 5xx, or any ``httpx.RequestError``
-          (network-layer failures: timeouts, connect errors), sleeps with
-          exponential backoff ``min(2 ** attempt, 30)`` seconds and retries
-          until ``server_error_max_retries`` is reached; after that, raises
-          :class:`_TransportServerError`. ``server_error_max_retries == 0``
-          short-circuits to an immediate raise. This path does NOT honor
-          ``Retry-After`` because 5xx rarely carries it.
-        - All other errors propagate as :class:`httpx.HTTPStatusError` /
-          :class:`httpx.RequestError` unchanged.
-
-        Caller responsibilities:
-
-        - Manage the ``set_request_id`` context (so retries within a single
-          logical call share one ``[req=<id>]`` tag).
-        - Decode the response (this helper does no parsing).
-        - Wrap transport exceptions into the caller's error domain:
-          ``rpc_call`` maps into :class:`RPCError`-family exceptions;
-          ``query_post`` maps into :class:`ChatError` / :class:`NetworkError`.
-
-        Args:
-            build_request: Factory invoked once per attempt with a fresh
-                ``_AuthSnapshot``. Must return ``(url, body, extra_headers)``.
-                ``extra_headers`` is merged onto the httpx client's defaults
-                for this attempt only.
-            log_label: Caller-friendly label embedded in log lines (e.g. an
-                RPC method name or ``"chat.ask"``).
-
-        Returns:
-            The raw ``httpx.Response`` from the successful attempt. The
-            caller owns decoding.
-        """
-        assert self._http_client is not None
-        client = self._http_client
-
-        refreshed_this_call = False
-        rate_limit_retries = 0
-        server_error_retries = 0
-        start = time.perf_counter()
-
-        while True:
-            snapshot = self._snapshot()
-            url, body, headers = build_request(snapshot)
-
-            try:
-                if headers:
-                    response = await client.post(url, content=body, headers=headers)
-                else:
-                    response = await client.post(url, content=body)
-                response.raise_for_status()
-            except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-                # --- Auth refresh path ---------------------------------
-                if (
-                    not refreshed_this_call
-                    and self._refresh_callback is not None
-                    and is_auth_error(exc)
-                ):
-                    logger.info(
-                        "%s auth error detected, attempting token refresh",
-                        log_label,
-                    )
-                    try:
-                        await self._await_refresh()
-                    except Exception as refresh_error:
-                        logger.warning("Token refresh failed: %s", refresh_error)
-                        # Signal "refresh failed" to the caller via a typed
-                        # transport exception so the RPC mapper can re-raise
-                        # the *original* HTTPStatusError unchanged (matches
-                        # the historical ``_try_refresh_and_retry`` contract
-                        # — see ``test_no_retry_on_cookie_expiration``).
-                        raise _TransportAuthExpired(
-                            f"auth refresh failed for {log_label}",
-                            original=exc,
-                        ) from refresh_error
-                    if self._refresh_retry_delay > 0:
-                        await asyncio.sleep(self._refresh_retry_delay)
-                    logger.info("Token refresh successful, retrying %s", log_label)
-                    refreshed_this_call = True
-                    # Loop around: next iteration takes a FRESH snapshot,
-                    # rebuilds the request body with the new csrf/sid, and
-                    # re-POSTs.
-                    continue
-
-                # --- 429 rate-limit path --------------------------------
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-                    retry_after = _parse_retry_after(exc.response.headers.get("retry-after"))
-                    # ``disable_internal_retries`` (T7.B2) suppresses the 429
-                    # retry loop for declared mutating create RPCs whose retries
-                    # would risk duplicate-resource creation. The API-layer
-                    # ``_idempotency.idempotent_create`` wrapper owns the
-                    # probe-then-retry loop instead.
-                    if (
-                        not disable_internal_retries
-                        and retry_after is not None
-                        and rate_limit_retries < self._rate_limit_max_retries
-                    ):
-                        logger.warning(
-                            "%s rate-limited (HTTP 429); sleeping %ds then retrying (%d/%d)",
-                            log_label,
-                            retry_after,
-                            rate_limit_retries + 1,
-                            self._rate_limit_max_retries,
-                        )
-                        await asyncio.sleep(retry_after)
-                        rate_limit_retries += 1
-                        continue
-                    raise _TransportRateLimited(
-                        f"{log_label} rate-limited (HTTP 429)",
-                        retry_after=retry_after,
-                        response=exc.response,
-                        original=exc,
-                    ) from exc
-
-                # --- 5xx / network retry path -------------------------------
-                # Exponential backoff: 5xx responses rarely carry Retry-After
-                # so we don't use the 429 model. ``httpx.RequestError`` covers
-                # transient network-layer failures (timeouts, connect errors,
-                # remote-protocol blips) that are reasonable to retry.
-                is_server_error = (
-                    isinstance(exc, httpx.HTTPStatusError) and 500 <= exc.response.status_code < 600
-                )
-                is_network_error = isinstance(exc, httpx.RequestError)
-                if is_server_error or is_network_error:
-                    # ``disable_internal_retries`` (T7.B2) short-circuits the
-                    # 5xx / network retry loop for declared mutating create
-                    # RPCs (e.g. CREATE_NOTEBOOK, ADD_SOURCE) where a naive
-                    # re-POST after a server commit would duplicate the
-                    # resource. The API-layer ``idempotent_create`` wrapper
-                    # owns the probe-then-retry loop instead.
-                    if (
-                        not disable_internal_retries
-                        and server_error_retries < self._server_error_max_retries
-                    ):
-                        # Exponential backoff capped at 30s. The cap blunts
-                        # thundering-herd well past the first few retries
-                        # (every retry beyond ~5 attempts waits exactly 30s),
-                        # but the early retries (1s, 2s, 4s, ...) can still
-                        # synchronize across clients that all failed on the
-                        # same transient backend blip. Add a small ±20% jitter
-                        # so concurrent retries are spread out.
-                        backoff = min(2**server_error_retries, 30)
-                        backoff += random.uniform(-0.2 * backoff, 0.2 * backoff)  # noqa: S311  # nosec B311 — jitter, not crypto
-                        backoff = max(0.1, backoff)
-                        status_label = (
-                            f"HTTP {exc.response.status_code}"  # type: ignore[union-attr]
-                            if is_server_error
-                            else type(exc).__name__
-                        )
-                        logger.warning(
-                            "%s server/network error (%s); backing off %.1fs then retrying (%d/%d)",
-                            log_label,
-                            status_label,
-                            backoff,
-                            server_error_retries + 1,
-                            self._server_error_max_retries,
-                        )
-                        await asyncio.sleep(backoff)
-                        server_error_retries += 1
-                        continue
-                    if is_server_error:
-                        status_error = cast(httpx.HTTPStatusError, exc)
-                        raise _TransportServerError(
-                            f"{log_label} server error "
-                            f"(HTTP {status_error.response.status_code}) after "
-                            f"{server_error_retries} retries",
-                            original=status_error,
-                            response=status_error.response,
-                            status_code=status_error.response.status_code,
-                        ) from exc
-                    raise _TransportServerError(
-                        f"{log_label} network error after {server_error_retries} retries: {exc}",
-                        original=exc,
-                    ) from exc
-
-                # --- Anything else: propagate the raw transport error ----
-                elapsed = time.perf_counter() - start
-                logger.debug(
-                    "%s transport error after %.3fs: %s",
-                    log_label,
-                    elapsed,
-                    exc,
-                )
-                raise
-
-            # Success
-            return response
+        """Compatibility wrapper around :class:`AuthedTransport`."""
+        return await self._get_authed_transport().perform_authed_post(
+            build_request=build_request,
+            log_label=log_label,
+            disable_internal_retries=disable_internal_retries,
+        )
 
     async def _await_refresh(self) -> None:
         """Run / join the shared refresh task.
 
-        Concurrent callers share one refresh task so a thundering herd of
-        401s on the same client triggers exactly one token refresh. The lock
-        protects task-creation only; the await on the task itself happens
-        outside the lock so other callers can join.
-
-        The join is wrapped in :func:`asyncio.shield` (T7.C1, audit §4) so
-        that a caller cancelled while waiting — e.g. via
-        ``asyncio.wait_for(..., timeout=...)`` — unwinds locally without
-        propagating the ``CancelledError`` into the *shared* refresh task.
-        Without the shield, one cancelled waiter would cancel the
-        underlying task, taking down every sibling joined to the same
-        single-flight refresh. The slot at ``self._refresh_task`` is left
-        intact across the cancellation and is replaced only on the next
-        refresh wave once the current task transitions to ``done()``.
+        Delegates to :meth:`AuthRefreshCoordinator.await_refresh`. The
+        coordinator preserves the single-flight semantics — concurrent
+        callers share one refresh task so a thundering herd of 401s on the
+        same client triggers exactly one token refresh. The lock protects
+        task-creation only; the await on the task itself happens outside
+        the lock so other callers can join, and the join is wrapped in
+        :func:`asyncio.shield` so a cancelled waiter unwinds locally
+        without propagating ``CancelledError`` into the shared task. The
+        ``_refresh_task`` slot is left intact across cancellation and is
+        replaced only on the next refresh wave once the current task
+        transitions to ``done()``.
         """
-        assert self._refresh_callback is not None
-        assert self._refresh_lock is not None
-
-        async with self._refresh_lock:
-            if self._refresh_task is not None and not self._refresh_task.done():
-                refresh_task = self._refresh_task
-                logger.debug("Joining existing refresh task")
-            else:
-                coro = cast(Coroutine[Any, Any, AuthTokens], self._refresh_callback())
-                self._refresh_task = asyncio.create_task(coro)
-                refresh_task = self._refresh_task
-
-        await asyncio.shield(refresh_task)
-
-    async def query_post(
-        self,
-        *,
-        build_request: _BuildRequest,
-        parse_label: str,
-    ) -> httpx.Response:
-        """Chat-side semantic owner around :meth:`_perform_authed_post`.
-
-        Wraps the shared transport pipeline with chat-flavored exception
-        mapping: transport-layer auth failures become
-        :class:`~notebooklm.exceptions.ChatError`, and transport-layer
-        network/rate-limit failures become
-        :class:`~notebooklm.exceptions.NetworkError` /
-        :class:`~notebooklm.exceptions.ChatError` respectively. This keeps
-        ChatAPI free of HTTP-status branching and matches the historical
-        contract of ``ChatAPI.ask`` (T2.D will migrate that caller).
-
-        Args:
-            build_request: See :meth:`_perform_authed_post`.
-            parse_label: Caller-friendly label used in log lines and error
-                messages (e.g. ``"chat.ask"``).
-        """
-        # Import here to avoid a circular import: exceptions imports from
-        # this module's siblings.
-        from .exceptions import ChatError, NetworkError
-
-        try:
-            return await self._perform_authed_post(
-                build_request=build_request,
-                log_label=parse_label,
-            )
-        except _TransportAuthExpired as exc:
-            raise ChatError(
-                f"{parse_label} failed: authentication expired and refresh did not recover"
-            ) from exc
-        except _TransportRateLimited as exc:
-            raise ChatError(
-                f"{parse_label} rate-limited (HTTP 429)."
-                + (
-                    f" Retry after {exc.retry_after} seconds."
-                    if exc.retry_after is not None
-                    else ""
-                )
-            ) from exc
-        except _TransportServerError as exc:
-            if isinstance(exc.original, httpx.HTTPStatusError):
-                raise ChatError(
-                    f"{parse_label} failed with HTTP {exc.original.response.status_code} "
-                    f"after retries: {exc.original}"
-                ) from exc
-            # Network-layer failure (RequestError / Timeout).
-            # ``_perform_authed_post`` only wraps ``httpx.RequestError`` into
-            # ``_TransportServerError`` on the network path; this guard keeps
-            # the contract enforced under ``python -O`` (where ``assert``
-            # would be stripped) and gives a clear diagnostic if the
-            # invariant ever drifts.
-            if not isinstance(exc.original, httpx.RequestError):
-                raise TypeError(
-                    f"Unexpected _TransportServerError.original type: {type(exc.original)}"
-                ) from exc
-            # Preserve the timeout-specific message: TimeoutException is a
-            # subclass of RequestError, so without this branch read/connect
-            # timeouts would surface as a generic "network error after
-            # retries" line and lose the "timed out" signal callers rely on.
-            if isinstance(exc.original, httpx.TimeoutException):
-                raise NetworkError(
-                    f"{parse_label} timed out after retries: {exc.original}",
-                    original_error=exc.original,
-                ) from exc
-            raise NetworkError(
-                f"{parse_label} network error after retries: {exc.original}",
-                original_error=exc.original,
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            # Non-5xx / non-401 / non-429 status errors fall through
-            # ``_perform_authed_post``'s "Anything else" branch (e.g. a 404
-            # or unhandled 4xx).
-            raise ChatError(
-                f"{parse_label} failed with HTTP {exc.response.status_code}: {exc}"
-            ) from exc
-        # NOTE: bare ``httpx.TimeoutException`` / ``httpx.RequestError``
-        # handlers were removed here because ``_perform_authed_post`` always
-        # either retries those errors or wraps them in
-        # ``_TransportServerError`` (handled above), so they cannot reach
-        # this scope.
+        self._ensure_auth_coord()
+        await self._auth_coord.await_refresh(self)
 
     async def rpc_call(
         self,
@@ -1154,67 +1223,28 @@ class ClientCore:
         _is_retry: bool = False,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ) -> Any:
-        """Make an RPC call to the NotebookLM API.
+        """Compatibility wrapper around :meth:`RpcExecutor.execute_with_telemetry`.
 
-        Automatically refreshes authentication tokens and retries once if an
-        auth failure is detected and a refresh_callback was provided.
-
-        Args:
-            method: The RPC method to call.
-            params: Parameters for the RPC call (nested list structure).
-            source_path: The source path parameter (usually /notebook/{id}).
-            allow_null: If True, don't raise error when response is null.
-            _is_retry: Internal flag to prevent infinite decode-time retries.
-            disable_internal_retries: When True, suppresses the inner 5xx /
-                429 / network retry loop in ``_perform_authed_post`` so that
-                the first transport-level failure surfaces immediately. Used
-                by declared mutating create RPCs (T7.B2): a naive re-POST
-                after a server-side commit would duplicate the resource, so
-                the API-layer ``_idempotency.idempotent_create`` wrapper
-                owns the probe-then-retry loop instead. The auth-refresh
-                path is unaffected (a 401 → refresh → retry is still legal
-                because the request was rejected, not accepted).
-
-        Returns:
-            Decoded response data.
-
-        Raises:
-            RuntimeError: If client is not initialized (not in context manager).
-            httpx.HTTPStatusError: If HTTP request fails.
-            RPCError: If RPC call fails or returns unexpected data.
+        The executor owns the telemetry, reqid, drain, and decode-time
+        refresh-and-retry plumbing; this facade preserves the method shape so
+        the 30+ tests that mock ``core.rpc_call = AsyncMock(...)`` by
+        attribute keep working. See
+        :meth:`notebooklm._core_rpc.RpcExecutor.execute_with_telemetry` for
+        the full contract (kwargs ``_is_retry`` / ``disable_internal_retries``
+        / ``operation_variant`` flow through unchanged; ``RuntimeError`` is
+        raised if the client is not initialized).
         """
-        if not self._http_client:
-            raise RuntimeError("Client not initialized. Use 'async with' context.")
-
-        # Only the outer rpc_call mints a request id; the decode-time retry
-        # path (``_is_retry=True``) inherits the parent's id so a single
-        # decode-error → refresh → retry sequence appears under one
-        # ``[req=<id>]`` in the logs. HTTP-status retries (auth + 429) happen
-        # inside ``_perform_authed_post`` without recursion, so they don't
-        # need this guard.
-        if _is_retry:
-            return await self._rpc_call_impl(
-                method,
-                params,
-                source_path,
-                allow_null,
-                _is_retry,
-                disable_internal_retries=disable_internal_retries,
-            )
-
-        _reqid_token = set_request_id()
-        try:
-            return await self._rpc_call_impl(
-                method,
-                params,
-                source_path,
-                allow_null,
-                _is_retry,
-                disable_internal_retries=disable_internal_retries,
-            )
-        finally:
-            reset_request_id(_reqid_token)
+        return await self._get_rpc_executor().execute_with_telemetry(
+            method,
+            params,
+            source_path,
+            allow_null,
+            _is_retry,
+            disable_internal_retries=disable_internal_retries,
+            operation_variant=operation_variant,
+        )
 
     async def _rpc_call_impl(
         self,
@@ -1225,244 +1255,34 @@ class ClientCore:
         _is_retry: bool,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ) -> Any:
-        # Caller (rpc_call) has already verified self._http_client is not None;
-        # re-assert for mypy narrowing through this helper.
-        assert self._http_client is not None
-        start = time.perf_counter()
-        logger.debug("RPC %s starting", method.name)
-
-        # Resolve the RPC id ONCE per logical call. ``NOTEBOOKLM_RPC_OVERRIDES``
-        # lets users self-patch when Google rotates an obfuscated method id;
-        # the resolved value MUST flow into both the URL's ``rpcids=`` query
-        # param and the request body's ``f.req`` payload (the wire format
-        # treats a mismatch as malformed). Resolving once also means decode
-        # below uses the same id we asked the server for.
-        resolved_id = resolve_rpc_id(method.name, method.value)
-
-        # ``_perform_authed_post`` calls this factory once per HTTP attempt;
-        # on retry it passes a fresh snapshot so the body is rebuilt with the
-        # refreshed CSRF and the URL with the refreshed session id /
-        # authuser. Capturing ``self.auth.csrf_token`` here directly would
-        # snapshot at outer-call time and replay a stale token on retry.
-        rpc_request = encode_rpc_request(method, params, rpc_id_override=resolved_id)
-
-        def _build(snapshot: _AuthSnapshot) -> tuple[str, str, dict[str, str]]:
-            # Deliberate divergence: the body uses the snapshot's csrf_token
-            # (a frozen point-in-time copy) while ``_build_url`` reads
-            # ``self.auth.session_id`` / ``self.auth.authuser`` /
-            # ``self.auth.account_email`` LIVE off ``self.auth``. The two
-            # stay consistent only because the no-await invariant between
-            # ``_snapshot()`` and the ``client.post(...)`` call inside
-            # ``_perform_authed_post`` guarantees no coroutine can mutate
-            # ``self.auth`` between snapshot capture and request build (see
-            # the AST guard in ``tests/unit/test_concurrency_refresh_race.py``
-            # — adding an ``await`` anywhere in this factory or in
-            # ``_build_url`` would silently desync URL from body across a
-            # refresh). The snapshot's session_id/authuser/account_email
-            # fields are carried for symmetry / future-proofing but are not
-            # the source of truth on this code path.
-            url = self._build_url(method, source_path, rpc_id_override=resolved_id)
-            body = build_request_body(rpc_request, snapshot.csrf_token)
-            return url, body, {}
-
-        try:
-            response = await self._perform_authed_post(
-                build_request=_build,
-                log_label=f"RPC {method.name}",
-                disable_internal_retries=disable_internal_retries,
-            )
-        except _TransportAuthExpired as exc:
-            # Refresh callback raised. Historical contract:
-            # the *original* transport exception escapes with the refresh
-            # error attached via ``__cause__`` (already chained inside
-            # ``_perform_authed_post``). No status-code mapping happens for
-            # this path — callers that catch :class:`httpx.HTTPStatusError`
-            # see exactly what they used to see pre-extraction.
-            raise exc.original from exc.__cause__
-        except _TransportRateLimited as exc:
-            elapsed = time.perf_counter() - start
-            logger.error(
-                "RPC %s failed after %.3fs: HTTP 429",
-                method.name,
-                elapsed,
-            )
-            msg = f"API rate limit exceeded calling {method.name}"
-            if exc.retry_after:
-                msg += f". Retry after {exc.retry_after} seconds"
-            raise RateLimitError(
-                msg,
-                method_id=method.value,
-                retry_after=exc.retry_after,
-            ) from exc.original
-        except _TransportServerError as exc:
-            elapsed = time.perf_counter() - start
-            # Translate the budget-exhaustion signal back into the historical
-            # RPC error shape: 5xx → ServerError; network → NetworkError /
-            # RPCTimeoutError. ``_raise_rpc_error_from_*`` already does the
-            # right mapping for the underlying ``original`` exception.
-            if isinstance(exc.original, httpx.HTTPStatusError):
-                logger.error(
-                    "RPC %s failed after %.3fs: HTTP %s (server-error retries exhausted)",
-                    method.name,
-                    elapsed,
-                    exc.original.response.status_code,
-                )
-                self._raise_rpc_error_from_http_status(exc.original, method)
-            else:
-                # ``_perform_authed_post`` only wraps ``httpx.RequestError``
-                # into ``_TransportServerError`` on the network path; this
-                # guard keeps the contract enforced under ``python -O``
-                # (where ``assert`` would be stripped).
-                if not isinstance(exc.original, httpx.RequestError):
-                    raise TypeError(
-                        f"Unexpected _TransportServerError.original type: {type(exc.original)}"
-                    ) from exc
-                logger.error(
-                    "RPC %s failed after %.3fs: %s (server-error retries exhausted)",
-                    method.name,
-                    elapsed,
-                    exc.original,
-                )
-                self._raise_rpc_error_from_request_error(exc.original, method)
-        except httpx.HTTPStatusError as exc:
-            elapsed = time.perf_counter() - start
-            logger.error(
-                "RPC %s failed after %.3fs: HTTP %s",
-                method.name,
-                elapsed,
-                exc.response.status_code,
-            )
-            self._raise_rpc_error_from_http_status(exc, method)
-        # NOTE: bare ``httpx.RequestError`` handler was removed here because
-        # ``_perform_authed_post`` always either retries network-layer
-        # errors or wraps them in ``_TransportServerError`` (handled above),
-        # so they cannot reach this scope.
-
-        # ---------- Decode -------------------------------------------------
-        # Decode-time auth retry stays RPC-specific: Google sometimes
-        # returns a 200 with an auth-shaped RPCError payload (the body says
-        # "authentication expired" instead of a 401 status code). The chat
-        # streaming format doesn't have this pattern, so the retry lives
-        # here, not in ``_perform_authed_post``.
-        try:
-            # The server echoes back whatever RPC id we sent on the wire, so
-            # decode against the resolved id (override-aware) rather than the
-            # canonical ``method.value`` — otherwise an override would parse
-            # as "RPC id not found in response".
-            result = decode_response(response.text, resolved_id, allow_null=allow_null)
-            elapsed = time.perf_counter() - start
-            logger.debug("RPC %s completed in %.3fs", method.name, elapsed)
-            return result
-        except RPCError as e:
-            elapsed = time.perf_counter() - start
-
-            # Check if this is an auth error and we can retry
-            if not _is_retry and self._refresh_callback and is_auth_error(e):
-                refreshed = await self._try_refresh_and_retry(
-                    method,
-                    params,
-                    source_path,
-                    allow_null,
-                    e,
-                    disable_internal_retries=disable_internal_retries,
-                )
-                if refreshed is not None:
-                    return refreshed
-
-            logger.error("RPC %s failed after %.3fs: %s", method.name, elapsed, e)
-            raise
-        except Exception as e:
-            elapsed = time.perf_counter() - start
-            logger.error("RPC %s failed after %.3fs: %s", method.name, elapsed, e)
-            raise RPCError(
-                f"Failed to decode response for {method.name}: {e}",
-                method_id=method.value,
-            ) from e
+        """Compatibility wrapper around :class:`RpcExecutor`."""
+        return await self._get_rpc_executor().execute(
+            method,
+            params,
+            source_path,
+            allow_null,
+            _is_retry,
+            disable_internal_retries=disable_internal_retries,
+            operation_variant=operation_variant,
+        )
 
     def _raise_rpc_error_from_http_status(
         self,
         exc: httpx.HTTPStatusError,
         method: RPCMethod,
     ) -> NoReturn:
-        """Map an HTTP-status failure onto the RPC error hierarchy.
-
-        Centralizes the status-to-exception mapping that historically lived
-        inline in ``_rpc_call_impl``. Always raises — typed ``NoReturn`` so
-        mypy sees the caller's control flow terminates here.
-        """
-        status = exc.response.status_code
-
-        if status == 429:
-            # _perform_authed_post normally raises ``_TransportRateLimited``
-            # before reaching here. This branch covers callers that bypass
-            # the helper or a 429 surfacing after an auth retry.
-            retry_after = _parse_retry_after(exc.response.headers.get("retry-after"))
-            msg = f"API rate limit exceeded calling {method.name}"
-            if retry_after:
-                msg += f". Retry after {retry_after} seconds"
-            raise RateLimitError(msg, method_id=method.value, retry_after=retry_after) from exc
-
-        if 500 <= status < 600:
-            raise ServerError(
-                f"Server error {status} calling {method.name}: {exc.response.reason_phrase}",
-                method_id=method.value,
-                status_code=status,
-            ) from exc
-
-        if 400 <= status < 500 and status not in (401, 403):
-            raise ClientError(
-                f"Client error {status} calling {method.name}: {exc.response.reason_phrase}",
-                method_id=method.value,
-                status_code=status,
-            ) from exc
-
-        # 401/403 or other: Generic RPCError (auth retry already attempted by
-        # _perform_authed_post when a refresh callback was configured).
-        raise RPCError(
-            f"HTTP {status} calling {method.name}: {exc.response.reason_phrase}",
-            method_id=method.value,
-        ) from exc
+        """Compatibility wrapper around :class:`RpcExecutor`."""
+        self._get_rpc_executor().raise_rpc_error_from_http_status(exc, method)
 
     def _raise_rpc_error_from_request_error(
         self,
         exc: httpx.RequestError,
         method: RPCMethod,
     ) -> NoReturn:
-        """Map a non-HTTPStatus transport failure onto NetworkError/RPCTimeoutError.
-
-        Always raises — typed ``NoReturn`` so mypy treats the caller's
-        control flow as terminating here, preventing an unbound-``response``
-        warning in the decode block of ``_rpc_call_impl``.
-        """
-        # Check ConnectTimeout first (more specific than general TimeoutException)
-        if isinstance(exc, httpx.ConnectTimeout):
-            raise NetworkError(
-                f"Connection timed out calling {method.name}: {exc}",
-                method_id=method.value,
-                original_error=exc,
-            ) from exc
-
-        if isinstance(exc, httpx.TimeoutException):
-            raise RPCTimeoutError(
-                f"Request timed out calling {method.name}",
-                method_id=method.value,
-                timeout_seconds=self._timeout,
-                original_error=exc,
-            ) from exc
-
-        if isinstance(exc, httpx.ConnectError):
-            raise NetworkError(
-                f"Connection failed calling {method.name}: {exc}",
-                method_id=method.value,
-                original_error=exc,
-            ) from exc
-
-        raise NetworkError(
-            f"Request failed calling {method.name}: {exc}",
-            method_id=method.value,
-            original_error=exc,
-        ) from exc
+        """Compatibility wrapper around :class:`RpcExecutor`."""
+        self._get_rpc_executor().raise_rpc_error_from_request_error(exc, method)
 
     async def _try_refresh_and_retry(
         self,
@@ -1473,61 +1293,17 @@ class ClientCore:
         original_error: Exception,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ) -> Any | None:
-        """Attempt to refresh auth tokens and retry the RPC call.
-
-        Uses a shared task pattern to ensure only one refresh operation runs
-        at a time. Concurrent callers wait on the same task, preventing
-        redundant refresh calls under high concurrency.
-
-        Args:
-            method: The RPC method to retry.
-            params: Original parameters.
-            source_path: Original source path.
-            allow_null: Original allow_null setting.
-            original_error: The auth error that triggered this retry.
-            disable_internal_retries: When True, suppress the inner 5xx /
-                429 / network retry loop on the post-refresh ``rpc_call``,
-                so transport failures are surfaced immediately for the
-                caller's idempotency wrapper to handle.
-
-        Returns:
-            The RPC result if retry succeeds, None if refresh failed.
-
-        Raises:
-            The original error (with refresh error as cause) if refresh fails.
-        """
-        logger.info(
-            "RPC %s auth error detected, attempting token refresh",
-            method.name,
-        )
-
-        # Delegate the shared-task + lock dance to ``_await_refresh`` so this
-        # decode-time retry path stays in lockstep with the transport-time
-        # path inside ``_perform_authed_post``. On refresh failure, surface
-        # the *original* RPC decode error (not the refresh error) so callers
-        # see the symptom they originally hit — refresh failure is attached
-        # as ``__cause__``.
-        try:
-            await self._await_refresh()
-        except Exception as refresh_error:
-            logger.warning("Token refresh failed: %s", refresh_error)
-            raise original_error from refresh_error
-
-        # Brief delay before retry to avoid hammering the API
-        if self._refresh_retry_delay > 0:
-            await asyncio.sleep(self._refresh_retry_delay)
-
-        logger.info("Token refresh successful, retrying RPC %s", method.name)
-
-        # Retry with refreshed tokens
-        return await self.rpc_call(
+        """Compatibility wrapper around :class:`RpcExecutor`."""
+        return await self._get_rpc_executor().try_refresh_and_retry(
             method,
             params,
             source_path,
             allow_null,
-            _is_retry=True,
+            original_error,
             disable_internal_retries=disable_internal_retries,
+            operation_variant=operation_variant,
         )
 
     def get_http_client(self) -> httpx.AsyncClient:
@@ -1545,132 +1321,17 @@ class ClientCore:
             raise RuntimeError("Client not initialized. Use 'async with' context.")
         return self._http_client
 
-    def cache_conversation_turn(
-        self, conversation_id: str, query: str, answer: str, turn_number: int
-    ) -> None:
-        """Cache a conversation turn locally.
-
-        Uses FIFO eviction when cache exceeds MAX_CONVERSATION_CACHE_SIZE.
-
-        Args:
-            conversation_id: The conversation ID.
-            query: The user's question.
-            answer: The AI's response.
-            turn_number: The turn number in the conversation.
-        """
-        is_new_conversation = conversation_id not in self._conversation_cache
-
-        # Only evict when adding a NEW conversation at capacity
-        if is_new_conversation:
-            while len(self._conversation_cache) >= MAX_CONVERSATION_CACHE_SIZE:
-                # popitem(last=False) removes oldest entry (FIFO)
-                self._conversation_cache.popitem(last=False)
-            self._conversation_cache[conversation_id] = []
-
-        self._conversation_cache[conversation_id].append(
-            {
-                "query": query,
-                "answer": answer,
-                "turn_number": turn_number,
-            }
-        )
-
-    def get_cached_conversation(self, conversation_id: str) -> list[dict[str, Any]]:
-        """Get cached conversation turns.
-
-        Args:
-            conversation_id: The conversation ID.
-
-        Returns:
-            List of cached turns, or empty list if not found.
-        """
-        return self._conversation_cache.get(conversation_id, [])
-
-    def clear_conversation_cache(self, conversation_id: str | None = None) -> bool:
-        """Clear conversation cache.
-
-        Args:
-            conversation_id: Clear specific conversation, or all if None.
-
-        Returns:
-            True if cache was cleared.
-        """
-        if conversation_id:
-            if conversation_id in self._conversation_cache:
-                del self._conversation_cache[conversation_id]
-                return True
-            return False
-        else:
-            self._conversation_cache.clear()
-            return True
-
     async def get_source_ids(self, notebook_id: str) -> list[str]:
         """Extract all source IDs from a notebook.
 
-        Fetches notebook data and extracts source IDs for use with
-        chat and artifact generation when targeting specific sources.
+        Thin facade over :func:`notebooklm._sources.fetch_source_ids` —
+        retained on :class:`ClientCore` because first-party callers and the
+        test suite continue to invoke ``core.get_source_ids(...)``.
 
         Args:
             notebook_id: The notebook ID.
 
         Returns:
             List of source IDs. Empty list if no sources or on error.
-
-        Note:
-            Source IDs are triple-nested in RPC: source[0][0] contains the ID.
         """
-        params = [notebook_id, None, [2], None, 0]
-        notebook_data = await self.rpc_call(
-            RPCMethod.GET_NOTEBOOK,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-        )
-
-        source_ids: list[str] = []
-        if not notebook_data or not isinstance(notebook_data, list):
-            return source_ids
-
-        # Schema-drift detection points: log WARNING at each isinstance/len
-        # guard that fails on a non-empty response (real drift surfaces here,
-        # not at the safety-net except below).
-        try:
-            if not isinstance(notebook_data[0], list):
-                # notebook_data is already known to be a non-empty list here
-                # (guarded by `if not notebook_data` above).
-                logger.warning(
-                    "get_source_ids: notebook_data[0] shape unexpected for %s "
-                    "(schema drift?). top-type=%s",
-                    notebook_id,
-                    type(notebook_data[0]).__name__,
-                )
-                return source_ids
-
-            notebook_info = notebook_data[0]
-            if not (len(notebook_info) > 1 and isinstance(notebook_info[1], list)):
-                logger.warning(
-                    "get_source_ids: notebook_info[1] not list for %s (schema drift?). len=%d",
-                    notebook_id,
-                    len(notebook_info),
-                )
-                return source_ids
-
-            sources = notebook_info[1]
-            for source in sources:
-                if not (isinstance(source, list) and source):
-                    continue
-                first = source[0]
-                if not (isinstance(first, list) and first):
-                    continue
-                sid = first[0]
-                if isinstance(sid, str):
-                    source_ids.append(sid)
-        except (IndexError, TypeError) as e:
-            # Defense-in-depth: guards above should make this unreachable.
-            logger.warning(
-                "get_source_ids: unexpected exception despite guards for %s: %s",
-                notebook_id,
-                e,
-                exc_info=True,
-            )
-
-        return source_ids
+        return await fetch_source_ids(self, notebook_id)
