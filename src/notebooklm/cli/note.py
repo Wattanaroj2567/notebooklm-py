@@ -17,17 +17,12 @@ from rich.table import Table
 
 from ..client import NotebookLMClient
 from ..types import Note
+from .auth_runtime import with_client
 from .error_handler import _output_error
-from .helpers import (
-    console,
-    json_output_response,
-    read_stdin_text,
-    require_notebook,
-    resolve_note_id,
-    resolve_notebook_id,
-    with_client,
-)
+from .input import read_stdin_text
 from .options import json_option, notebook_option
+from .rendering import console, json_output_response
+from .resolve import require_notebook, resolve_note_id, resolve_notebook_id
 
 
 @click.group()
@@ -132,7 +127,7 @@ def note_create(ctx, content, content_flag, notebook_id, title, json_output, cli
       cat notes.md | notebooklm note create --content -    # Content from stdin
       cat notes.md | notebooklm note create -              # Same, positional form
     """
-    # P7.T2 / M3 — resolve content from one of (positional CONTENT, --content,
+    # Resolve content from one of (positional CONTENT, --content,
     # stdin). Positional and --content are mutually exclusive so the failure
     # mode on accidental double-pass is loud instead of a silent precedence.
     # ``content`` defaults to ``""`` (Click's ``default=""``) so we can't
@@ -214,9 +209,9 @@ def note_get(ctx, note_id, notebook_id, json_output, client_auth):
             )
             n = await client.notes.get(nb_id_resolved, resolved_id)
 
-            # C1 (Phase 3, BREAKING): not-found exits 1 with a typed error
-            # instead of the previous exit-0 ``found: false`` placeholder. The
-            # backend may return ``None`` (or any non-``Note`` sentinel) when
+            # BREAKING: not-found exits 1 with a typed error instead of
+            # the previous exit-0 ``found: false`` placeholder. The backend
+            # may return ``None`` (or any non-``Note`` sentinel) when
             # the row was deleted between the partial-ID resolve and this
             # ``get``; treat any non-``Note`` as missing. See
             # ``docs/cli-exit-codes.md`` and the BREAKING entry in
@@ -226,7 +221,7 @@ def note_get(ctx, note_id, notebook_id, json_output, client_auth):
             # (``_output_error`` always raises) — it exists solely to narrow
             # ``n`` from ``Note | None`` to ``Note`` for mypy without forcing a
             # ``NoReturn`` annotation onto ``error_handler._output_error``
-            # (which would touch a module the C1 spec says we must not).
+            # (which would change the shared error helper's typing contract).
             if not isinstance(n, Note):
                 _output_error(
                     "Note not found",

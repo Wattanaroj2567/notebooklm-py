@@ -2,7 +2,7 @@
 
 Provides reusable option decorators to reduce boilerplate in commands.
 
-Shell completion (P7.T1 / M1)
+Shell completion
 -----------------------------
 
 The ``-n/--notebook``, ``-s/--source``, and ``-a/--artifact`` options below
@@ -16,12 +16,12 @@ just gets no suggestions instead of an error printed by their shell. This
 keeps tab-completion safe to use even in fresh shells without credentials.
 """
 
-import os
 from collections.abc import Callable
 
 import click
 from click.decorators import FC
-from click.shell_completion import CompletionItem
+
+from . import completion as _completion
 
 
 def _complete_notebooks(ctx, param, incomplete):
@@ -38,26 +38,7 @@ def _complete_notebooks(ctx, param, incomplete):
     suggestions" — exactly what the user expects when ``notebooklm list``
     would also fail.
     """
-    try:
-        from ..client import NotebookLMClient
-        from .helpers import get_auth_tokens, run_async
-
-        auth = get_auth_tokens(ctx)
-
-        async def _list():
-            async with NotebookLMClient(auth) as client:
-                return await client.notebooks.list()
-
-        notebooks = run_async(_list())
-        items: list[CompletionItem] = []
-        for nb in notebooks:
-            if nb.id.startswith(incomplete):
-                items.append(CompletionItem(nb.id, help=nb.title or ""))
-                if len(items) >= 50:
-                    break
-        return items
-    except Exception:
-        return []
+    return _completion.complete_notebooks(ctx, incomplete)
 
 
 def _resolve_notebook_for_completion(ctx) -> str | None:
@@ -75,26 +56,7 @@ def _resolve_notebook_for_completion(ctx) -> str | None:
     Returns ``None`` when no notebook can be resolved, in which case the
     caller should return an empty completion list rather than guess.
     """
-    # 1) walk up Click contexts looking for an already-parsed --notebook value.
-    cur = ctx
-    while cur is not None:
-        nid = cur.params.get("notebook_id") if cur.params else None
-        if nid:
-            return nid
-        cur = cur.parent
-
-    # 2) env var fallback (helpers.require_notebook treats whitespace-only as unset).
-    env_val = os.environ.get("NOTEBOOKLM_NOTEBOOK", "").strip()
-    if env_val:
-        return env_val
-
-    # 3) active context written by ``notebooklm use``.
-    try:
-        from .helpers import get_current_notebook
-
-        return get_current_notebook()
-    except Exception:
-        return None
+    return _completion.resolve_notebook(ctx)
 
 
 def _complete_sources(ctx, param, incomplete):
@@ -104,31 +66,11 @@ def _complete_sources(ctx, param, incomplete):
     sources and filters by ``incomplete`` prefix. Returns ``[]`` on any
     failure — see ``_complete_notebooks`` for the rationale.
     """
-    try:
-        from ..client import NotebookLMClient
-        from .helpers import get_auth_tokens, run_async
-
-        nb_id = _resolve_notebook_for_completion(ctx)
-        if not nb_id:
-            return []
-        auth = get_auth_tokens(ctx)
-
-        async def _list():
-            async with NotebookLMClient(auth) as client:
-                return await client.sources.list(nb_id)
-
-        sources = run_async(_list())
-        items: list[CompletionItem] = []
-        for src in sources:
-            sid = getattr(src, "id", None) or getattr(src, "source_id", "")
-            if sid and sid.startswith(incomplete):
-                title = getattr(src, "title", "") or ""
-                items.append(CompletionItem(sid, help=title))
-                if len(items) >= 50:
-                    break
-        return items
-    except Exception:
-        return []
+    return _completion.complete_sources(
+        ctx,
+        incomplete,
+        notebook_resolver=_resolve_notebook_for_completion,
+    )
 
 
 def _complete_artifacts(ctx, param, incomplete):
@@ -137,38 +79,18 @@ def _complete_artifacts(ctx, param, incomplete):
     Same shape as ``_complete_sources`` but lists artifacts in the resolved
     notebook. Returns ``[]`` on any failure.
     """
-    try:
-        from ..client import NotebookLMClient
-        from .helpers import get_auth_tokens, run_async
-
-        nb_id = _resolve_notebook_for_completion(ctx)
-        if not nb_id:
-            return []
-        auth = get_auth_tokens(ctx)
-
-        async def _list():
-            async with NotebookLMClient(auth) as client:
-                return await client.artifacts.list(nb_id)
-
-        artifacts = run_async(_list())
-        items: list[CompletionItem] = []
-        for art in artifacts:
-            aid = getattr(art, "id", None) or getattr(art, "artifact_id", "")
-            if aid and aid.startswith(incomplete):
-                title = getattr(art, "title", "") or getattr(art, "name", "") or ""
-                items.append(CompletionItem(aid, help=title))
-                if len(items) >= 50:
-                    break
-        return items
-    except Exception:
-        return []
+    return _completion.complete_artifacts(
+        ctx,
+        incomplete,
+        notebook_resolver=_resolve_notebook_for_completion,
+    )
 
 
 def notebook_option(f: FC) -> FC:
     """Add --notebook/-n option for notebook ID.
 
     The option defaults to None and falls back to the ``NOTEBOOKLM_NOTEBOOK``
-    environment variable (P7.T3 / M4) before context-based resolution kicks in
+    environment variable before context-based resolution kicks in
     inside ``helpers.require_notebook``. Click's native ``envvar=`` wiring is
     used so the binding shows up in ``--help`` automatically (``show_envvar=True``)
     and so the env value reaches the command body via the same ``notebook_id``
@@ -176,7 +98,7 @@ def notebook_option(f: FC) -> FC:
 
     Supports partial ID matching (e.g., 'abc' matches 'abc123...').
 
-    Tab completion (P7.T1 / M1): when shell completion is activated for
+    Tab completion: when shell completion is activated for
     ``notebooklm`` (see ``docs/cli-reference.md``), ``-n <TAB>`` lists real
     notebook IDs from the active profile. Best-effort — returns no
     suggestions on auth / network failure.
@@ -219,9 +141,9 @@ def wait_polling_options(
     """Bundle the shared ``--timeout`` / ``--interval`` polling flags.
 
     Used by every long-running CLI command so the flag surface stays uniform
-    across ``generate <kind> --wait``, ``artifact wait``, and ``source wait``
-    (audit row I6, P5.T1). Returns a decorator so each call site can supply
-    its own historical defaults without diverging on flag name or help text.
+    across ``generate <kind> --wait``, ``artifact wait``, and ``source wait``.
+    Returns a decorator so each call site can supply its own historical
+    defaults without diverging on flag name or help text.
 
     The ``--wait`` flag is intentionally NOT bundled here. It is a *trigger*
     flag on ``generate <kind>`` (paired with ``wait_option`` /
@@ -277,7 +199,7 @@ def source_option(f: FC) -> FC:
 
     Supports partial ID matching (e.g., 'abc' matches 'abc123...').
 
-    Tab completion (P7.T1 / M1): when shell completion is activated, ``-s
+    Tab completion: when shell completion is activated, ``-s
     <TAB>`` lists source IDs from the resolved active notebook. Resolution
     follows the same precedence as the command body (``-n`` flag > env >
     persisted context); without a resolvable notebook the completer returns
@@ -298,7 +220,7 @@ def artifact_option(f: FC) -> FC:
 
     Supports partial ID matching (e.g., 'abc' matches 'abc123...').
 
-    Tab completion (P7.T1 / M1): when shell completion is activated, ``-a
+    Tab completion: when shell completion is activated, ``-a
     <TAB>`` lists artifact IDs from the resolved active notebook. See
     ``source_option`` for the resolution rules.
     """
@@ -328,7 +250,7 @@ class _PromptFilePath(click.ParamType):
     """``--prompt-file`` value: a regular file OR the literal ``-`` (stdin).
 
     Replaces ``click.Path(exists=True, dir_okay=False)`` so the Unix ``-``
-    convention works (P7.T2 / M3). For real paths we still want
+    convention works. For real paths we still want
     ``click.Path``'s existence + dir-check guarantees so a typo surfaces at
     parse time instead of inside the command body. ``-`` is passed through
     untouched and the downstream ``resolve_prompt`` helper interprets it as
@@ -349,7 +271,7 @@ def prompt_file_option(f: FC) -> FC:
     """Add --prompt-file option for reading prompt/query text from a file.
 
     Accepts a path to a regular file OR the literal ``-`` to read from
-    stdin (P7.T2 / M3).
+    stdin.
     """
     return click.option(
         "--prompt-file",
@@ -377,11 +299,11 @@ def retry_option(f: FC) -> FC:
 def list_options(f: FC) -> FC:
     """Add ``--limit`` and ``--no-truncate`` flags shared by every ``list``-style command.
 
-    Audit row I16 / Phase 6 (P6.T1). Used by the top-level ``notebooklm list``,
-    ``notebooklm source list``, and ``notebooklm artifact list`` so the
-    output-shaping flag surface stays uniform across list-style commands as
-    notebooks grow large enough that the default rendering becomes unreadable
-    or unparseable. The wrapped function gains two kwargs:
+    Used by the top-level ``notebooklm list``, ``notebooklm source list``,
+    and ``notebooklm artifact list`` so the output-shaping flag surface
+    stays uniform across list-style commands as notebooks grow large
+    enough that the default rendering becomes unreadable or unparseable.
+    The wrapped function gains two kwargs:
 
     - ``limit`` (``int | None``) — when non-``None``, the command must slice
       its result set to the first ``limit`` rows BEFORE rendering (and before

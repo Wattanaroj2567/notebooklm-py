@@ -13,19 +13,15 @@ from rich.table import Table
 
 from ..client import NotebookLMClient
 from ..types import ChatMode
-from .helpers import (
-    console,
-    get_current_conversation,
-    get_current_notebook,
-    json_output_response,
-    require_notebook,
-    resolve_notebook_id,
-    resolve_prompt,
-    resolve_source_ids,
-    set_current_conversation,
-    with_client,
-)
+from .auth_runtime import with_client
+from .context import get_current_conversation, get_current_notebook, set_current_conversation
+from .input import resolve_prompt
 from .options import _complete_sources, json_option, notebook_option, prompt_file_option
+from .rendering import (
+    console,
+    json_output_response,
+)
+from .resolve import require_notebook, resolve_notebook_id, resolve_source_ids
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +87,22 @@ def register_chat_commands(cli):
         "--new",
         "new_conversation",
         is_flag=True,
-        help="Start a fresh conversation, skipping the auto-resume of the last one.",
+        help=(
+            "Start a fresh conversation. DESTRUCTIVE: this deletes the "
+            "notebook's current server-side conversation (turns are not "
+            "recoverable) before asking. Prompts for confirmation unless "
+            "``--yes`` is passed."
+        ),
+    )
+    @click.option(
+        "--yes",
+        "-y",
+        "assume_yes",
+        is_flag=True,
+        help=(
+            "Skip the ``--new`` destructive-delete confirmation prompt. "
+            "``--json`` implies ``--yes`` so scripted callers never hang."
+        ),
     )
     @click.option(
         "--source",
@@ -104,7 +115,16 @@ def register_chat_commands(cli):
     @click.option(
         "--json", "json_output", is_flag=True, help="Output as JSON (includes references)"
     )
-    @click.option("--save-as-note", is_flag=True, help="Save response as a note")
+    @click.option(
+        "--save-as-note",
+        is_flag=True,
+        help=(
+            "Save response as a note. When the answer has citations, the saved "
+            "note preserves interactive [N] hover-anchor links (matching the "
+            "NotebookLM web UI's 'Save to note' behavior); otherwise falls "
+            "back to a plain-text note."
+        ),
+    )
     @click.option("--note-title", default=None, help="Note title (use with --save-as-note)")
     @click.option(
         "--timeout",
@@ -123,6 +143,7 @@ def register_chat_commands(cli):
         notebook_id,
         conversation_id,
         new_conversation,
+        assume_yes,
         source_ids,
         json_output,
         save_as_note,
@@ -161,8 +182,36 @@ def register_chat_commands(cli):
             async with NotebookLMClient(client_auth, **client_kwargs) as client:
                 nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
                 if new_conversation:
-                    # --new: skip both the local-cache and server-side resume so the
-                    # server treats this turn as the start of a new conversation.
+                    # Dropping ``conversation_id`` alone extends the most-recent
+                    # conversation (see ChatAPI.ask Note). Deleting it first
+                    # leaves the next ask nothing to attach to. No prior
+                    # conversation is fine — skip both the prompt and the
+                    # delete; ``ask`` then creates the notebook's first one.
+                    last_conv_id = await client.chat.get_conversation_id(nb_id_resolved)
+                    if last_conv_id:
+                        # ``--json`` implies ``--yes`` so scripted callers don't
+                        # hang on stdin (which would also clobber JSON stdout
+                        # purity). See cli/artifact.py:artifact_delete for the
+                        # same pattern.
+                        if (
+                            not assume_yes
+                            and not json_output
+                            and not click.confirm(
+                                f"This will permanently delete conversation "
+                                f"{last_conv_id[:8]}... and all its turns. Continue?",
+                                default=False,
+                            )
+                        ):
+                            # Exit 1 (BaseException-bypassing ``SystemExit``)
+                            # so scripts can distinguish "user said no" from
+                            # "ask succeeded" — the intended ``ask`` did not
+                            # run. ``click.exceptions.Exit`` and ``ctx.exit``
+                            # both raise ``RuntimeError`` subclasses that the
+                            # ``handle_errors`` catch-all (error_handler.py)
+                            # would remap to exit 2.
+                            console.print("[yellow]Aborted — no conversation deleted.[/yellow]")
+                            raise SystemExit(1)
+                        await client.chat.delete_conversation(nb_id_resolved, last_conv_id)
                     effective_conv_id: str | None = None
                 else:
                     effective_conv_id = _determine_conversation_id(
@@ -222,8 +271,20 @@ def register_chat_commands(cli):
                         console.print("[yellow]Warning: No answer to save as note[/yellow]")
                         return
                     try:
-                        title = note_title or f"Chat: {question[:50]}"
-                        note = await client.notes.create(nb_id_resolved, title, result.answer)
+                        title = note_title or f"Chat: {question[:50].strip().replace(chr(10), ' ')}"
+                        if result.references:
+                            # Citation-rich path: server stores [N] markers as
+                            # hover-anchored references (issue #660).
+                            note = await client.notes.create_from_chat(
+                                nb_id_resolved, result, title=title
+                            )
+                        else:
+                            # No citations to preserve — fall back to the
+                            # plain-text path so the save still succeeds.
+                            console.print(
+                                "[dim]No citations in answer; saving as plain-text note.[/dim]"
+                            )
+                            note = await client.notes.create(nb_id_resolved, title, result.answer)
                         console.print(
                             f"\n[dim]Saved as note: {note.title} ({note.id[:8]}...)[/dim]"
                         )
@@ -447,7 +508,7 @@ def register_chat_commands(cli):
                     console.print(f"\n[dim]── {conv_id} ──[/dim]")
                 table = Table()
                 table.add_column("#", style="dim", width=4)
-                # P6.T1 / I16: ``--no-truncate`` lifts both the column-level
+                # ``--no-truncate`` lifts both the column-level
                 # ``max_width=50`` constraint and the ``[:50]`` cell slice so
                 # the table view can render long Q/A turns in full. Default
                 # behavior is unchanged — the 50-char preview is preserved

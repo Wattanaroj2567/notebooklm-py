@@ -16,5 +16,5 @@ def check_python_version():
         sys.exit(
             f"notebooklm-py requires Python {MIN_VERSION[0]}.{MIN_VERSION[1]} or later. "
             f"You are using Python {sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}.\n"
-            "Please upgrade: https://www.python.org/downloads/"
+            f"Please upgrade: https://www.python.org/downloads/"
         )
