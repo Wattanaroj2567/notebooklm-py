@@ -7,8 +7,14 @@ from urllib.parse import parse_qs
 import pytest
 
 from notebooklm import NotebookLMClient
-from notebooklm._research import ResearchAPI
-from notebooklm.auth import AuthTokens
+from notebooklm._research import (
+    ResearchAPI,
+    _extract_query_text,
+    _extract_sources_and_summary,
+    _extract_status_code,
+    _extract_task_id,
+    _extract_task_info,
+)
 from notebooklm.rpc import RPCMethod
 
 
@@ -17,16 +23,6 @@ def _extract_request_params(request) -> list:
     body = parse_qs(request.content.decode())
     f_req = json.loads(body["f.req"][0])
     return json.loads(f_req[0][0][1])
-
-
-@pytest.fixture
-def auth_tokens():
-    """Create test authentication tokens."""
-    return AuthTokens(
-        cookies={"SID": "test"},
-        csrf_token="test_csrf",
-        session_id="test_session",
-    )
 
 
 class TestParseResultType:
@@ -201,6 +197,142 @@ class TestExtractLegacyReportChunks:
             ResearchAPI._extract_legacy_report_chunks([None, "t", None, 5, None, None, ["", None]])
             == ""
         )
+
+
+class TestExtractTaskId:
+    """Tests for ``_extract_task_id`` helper."""
+
+    def test_happy_path(self):
+        assert _extract_task_id(["task_abc", ["info"]]) == "task_abc"
+
+    def test_empty_list_drift_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_task_id([]) is None
+        assert "safe_index drift" in caplog.text
+
+    def test_non_string_id_drift_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_task_id([42, ["info"]]) is None
+        assert "task_data[0] is not a string" in caplog.text
+
+    def test_non_list_input_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_task_id(None) is None
+
+
+class TestExtractTaskInfo:
+    """Tests for ``_extract_task_info`` helper."""
+
+    def test_happy_path(self):
+        info = [None, ["q"], None, [[]], 2]
+        assert _extract_task_info(["task_id", info]) is info
+
+    def test_missing_index_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_task_info(["only_id"]) is None
+        assert "safe_index drift" in caplog.text
+
+    def test_non_list_value_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_task_info(["task_id", "not_a_list"]) is None
+        assert "task_data[1] is not a list" in caplog.text
+
+
+class TestExtractQueryText:
+    """Tests for ``_extract_query_text`` helper."""
+
+    def test_happy_path(self):
+        task_info = [None, ["quantum computing", "extra"], None, [], 1]
+        assert _extract_query_text(task_info) == "quantum computing"
+
+    def test_missing_query_info_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            # task_info[1] missing entirely
+            assert _extract_query_text([None]) is None
+        assert "safe_index drift" in caplog.text
+
+    def test_non_string_query_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_query_text([None, [123], None, [], 1]) is None
+        assert "task_info[1][0] is not a string" in caplog.text
+
+
+class TestExtractStatusCode:
+    """Tests for ``_extract_status_code`` helper."""
+
+    def test_happy_path_in_progress(self):
+        assert _extract_status_code([None, ["q"], None, [], 1]) == 1
+
+    def test_happy_path_completed(self):
+        assert _extract_status_code([None, ["q"], None, [], 2]) == 2
+
+    def test_happy_path_deep_completed(self):
+        assert _extract_status_code([None, ["q"], None, [], 6]) == 6
+
+    def test_missing_index_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_status_code([None, ["q"], None, []]) is None
+        assert "safe_index drift" in caplog.text
+
+    def test_non_int_returns_none(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_status_code([None, ["q"], None, [], "completed"]) is None
+        assert "task_info[4] is not an int" in caplog.text
+
+    def test_bool_rejected(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert _extract_status_code([None, ["q"], None, [], True]) is None
+        assert "task_info[4] is bool" in caplog.text
+
+
+class TestExtractSourcesAndSummary:
+    """Tests for ``_extract_sources_and_summary`` helper."""
+
+    def test_happy_path_with_summary(self):
+        task_info = [
+            None,
+            ["q"],
+            None,
+            [[["https://example.com", "Example"]], "Summary text"],
+            2,
+        ]
+        sources, summary = _extract_sources_and_summary(task_info)
+        assert sources == [["https://example.com", "Example"]]
+        assert summary == "Summary text"
+
+    def test_happy_path_sources_only(self):
+        task_info = [None, ["q"], None, [[["url", "title"]]], 2]
+        sources, summary = _extract_sources_and_summary(task_info)
+        assert sources == [["url", "title"]]
+        assert summary is None
+
+    def test_missing_bundle_returns_empty(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            sources, summary = _extract_sources_and_summary([None, ["q"], None])
+        assert sources == []
+        assert summary is None
+        assert "safe_index drift" in caplog.text
+
+    def test_empty_bundle_returns_empty(self):
+        sources, summary = _extract_sources_and_summary([None, ["q"], None, [], 2])
+        assert sources == []
+        assert summary is None
+
+    def test_non_list_bundle_drift(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            sources, summary = _extract_sources_and_summary([None, ["q"], None, "drift", 2])
+        assert sources == []
+        assert summary is None
+        assert "task_info[3] is not a list" in caplog.text
+
+    def test_non_list_sources_slot_drift(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            sources, summary = _extract_sources_and_summary(
+                [None, ["q"], None, ["not_a_list", "Summary"], 2]
+            )
+        assert sources == []
+        assert summary == "Summary"
+        assert "task_info[3][0] is not a list" in caplog.text
 
 
 class TestResearch:
@@ -379,7 +511,11 @@ class TestResearch:
         httpx_mock.add_response(content=response_body.encode(), method="POST")
 
         async with NotebookLMClient(auth_tokens) as client:
-            result = await client.research.poll("nb_123")
+            # poll() without task_id when >1 task is in flight is the
+            # ambiguous case — pin that the DeprecationWarning fires on this
+            # exact path so a future change can't silently drop it.
+            with pytest.warns(DeprecationWarning, match="task_id"):
+                result = await client.research.poll("nb_123")
 
         assert result["task_id"] == "task_latest"
         assert result["query"] == "latest query"
@@ -538,9 +674,12 @@ class TestResearch:
                     "research_task_id": "report_123",
                 },
             ]
+            # caller's task_id must match the source's research_task_id.
+            # For deep research the authoritative id on the wire is the
+            # report_id, which is what ``poll`` propagates onto each source.
             result = await client.research.import_sources(
                 notebook_id="nb_123",
-                task_id="task_123",
+                task_id="report_123",
                 sources=sources,
             )
 
@@ -566,8 +705,18 @@ class TestResearch:
 
     @pytest.mark.asyncio
     async def test_import_sources_rejects_mixed_research_task_ids(self, auth_tokens):
-        """Test that import_sources rejects batches spanning multiple research tasks."""
-        from notebooklm.exceptions import ValidationError
+        """Test that import_sources rejects batches spanning multiple research tasks.
+
+        Two distinct failure modes both refuse the batch:
+        - At least one source's ``research_task_id`` differs from the caller's
+          ``task_id`` (raises :class:`ResearchTaskMismatchError`).
+        - All sources match the caller's ``task_id`` but disagree among
+          themselves (legacy multi-task batch check; raises plain
+          :class:`ValidationError`). Hard to construct in practice because
+          a caller can pass only one ``task_id``, but the legacy check
+          remains a defense-in-depth guardrail.
+        """
+        from notebooklm.exceptions import ResearchTaskMismatchError
 
         async with NotebookLMClient(auth_tokens) as client:
             sources = [
@@ -584,12 +733,17 @@ class TestResearch:
                     "research_task_id": "report_456",
                 },
             ]
-            with pytest.raises(ValidationError, match="multiple research tasks"):
+            # Caller passes task_id="report_123": the first source matches,
+            # but the second source's research_task_id="report_456" mismatches
+            # and trips the per-source task-id check.
+            with pytest.raises(ResearchTaskMismatchError) as exc_info:
                 await client.research.import_sources(
                     notebook_id="nb_123",
-                    task_id="task_123",
+                    task_id="report_123",
                     sources=sources,
                 )
+            assert exc_info.value.task_id == "report_123"
+            assert exc_info.value.source_research_task_id == "report_456"
 
     @pytest.mark.asyncio
     async def test_import_sources_includes_multiple_report_entries(
@@ -629,9 +783,10 @@ class TestResearch:
                     "research_task_id": "report_123",
                 },
             ]
+            # caller's task_id matches the sources' research_task_id.
             result = await client.research.import_sources(
                 notebook_id="nb_123",
-                task_id="task_123",
+                task_id="report_123",
                 sources=sources,
             )
 
@@ -780,7 +935,6 @@ class TestResearch:
             )
             assert start_result is not None
             assert start_result["mode"] == "deep"
-            task_id = start_result["task_id"]
 
             poll_result = await client.research.poll("nb_123")
             assert poll_result["status"] == "completed"
@@ -792,9 +946,14 @@ class TestResearch:
             sources_with_urls = [s for s in sources if s.get("url")]
             assert len(sources_with_urls) == 2
 
+            # for deep research the authoritative id on the wire is
+            # the report_id returned by ``poll`` (and stamped onto each
+            # source as ``research_task_id``), not the ``task_id`` returned
+            # by ``start``. Pass the poll-derived id so the per-source
+            # mismatch guard accepts the batch.
             imported = await client.research.import_sources(
                 notebook_id="nb_123",
-                task_id=task_id,
+                task_id=poll_result["task_id"],
                 sources=sources,  # Pass all, filtering happens internally
             )
 

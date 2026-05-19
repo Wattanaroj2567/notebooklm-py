@@ -1,7 +1,4 @@
-"""Tests for per-request correlation IDs via contextvars.ContextVar.
-
-Phase 1 / T2. See .sisyphus/plans/phase-1-implementation.md.
-"""
+"""Tests for per-request correlation IDs via contextvars.ContextVar."""
 
 from __future__ import annotations
 
@@ -251,6 +248,7 @@ async def test_retry_inherits_parent_request_id():
         rate_limit_retries=0,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ):
         captured_ids.append(get_request_id())
         # First call: raise to trigger retry path; second call: succeed.

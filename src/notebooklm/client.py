@@ -19,29 +19,46 @@ Example:
         result = await client.chat.ask(notebook_id, "What is this about?")
 """
 
+from __future__ import annotations
+
 import dataclasses
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import httpx
 
 if TYPE_CHECKING:
-    from .types import ConnectionLimits
+    from .rpc import RPCMethod
+    from .types import ClientMetricsSnapshot, ConnectionLimits, RpcTelemetryEvent
 
 from ._artifacts import ArtifactsAPI
+from ._auth.session import refresh_auth_session
 from ._chat import ChatAPI
-from ._core import DEFAULT_KEEPALIVE_MIN_INTERVAL, DEFAULT_TIMEOUT, ClientCore
-from ._env import get_base_url
+from ._core import (
+    DEFAULT_KEEPALIVE_MIN_INTERVAL,
+    DEFAULT_MAX_CONCURRENT_RPCS,
+    DEFAULT_MAX_CONCURRENT_UPLOADS,
+    DEFAULT_TIMEOUT,
+    ClientCore,
+)
+from ._env import get_base_url as get_base_url
 from ._notebooks import NotebooksAPI
 from ._notes import NotesAPI
 from ._research import ResearchAPI
 from ._settings import SettingsAPI
 from ._sharing import SharingAPI
 from ._sources import SourcesAPI
-from ._url_utils import is_google_auth_redirect
-from .auth import AuthTokens, authuser_query, extract_wiz_field
-from .exceptions import AuthExtractionError
+from ._url_utils import is_google_auth_redirect as is_google_auth_redirect
+from .auth import AuthTokens
+from .auth import authuser_query as authuser_query
+from .auth import extract_wiz_field as extract_wiz_field
+from .exceptions import AuthExtractionError as AuthExtractionError
+
+__all__ = ["NotebookLMClient"]
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +105,13 @@ class NotebookLMClient:
         storage_path: Path | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = DEFAULT_KEEPALIVE_MIN_INTERVAL,
-        rate_limit_max_retries: int = 0,
+        rate_limit_max_retries: int = 3,
         server_error_max_retries: int = 3,
-        limits: "ConnectionLimits | None" = None,
+        limits: ConnectionLimits | None = None,
+        max_concurrent_uploads: int | None = DEFAULT_MAX_CONCURRENT_UPLOADS,
+        max_concurrent_rpcs: int | None = DEFAULT_MAX_CONCURRENT_RPCS,
+        upload_timeout: httpx.Timeout | None = None,
+        on_rpc_event: Callable[[RpcTelemetryEvent], object] | None = None,
     ):
         """Initialize the NotebookLM client.
 
@@ -107,10 +128,14 @@ class NotebookLMClient:
             keepalive_min_interval: Lower bound for ``keepalive`` (defaults to
                 60 s) to avoid accidentally rate-limiting Google's identity
                 surface.
-            rate_limit_max_retries: Max automatic retries on HTTP 429 with a
-                parseable ``Retry-After``. ``0`` (default) preserves the
-                pre-Phase-3 contract of raising immediately. See
-                :class:`ClientCore` for the per-attempt sleep semantics.
+            rate_limit_max_retries: Max automatic retries on HTTP 429.
+                Defaults to ``3`` so programmatic users
+                inherit "smart retry" behavior out of the box. Set to ``0``
+                to raise ``RateLimitError`` immediately.
+                Sleeps for ``Retry-After`` when the server provides a
+                parseable header; otherwise falls back to capped exponential
+                backoff ``min(2 ** attempt, 30)`` seconds with ±20% jitter.
+                See :class:`ClientCore` for full sleep semantics.
             server_error_max_retries: Max automatic retries for retryable
                 transient failures: HTTP 5xx and network-layer
                 ``httpx.RequestError`` (timeouts, connect errors). Defaults to
@@ -122,6 +147,51 @@ class NotebookLMClient:
                 max_keepalive_connections=50, keepalive_expiry=30.0s). Widen
                 for heavy batch workloads (FastAPI/Django services sharing one
                 client across many concurrent requests).
+            max_concurrent_uploads: Ceiling on simultaneous in-flight
+                ``client.sources.add_file`` uploads. Defaults to ``4``. Each
+                in-flight upload holds one open file descriptor for the
+                duration of the upload, so the cap doubles as an
+                FD-exhaustion guard against fan-out callers that would
+                otherwise open dozens of files concurrently and exhaust
+                the per-process FD limit. ``None``
+                resolves to the default — unbounded uploads are
+                intentionally rejected. Must be ``>= 1`` when supplied.
+                Independent of the RPC pool sizing (uploads use their own
+                ``httpx.AsyncClient`` against the Scotty endpoint and
+                don't share the RPC connection pool).
+            max_concurrent_rpcs: Ceiling on simultaneous in-flight RPC
+                POSTs (``client.notebooks.list``, ``client.chat.ask``,
+                etc.). Defaults to ``16`` — well below the default
+                ``ConnectionLimits.max_connections=100`` so short-lived
+                helper requests (auth refresh GETs, upload preflights)
+                still have pool headroom. Pass ``None`` to disable the
+                gate entirely; useful when an external rate-limiter is
+                in front of the client or for single-shot CLI commands
+                where the throttle is overhead. Must be ``>= 1`` when
+                supplied, and must satisfy ``max_concurrent_rpcs <=
+                limits.max_connections`` — the constructor raises
+                ``ValueError`` otherwise (a semaphore that lets requests
+                through that the pool can't fulfill would surface as
+                opaque ``httpx.PoolTimeout`` rather than clean
+                back-pressure). Before this gate was added, heavy
+                fan-out workloads tripped pool timeouts before any
+                upstream throttle could intervene.
+            upload_timeout: Optional override for the ``httpx.Timeout`` used
+                by the resumable-upload start handshake and the finalize
+                POST in ``client.sources.add_file``. ``None`` (default)
+                preserves the original hardcoded values (10.0s connect /
+                60.0s read for start; 10.0s connect / 300.0s read for
+                finalize). The supplied ``Timeout`` is used wholesale at
+                both upload sites — specify all components explicitly
+                (e.g. ``httpx.Timeout(10.0, read=600.0)``), or partial
+                fields will fall back to httpx's own 5.0s defaults rather
+                than the original 10.0s connect. Defaults are NOT changed
+                silently for back-compat.
+            on_rpc_event: Optional sync or async callback invoked after each
+                logical RPC succeeds or fails. The callback receives a
+                backend-agnostic ``RpcTelemetryEvent`` so applications can
+                forward telemetry to logging, Prometheus, OpenTelemetry, or
+                another metrics backend without this package depending on one.
         """
         # Normalize the effective storage path onto the auth object so every
         # downstream code path (refresh_auth, ClientCore.close on-close save,
@@ -135,6 +205,48 @@ class NotebookLMClient:
         if storage_path is not None and auth.storage_path != storage_path:
             auth = dataclasses.replace(auth, storage_path=storage_path)
 
+        # Canonicalize the keepalive storage path so different representations
+        # of the same physical file (relative vs absolute, ``~`` shorthand,
+        # symlink components) hash to the same key in the in-process rotation
+        # dedupe (``_get_poke_lock`` / ``_try_claim_rotation`` /
+        # ``_rotation_lock_path`` in auth.py). The auth refresh path already
+        # canonicalizes at ``auth.py:_fetch_tokens_with_refresh`` via
+        # ``Path(p).expanduser().resolve()``; this mirrors it so two clients
+        # pointing at the same file via different path syntaxes share one
+        # ``_LAST_POKE_ATTEMPT_MONOTONIC`` entry instead of bypassing dedupe
+        # and firing duplicate ``RotateCookies`` POSTs.
+        # NOTE: the public ``storage_path`` argument and ``auth.storage_path``
+        # are intentionally left as the caller provided them — only the
+        # internal-derived ``ClientCore._keepalive_storage_path`` is
+        # canonicalized.
+        keepalive_storage_path: Path | None = auth.storage_path
+        if keepalive_storage_path is not None:
+            keepalive_storage_path = Path(keepalive_storage_path).expanduser().resolve()
+
+        # Cross-validate the RPC throttle against the underlying httpx pool
+        # before ``ClientCore`` swallows the ``limits=None`` sentinel into
+        # its own ``ConnectionLimits()`` synthesis.
+        # Performed here so the constraint is enforced uniformly regardless
+        # of whether the caller passed an explicit ``ConnectionLimits``
+        # instance or relied on the default — ``ClientCore.__init__`` can't
+        # see the caller's intent once the default has been substituted.
+        # Skip when either side opts out (``max_concurrent_rpcs is None``
+        # means "no gate"; we deliberately don't second-guess the caller's
+        # external-throttle setup).
+        if max_concurrent_rpcs is not None:
+            from .types import ConnectionLimits
+
+            effective_limits = limits if limits is not None else ConnectionLimits()
+            if max_concurrent_rpcs > effective_limits.max_connections:
+                raise ValueError(
+                    "max_concurrent_rpcs must be <= limits.max_connections "
+                    f"(got max_concurrent_rpcs={max_concurrent_rpcs}, "
+                    f"max_connections={effective_limits.max_connections}). "
+                    "A semaphore wider than the connection pool surfaces "
+                    "saturation as opaque httpx.PoolTimeout instead of "
+                    "clean back-pressure."
+                )
+
         # Pass refresh_auth as callback for automatic retry on auth failures
         # Note: refresh_auth calls update_auth_headers internally
         self._core = ClientCore(
@@ -143,18 +255,20 @@ class NotebookLMClient:
             refresh_callback=self.refresh_auth,
             keepalive=keepalive,
             keepalive_min_interval=keepalive_min_interval,
-            keepalive_storage_path=auth.storage_path,
+            keepalive_storage_path=keepalive_storage_path,
             rate_limit_max_retries=rate_limit_max_retries,
             server_error_max_retries=server_error_max_retries,
             limits=limits,
+            max_concurrent_uploads=max_concurrent_uploads,
+            max_concurrent_rpcs=max_concurrent_rpcs,
+            on_rpc_event=on_rpc_event,
         )
 
-        # Initialize sub-client APIs.
-        # ArtifactsAPI and NotesAPI both consume the shared ``_mind_map``
-        # module for mind-map primitives, so their construction order is
-        # not significant (see T6.F).
-        self.notebooks = NotebooksAPI(self._core)
-        self.sources = SourcesAPI(self._core)
+        # After D2 cutover, sub-clients consume ``ClientCore`` directly,
+        # typed against their per-sub-client narrow Protocol (defined
+        # co-located in each sub-client file).
+        self.sources = SourcesAPI(self._core, upload_timeout=upload_timeout)
+        self.notebooks = NotebooksAPI(self._core, sources_api=self.sources)
         self.artifacts = ArtifactsAPI(self._core, storage_path=storage_path)
         self.notes = NotesAPI(self._core)
         self.chat = ChatAPI(self._core)
@@ -167,7 +281,7 @@ class NotebookLMClient:
         """Get the authentication tokens."""
         return self._core.auth
 
-    async def __aenter__(self) -> "NotebookLMClient":
+    async def __aenter__(self) -> NotebookLMClient:
         """Open the client connection."""
         logger.debug("Opening NotebookLM client")
         await self._core.open()
@@ -181,7 +295,7 @@ class NotebookLMClient:
     ) -> None:
         """Close the client connection.
 
-        Exception arbitration (T7.B4 / audit §25): if the ``async with``
+        Exception arbitration: if the ``async with``
         body raised, prefer that exception and demote any ``close()``
         failure to a WARNING log so the original cause isn't masked.
         If the body succeeded, propagate ``close()`` failures normally.
@@ -190,7 +304,7 @@ class NotebookLMClient:
         """
         logger.debug("Closing NotebookLM client")
         try:
-            await self._core.close()
+            await self.close()
         except BaseException as close_exc:
             if exc_val is not None:
                 logger.warning(
@@ -199,6 +313,89 @@ class NotebookLMClient:
                 )
                 return
             raise
+
+    async def drain(self, timeout: float | None = None) -> None:
+        """Stop accepting new operations and wait for in-flight operations to finish."""
+        await self._core.drain(timeout=timeout)
+
+    async def close(
+        self,
+        *,
+        drain: bool = True,
+        drain_timeout: float | None = None,
+    ) -> None:
+        """Close the client.
+
+        By default (``drain=True``), ``close()`` first stops accepting new
+        operations and waits for in-flight operations to finish before tearing
+        down the transport. If the drain deadline (``drain_timeout``) is
+        exceeded, the transport is still closed and the timeout is re-raised.
+
+        Pass ``drain=False`` to skip the drain step and tear the transport
+        down immediately (fire-and-forget semantics).
+
+        BREAKING CHANGE: prior versions defaulted to ``drain=False``. Callers
+        relying on fire-and-forget close semantics (e.g. via
+        ``__aexit__``) will now block briefly on the drain step; pass
+        ``drain=False`` explicitly to restore the old behavior.
+        """
+        if drain:
+            try:
+                await self.drain(timeout=drain_timeout)
+            except TimeoutError as drain_exc:
+                try:
+                    await self._core.close()
+                except Exception as close_exc:
+                    logger.warning(
+                        "Suppressing close() error after drain timeout to preserve timeout "
+                        "signal: %s",
+                        close_exc,
+                    )
+                    raise drain_exc from close_exc
+                raise
+            else:
+                await self._core.close()
+                return
+        await self._core.close()
+
+    def metrics_snapshot(self) -> ClientMetricsSnapshot:
+        """Return cumulative observability counters for this client."""
+        return self._core.metrics_snapshot()
+
+    async def rpc_call(
+        self,
+        method: RPCMethod,
+        params: list[Any],
+        source_path: str = "/",
+        allow_null: bool = False,
+        _is_retry: bool = False,
+        *,
+        disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
+    ) -> Any:
+        """Make a raw NotebookLM RPC call.
+
+        This is the public escape hatch for advanced callers who need an
+        undocumented RPC before a typed API exists. Prefer the namespaced APIs
+        (``client.notebooks``, ``client.sources``, etc.) when possible. Import
+        ``RPCMethod`` from ``notebooklm.rpc``. The ``_is_retry`` parameter is
+        exposed only to mirror ``ClientCore.rpc_call`` exactly; callers should
+        leave it at the default unless they are intentionally reproducing core
+        retry behavior.
+
+        The optional ``operation_variant`` selects a method-variant-specific
+        policy in the mutating-RPC idempotency registry. Most callers should
+        leave it ``None`` (the default) — Wave 2 will add variant entries.
+        """
+        return await self._core.rpc_call(
+            method=method,
+            params=params,
+            source_path=source_path,
+            allow_null=allow_null,
+            _is_retry=_is_retry,
+            disable_internal_retries=disable_internal_retries,
+            operation_variant=operation_variant,
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -213,10 +410,14 @@ class NotebookLMClient:
         profile: str | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = DEFAULT_KEEPALIVE_MIN_INTERVAL,
-        rate_limit_max_retries: int = 0,
+        rate_limit_max_retries: int = 3,
         server_error_max_retries: int = 3,
-        limits: "ConnectionLimits | None" = None,
-    ) -> "NotebookLMClient":
+        limits: ConnectionLimits | None = None,
+        max_concurrent_uploads: int | None = DEFAULT_MAX_CONCURRENT_UPLOADS,
+        max_concurrent_rpcs: int | None = DEFAULT_MAX_CONCURRENT_RPCS,
+        upload_timeout: httpx.Timeout | None = None,
+        on_rpc_event: Callable[[RpcTelemetryEvent], object] | None = None,
+    ) -> NotebookLMClient:
         """Create a client from Playwright storage state file.
 
         This is the recommended way to create a client for programmatic use.
@@ -231,8 +432,10 @@ class NotebookLMClient:
                 rotation poke. ``None`` disables it (default). See
                 :class:`NotebookLMClient` for full semantics.
             keepalive_min_interval: Floor for ``keepalive`` (defaults to 60 s).
-            rate_limit_max_retries: Max automatic retries on HTTP 429. ``0``
-                (default) preserves pre-Phase-3 raise-immediately behavior.
+            rate_limit_max_retries: Max automatic retries on HTTP 429.
+                Defaults to ``3``. Set to ``0`` to
+                restore raise-immediately behavior. See
+                :class:`NotebookLMClient` for full sleep semantics.
             server_error_max_retries: Max automatic retries for HTTP 5xx /
                 network errors with exponential backoff. Defaults to ``3``.
             limits: HTTP connection-pool tuning (``ConnectionLimits``). ``None``
@@ -241,6 +444,25 @@ class NotebookLMClient:
                 max_keepalive_connections=50, keepalive_expiry=30.0s). Widen
                 for heavy batch workloads (FastAPI/Django services sharing one
                 client across many concurrent requests).
+            max_concurrent_uploads: Ceiling on simultaneous in-flight file
+                uploads via ``client.sources.add_file``. Defaults to ``4``.
+                ``None`` resolves to the default. See :class:`NotebookLMClient`
+                for full semantics (FD-exhaustion guard, independence from
+                the RPC pool).
+            max_concurrent_rpcs: Ceiling on simultaneous in-flight RPC
+                POSTs. Defaults to ``16``; ``None`` disables the gate.
+                Must be ``>= 1`` and ``<= limits.max_connections``. See
+                :class:`NotebookLMClient` for the cross-validation rule
+                and the rationale (the gate sits below the connection
+                pool so back-pressure surfaces cleanly instead of as
+                opaque ``httpx.PoolTimeout``).
+            upload_timeout: Optional override for the ``httpx.Timeout`` used
+                by the resumable-upload start handshake and the finalize
+                POST. ``None`` (default) preserves the original hardcoded
+                values for back-compat. See :class:`NotebookLMClient` for
+                full semantics.
+            on_rpc_event: Optional sync or async callback invoked after each
+                logical RPC succeeds or fails.
 
         Returns:
             NotebookLMClient instance (not yet connected).
@@ -275,6 +497,10 @@ class NotebookLMClient:
             rate_limit_max_retries=rate_limit_max_retries,
             server_error_max_retries=server_error_max_retries,
             limits=limits,
+            max_concurrent_uploads=max_concurrent_uploads,
+            max_concurrent_rpcs=max_concurrent_rpcs,
+            upload_timeout=upload_timeout,
+            on_rpc_event=on_rpc_event,
         )
 
     async def refresh_auth(self) -> AuthTokens:
@@ -289,57 +515,4 @@ class NotebookLMClient:
         Raises:
             ValueError: If token extraction fails (page structure may have changed).
         """
-        http_client = self._core.get_http_client()
-        url = f"{get_base_url()}/"
-        if self.auth.account_email or self.auth.authuser:
-            url = f"{url}?{authuser_query(self.auth.authuser, self.auth.account_email)}"
-        response = await http_client.get(url)
-        response.raise_for_status()
-
-        # Check for redirect to login page
-        final_url = str(response.url)
-        if is_google_auth_redirect(final_url):
-            raise ValueError("Authentication expired. Run 'notebooklm login' to re-authenticate.")
-
-        # Extract SNlM0e (CSRF token) + FdrFJe (Session ID) via the unified
-        # extract_wiz_field helper. The helper tolerates double-quoted,
-        # single-quoted, and HTML-escaped variants, and raises
-        # AuthExtractionError with a sanitized 200-char preview on drift.
-        # AuthExtractionError is wrapped in ValueError to preserve the
-        # historical contract that refresh_auth raises ValueError on
-        # extraction failure (existing callers in keepalive paths catch
-        # ValueError specifically).
-        try:
-            csrf = extract_wiz_field(response.text, "SNlM0e", strict=True)
-            sid = extract_wiz_field(response.text, "FdrFJe", strict=True)
-        except AuthExtractionError as exc:
-            # Preserve the legacy human-readable label for each token
-            # ("CSRF token" / "session ID") so existing callers and tests
-            # that match on substring keep working, while still propagating
-            # the sanitized HTML preview from the new helper.
-            label = {"SNlM0e": "CSRF token", "FdrFJe": "session ID"}.get(exc.key, exc.key)
-            raise ValueError(
-                f"Failed to extract {label} ({exc.key}). "
-                "Page structure may have changed or authentication expired. "
-                f"Preview: {exc.payload_preview!r}"
-            ) from exc
-        # ``extract_wiz_field`` returns ``Optional[str]``; with ``strict=True``
-        # it never returns None — narrow the type for mypy and tolerate the
-        # (unreachable) None branch without crashing.
-        self._core.auth.csrf_token = csrf or ""
-        self._core.auth.session_id = sid or ""
-
-        # CRITICAL: Update the HTTP client headers with new auth tokens
-        # Without this, the client continues using stale credentials
-        self._core.update_auth_headers()
-
-        # Persist refreshed cookies back to disk so the next CLI invocation
-        # picks up the updated short-lived tokens (e.g., __Secure-1PSIDCC).
-        # Routed through ClientCore.save_cookies so it serializes with the
-        # keepalive worker and the on-close save via ``_save_lock`` — without
-        # that, refresh_auth's synchronous save can race with an in-flight
-        # keepalive save and an older snapshot can clobber the freshly
-        # refreshed tokens.
-        await self._core.save_cookies(http_client.cookies)
-
-        return self._core.auth
+        return await refresh_auth_session(self._core)

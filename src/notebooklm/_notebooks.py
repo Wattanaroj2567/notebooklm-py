@@ -1,21 +1,44 @@
 """Notebook operations API."""
 
-import asyncio
 import logging
-from typing import TYPE_CHECKING, Any
+import warnings
+from typing import Any, Protocol
 
-from ._core import ClientCore
-from ._env import get_base_url
+from ._capabilities import AuthRouteProvider, CoreRPCProvider
 from ._idempotency import idempotent_create
+from ._notebook_metadata import (
+    NotebookMetadataService,
+    NotebookSourceLister,
+    create_default_source_lister,
+)
 from ._settings import build_get_user_settings_params, extract_account_limits
-from .exceptions import NotebookLimitError, NotebookNotFoundError, RPCError
+from ._sharing_manager import ShareManager
+from .exceptions import (
+    AuthError,
+    NetworkError,
+    NotebookLimitError,
+    NotebookNotFoundError,
+    RateLimitError,
+    RPCError,
+    ServerError,
+)
 from .rpc import RPCMethod, safe_index
-from .types import AccountLimits, Notebook, NotebookDescription, SuggestedTopic
-
-if TYPE_CHECKING:
-    from ._sources import SourcesAPI
+from .types import AccountLimits, Notebook, NotebookDescription, NotebookMetadata, SuggestedTopic
 
 logger = logging.getLogger(__name__)
+
+
+class _NotebooksCore(CoreRPCProvider, AuthRouteProvider, Protocol):
+    """Narrow per-sub-client view of the core required by :class:`NotebooksAPI`.
+
+    Co-located with the sub-client that consumes it (per ADR-002 §"narrow
+    Protocols, co-located"). Inherits only the capabilities NotebooksAPI
+    actually uses: ``rpc_call`` (from :class:`CoreRPCProvider`) and the
+    NotebookLM authuser routing surface (from :class:`AuthRouteProvider`).
+    """
+
+    pass
+
 
 CREATE_NOTEBOOK_QUOTA_RPC_CODE = 3
 
@@ -23,6 +46,98 @@ CREATE_NOTEBOOK_QUOTA_RPC_CODE = 3
 def build_create_notebook_params(title: str) -> list[Any]:
     """Return the canonical CREATE_NOTEBOOK RPC payload."""
     return [title, None, None, [2], [1]]
+
+
+def _extract_summary(outer: Any) -> str:
+    """Extract the summary string from a SUMMARIZE ``result[0]`` payload.
+
+    The expected shape is ``[[summary_string, ...], ...]`` — i.e. the summary
+    lives at ``outer[0][0]``. ``safe_index`` is used for the inner-most
+    descent so drift is logged with method_id + source rather than raising
+    ``IndexError`` from a raw subscript.
+
+    Returns:
+        The summary string, or ``""`` when the payload is missing the
+        expected slot (the caller is responsible for treating an empty
+        summary as "no description available").
+    """
+    summary_val = safe_index(
+        outer,
+        0,
+        0,
+        method_id=RPCMethod.SUMMARIZE.value,
+        source="_notebooks._extract_summary",
+    )
+    if summary_val is None:
+        return ""
+    return str(summary_val)
+
+
+def _extract_suggested_topics(outer: Any) -> list[SuggestedTopic]:
+    """Extract suggested topics from a SUMMARIZE ``result[0]`` payload.
+
+    The expected shape is ``[..., [[[question, prompt, ...], ...], ...], ...]``
+    — the topics list lives at ``outer[1][0]``, and each topic is itself a
+    list whose first two entries are ``question`` and ``prompt``.
+
+    The outer ``[1]`` slot is treated as routinely-optional (a notebook with
+    no topics legitimately omits it, so missing-slot is not "drift"); the
+    inner ``[0]`` descent goes through ``safe_index`` so genuine schema
+    drift surfaces with method_id + source. Per-topic shape checks log a
+    debug diagnostic and skip malformed entries rather than abort, because
+    a partial response (some valid topics + some drift) is more useful to
+    callers than an empty list.
+
+    Returns:
+        List of :class:`SuggestedTopic`. Empty when the payload omits the
+        slot or when every topic entry fails shape validation.
+    """
+    # outer[1] is routinely absent/empty when a notebook has no topics;
+    # use a plain guard rather than safe_index so that case doesn't log
+    # a drift warning on every healthy "no topics" response. Still log
+    # a DEBUG record so partial descriptions remain observable to anyone
+    # tailing logs while diagnosing a notebook with missing topics.
+    if not isinstance(outer, list) or len(outer) < 2:
+        logger.debug("_extract_suggested_topics: Partial description — no outer[1] slot")
+        return []
+
+    topics_container = outer[1]
+    if not isinstance(topics_container, list) or len(topics_container) == 0:
+        logger.debug(
+            "_extract_suggested_topics: Partial description — outer[1] is empty or non-list"
+        )
+        return []
+
+    topics_list = safe_index(
+        topics_container,
+        0,
+        method_id=RPCMethod.SUMMARIZE.value,
+        source="_notebooks._extract_suggested_topics",
+    )
+    if not isinstance(topics_list, list):
+        if topics_list is not None:
+            logger.debug(
+                "_extract_suggested_topics: expected list at outer[1][0], got %s",
+                type(topics_list).__name__,
+            )
+        return []
+
+    topics: list[SuggestedTopic] = []
+    for index, topic in enumerate(topics_list):
+        if not isinstance(topic, list) or len(topic) < 2:
+            logger.debug(
+                "_extract_suggested_topics: skipping malformed topic at index %d (type=%s)",
+                index,
+                type(topic).__name__,
+            )
+            continue
+        topics.append(
+            SuggestedTopic(
+                question=str(topic[0]) if topic[0] else "",
+                prompt=str(topic[1]) if topic[1] else "",
+            )
+        )
+    return topics
 
 
 class NotebooksAPI:
@@ -38,19 +153,51 @@ class NotebooksAPI:
             await client.notebooks.rename(new_nb.id, "Better Title")
     """
 
-    def __init__(self, core: ClientCore, sources_api: "SourcesAPI | None" = None):
+    def __init__(
+        self,
+        core: _NotebooksCore,
+        sources_api: NotebookSourceLister | None = None,
+        *,
+        metadata_service: NotebookMetadataService | None = None,
+        share_manager: ShareManager | None = None,
+    ) -> None:
         """Initialize the notebooks API.
 
         Args:
             core: The core client infrastructure.
-            sources_api: Optional sources API for cross-API calls. If None,
-                         creates a new instance (for backward compatibility).
+            sources_api: Optional source lister for cross-API metadata composition.
+            metadata_service: Optional explicit metadata service for tests or advanced wiring.
+            share_manager: Optional explicit legacy share manager for tests or advanced wiring.
         """
         self._core = core
-        # Lazy import to avoid circular dependency
-        from ._sources import SourcesAPI
+        self._sources = sources_api or create_default_source_lister(self._rpc_call)
+        self._metadata_service = metadata_service or NotebookMetadataService(
+            # Keep notebook lookup late-bound so tests and advanced callers that
+            # replace ``api.get`` after construction still affect get_metadata().
+            get_notebook=lambda notebook_id: self.get(notebook_id),
+            source_lister=self._sources,
+        )
+        self._share_manager = share_manager or ShareManager(self._rpc_call)
 
-        self._sources = sources_api or SourcesAPI(core)
+    async def _rpc_call(
+        self,
+        method: RPCMethod,
+        params: list[Any],
+        source_path: str = "/",
+        allow_null: bool = False,
+        _is_retry: bool = False,
+        *,
+        disable_internal_retries: bool = False,
+    ) -> Any:
+        """Delegate through the current core RPC method for late-bound overrides."""
+        return await self._core.rpc_call(
+            method,
+            params,
+            source_path=source_path,
+            allow_null=allow_null,
+            _is_retry=_is_retry,
+            disable_internal_retries=disable_internal_retries,
+        )
 
     async def list(self) -> list[Notebook]:
         """List all notebooks.
@@ -77,7 +224,7 @@ class NotebooksAPI:
             The created Notebook object.
 
         Idempotency:
-            T7.B2 — wraps the underlying CREATE_NOTEBOOK RPC in a
+            Wraps the underlying CREATE_NOTEBOOK RPC in a
             probe-then-retry loop. On a transient transport failure
             (5xx / 429 / network), the wrapper lists notebooks and
             checks whether a new notebook with the requested title
@@ -131,11 +278,37 @@ class NotebooksAPI:
             return notebook
 
         async def _probe() -> Notebook | None:
+            # Transport- and auth-level errors during the probe MUST
+            # propagate (P1-2): the original create may have committed
+            # server-side and we have no way to confirm. Silently
+            # returning None would let ``idempotent_create`` re-issue the
+            # create on the next attempt and duplicate the notebook.
+            # Surfacing the transport error keeps the caller in control —
+            # they can decide whether to re-probe later (e.g. once
+            # connectivity recovers) before retrying the create.
+            #
+            # Other exception types (decoding errors, unexpected RPC
+            # failures, programming bugs) are still treated as "probe
+            # could not confirm a match" — those signal that the probe
+            # path itself is broken in a way that wouldn't be fixed by a
+            # retry, so falling through to None preserves the existing
+            # contract of "best-effort probe".
             try:
                 current = await self.list()
+            except (AuthError, RateLimitError, ServerError, NetworkError):
+                # Transport- and auth-level probe failures must propagate.
+                # Silently returning None here lets ``idempotent_create``
+                # re-issue the create on top of a broken probe, which is
+                # exactly the duplicate-resource bug we are guarding against
+                # (P1-2).
+                logger.warning(
+                    "create: probe list() failed with transport/auth error; "
+                    "propagating so the caller can avoid a duplicate-resource retry"
+                )
+                raise
             except Exception:
                 logger.debug(
-                    "create: probe list() failed; treating as no match",
+                    "create: probe list() failed with non-transport error; treating as no match",
                     exc_info=True,
                 )
                 return None
@@ -355,33 +528,14 @@ class NotebooksAPI:
         suggested_topics: list[SuggestedTopic] = []
 
         # Response structure: [[[summary_string], [[topics]], ...]]
-        # Summary is at result[0][0][0], topics at result[0][1][0]
-        if result and isinstance(result, list):
-            try:
-                outer = result[0]
-
-                # Summary at outer[0][0]
-                summary_val = outer[0][0]
-                summary = str(summary_val) if summary_val else ""
-
-                # Suggested topics at outer[1][0]
-                topics_list = outer[1][0]
-                if isinstance(topics_list, list):
-                    for topic in topics_list:
-                        if isinstance(topic, list) and len(topic) >= 2:
-                            suggested_topics.append(
-                                SuggestedTopic(
-                                    question=str(topic[0]) if topic[0] else "",
-                                    prompt=str(topic[1]) if topic[1] else "",
-                                )
-                            )
-            except (IndexError, TypeError) as e:
-                # A partial result (e.g. summary but no topics) is possible.
-                logger.debug(
-                    "Partial description for notebook %s (no topics?): %s",
-                    notebook_id,
-                    e,
-                )
+        # Summary is at result[0][0][0], topics at result[0][1][0].
+        # The outer descent and per-slot extraction live in named helpers
+        # (`_extract_summary` / `_extract_suggested_topics`) so the deep
+        # index access stays auditable when Google's shape drifts.
+        if result and isinstance(result, list) and len(result) > 0:
+            outer = result[0]
+            summary = _extract_summary(outer)
+            suggested_topics = _extract_suggested_topics(outer)
 
         return NotebookDescription(summary=summary, suggested_topics=suggested_topics)
 
@@ -422,6 +576,22 @@ class NotebooksAPI:
     ) -> dict:
         """Toggle notebook sharing.
 
+        .. deprecated:: 0.5.0
+            Use :meth:`client.sharing.set_public` instead, which is the
+            canonical notebook-level public-sharing toggle and is paired
+            with the rest of the sharing surface (``add_user``,
+            ``set_view_level``, ``get_status``). This wrapper is
+            preserved as a no-behavior-change shim and will be removed
+            in a future major release.
+
+        Migration::
+
+            # before
+            await client.notebooks.share(notebook_id, public=True)
+
+            # after
+            await client.sharing.set_public(notebook_id, True)
+
         Note: This method uses SHARE_ARTIFACT for artifact-level sharing.
         For notebook-level sharing with user management, use client.sharing instead:
 
@@ -439,33 +609,16 @@ class NotebooksAPI:
         Returns:
             Dict with 'public' status, 'url', and 'artifact_id'.
         """
-        share_options = [1] if public else [0]
-        if artifact_id:
-            params = [share_options, notebook_id, artifact_id]
-        else:
-            params = [share_options, notebook_id]
-
-        await self._core.rpc_call(
-            RPCMethod.SHARE_ARTIFACT,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
+        warnings.warn(
+            "NotebooksAPI.share() is deprecated; use client.sharing.set_public() "
+            "for the canonical notebook-level public-sharing toggle (paired with "
+            "client.sharing.add_user(), set_view_level(), get_status()). Return "
+            "shape is unchanged in this release; the wrapper will be removed in "
+            "a future major release.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-
-        # Build share URL
-        base_url = f"{get_base_url()}/notebook/{notebook_id}"
-        if public and artifact_id:
-            url = f"{base_url}?artifactId={artifact_id}"
-        elif public:
-            url = base_url
-        else:
-            url = None
-
-        return {
-            "public": public,
-            "url": url,
-            "artifact_id": artifact_id,
-        }
+        return await self._share_manager.share(notebook_id, public, artifact_id)
 
     def get_share_url(self, notebook_id: str, artifact_id: str | None = None) -> str:
         """Get share URL for a notebook or artifact.
@@ -480,12 +633,9 @@ class NotebooksAPI:
         Returns:
             The share URL string.
         """
-        base_url = f"{get_base_url()}/notebook/{notebook_id}"
-        if artifact_id:
-            return f"{base_url}?artifactId={artifact_id}"
-        return base_url
+        return self._share_manager.get_share_url(notebook_id, artifact_id)
 
-    async def get_metadata(self, notebook_id: str):
+    async def get_metadata(self, notebook_id: str) -> NotebookMetadata:
         """Get notebook metadata with sources list.
 
         This combines notebook details with a simplified sources list,
@@ -508,33 +658,4 @@ class NotebooksAPI:
             import json
             print(json.dumps(metadata.to_dict(), indent=2))
         """
-        # Get notebook details and sources list concurrently
-        notebook, sources = await asyncio.gather(
-            self.get(notebook_id),
-            self._sources.list(notebook_id),
-        )
-
-        # Warn on potential data loss
-        if notebook.sources_count > 0 and len(sources) == 0:
-            logger.warning(
-                "Notebook %s reports %d sources but listing returned empty",
-                notebook_id,
-                notebook.sources_count,
-            )
-
-        # Build simplified source info
-        from .types import NotebookMetadata, SourceSummary
-
-        simplified_sources = [
-            SourceSummary(
-                kind=source.kind,
-                title=source.title,
-                url=source.url,
-            )
-            for source in sources
-        ]
-
-        return NotebookMetadata(
-            notebook=notebook,
-            sources=simplified_sources,
-        )
+        return await self._metadata_service.get_metadata(notebook_id)

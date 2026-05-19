@@ -20,7 +20,13 @@ _check_python_version()
 del _check_python_version
 
 # Configure logging (must run before other imports that create loggers)
-from ._logging import configure_logging
+from ._logging import (
+    configure_logging,
+    correlation_id,
+    get_request_id,
+    reset_request_id,
+    set_request_id,
+)
 
 configure_logging()
 
@@ -59,13 +65,14 @@ from .exceptions import (
     AuthExtractionError,
     # Domain: Chat
     ChatError,
+    ChatResponseParseError,
     ClientError,
     # Validation/Config
     ConfigurationError,
     DecodingError,
     # Network
     NetworkError,
-    # Idempotency (T7.B2)
+    # Idempotency
     NonIdempotentRetryError,
     # Domain: Notebooks
     NotebookError,
@@ -74,7 +81,10 @@ from .exceptions import (
     NotebookLMError,
     NotebookNotFoundError,
     RateLimitError,
+    # Domain: Research
+    ResearchTaskMismatchError,
     RPCError,
+    RPCResponseTooLargeError,
     RPCTimeoutError,
     ServerError,
     # Domain: Sources
@@ -101,6 +111,7 @@ from .types import (
     ChatReference,
     ChatResponseLength,
     CitedSourceSelection,
+    ClientMetricsSnapshot,
     ConnectionLimits,
     ConversationTurn,
     DriveMimeType,
@@ -117,6 +128,7 @@ from .types import (
     QuizQuantity,
     ReportFormat,
     ReportSuggestion,
+    RpcTelemetryEvent,
     ShareAccess,
     SharedUser,
     SharePermission,
@@ -137,16 +149,26 @@ from .types import (
     VideoStyle,
 )
 
+# Public API: Utility helpers
+from .utils import resolve_chat_reference_passage
+
 __all__ = [
     "__version__",
     # Client (main entry point)
     "NotebookLMClient",
     # Auth
     "AuthTokens",
+    # Observability
+    "correlation_id",
+    "get_request_id",
+    "set_request_id",
+    "reset_request_id",
     # Types
     "AccountLimits",
     "AccountTier",
     "ConnectionLimits",
+    "ClientMetricsSnapshot",
+    "RpcTelemetryEvent",
     "Notebook",
     "NotebookDescription",
     "NotebookMetadata",
@@ -165,6 +187,8 @@ __all__ = [
     "CitedSourceSelection",
     "SharedUser",
     "ShareStatus",
+    # Utility helpers
+    "resolve_chat_reference_passage",
     # Base Exceptions
     "NotebookLMError",
     "ValidationError",
@@ -177,10 +201,11 @@ __all__ = [
     "AuthExtractionError",
     "NetworkError",
     "RPCTimeoutError",
+    "RPCResponseTooLargeError",
     "RateLimitError",
     "ServerError",
     "ClientError",
-    # Idempotency (T7.B2)
+    # Idempotency
     "NonIdempotentRetryError",
     # Domain Exceptions: Notebooks
     "NotebookError",
@@ -188,6 +213,7 @@ __all__ = [
     "NotebookLimitError",
     # Domain Exceptions: Chat
     "ChatError",
+    "ChatResponseParseError",
     # Domain Exceptions: Sources
     "SourceError",
     "SourceAddError",
@@ -200,6 +226,8 @@ __all__ = [
     "ArtifactNotReadyError",
     "ArtifactParseError",
     "ArtifactDownloadError",
+    # Domain Exceptions: Research
+    "ResearchTaskMismatchError",
     # Warnings
     "UnknownTypeWarning",
     # User-facing type enums (str enums for .kind property)

@@ -1,4 +1,4 @@
-"""Phase 1.5 P1.5.1 — snapshot-invariant for the shared POST helper.
+"""Snapshot-invariant for the shared POST helper.
 
 httpx merges the cookie jar into the outgoing ``httpx.Request`` synchronously
 in ``build_request()``, before any ``await``. ``_perform_authed_post`` reads
@@ -9,20 +9,42 @@ entire ``(csrf, session_id, cookies)`` snapshot is atomic from a concurrent
 coroutine standpoint: no other task can mutate state between read and the
 wire.
 
-T2.C moved the POST out of ``_rpc_call_impl`` into ``_perform_authed_post``
-so chat (T2.D) can share the same transport pipeline. The AST guard below
-follows the POST; the invariant still belongs at the shared site.
+The POST was extracted out of ``_rpc_call_impl`` into
+``_perform_authed_post`` so chat can share the same transport pipeline.
+The AST guard below follows the POST; the invariant still belongs at the
+shared site.
 
-This file *locks* that invariant in two ways:
+The auth-snapshot lock hardened the invariant by:
+
+- making ``_snapshot()`` ``async def`` and acquiring a dedicated
+  ``_auth_snapshot_lock`` for the read, so the four scalar fields
+  (``csrf_token``/``session_id``/``authuser``/``account_email``) are
+  observed atomically with respect to ``refresh_auth``'s
+  write-block; and
+- refactoring ``_build_url()`` to consume the resulting
+  ``_AuthSnapshot`` rather than reading ``self.auth`` LIVE — that
+  prior live-read was the actual torn-read hazard, since it let a
+  refresh's write to ``self.auth.session_id`` slip into the URL between
+  snapshot capture and request build.
+
+This file *locks* the invariant in three ways:
 
 1. ``test_perform_authed_post_has_no_await_before_post_per_iteration`` —
-   static AST guard against an ``await`` inside the retry loop of
-   ``_perform_authed_post`` that precedes the iteration's ``client.post(...)``
-   call.
+   static AST guard against an ``await`` inside the retry loop's try
+   body of ``_perform_authed_post`` that precedes the iteration's
+   ``client.post(...)`` call. The ``await self._snapshot()`` lives
+   *before* the try block (so the lock acquisition itself isn't a
+   regression).
 
-2. ``test_concurrent_refresh_does_not_corrupt_inflight_rpc_request`` —
-   runtime self-consistency. Drives concurrent ``refresh_auth`` against an
-   in-flight ``rpc_call`` (both orderings) and asserts the captured
+2. ``test_build_url_does_not_read_self_auth`` — static AST guard
+   against any ``self.auth.<field>`` attribute access in
+   ``RpcExecutor.build_url``. The method MUST consume only its
+   ``snapshot: _AuthSnapshot`` parameter; reverting to ``self.auth``
+   would silently un-do the atomicity fix.
+
+3. ``test_concurrent_refresh_does_not_corrupt_inflight_rpc_request`` —
+   runtime self-consistency. Drives concurrent ``refresh_auth`` against
+   an in-flight ``rpc_call`` (both orderings) and asserts the captured
    ``httpx.Request`` is never observed with mixed-generation (csrf,
    session_id, cookies) state.
 """
@@ -32,16 +54,28 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import importlib.util
 import inspect
 import json
 import textwrap
+from pathlib import Path
 
 import httpx
 import pytest
 
-from conftest import make_core  # type: ignore[import-not-found]
 from notebooklm._core import ClientCore
+from notebooklm._core_rpc import RpcExecutor
+from notebooklm._core_transport import AuthedTransport
 from notebooklm.rpc import RPCMethod
+
+_UNIT_CONFTEST_SPEC = importlib.util.spec_from_file_location(
+    "unit_conftest_make_core",
+    Path(__file__).resolve().parent / "conftest.py",
+)
+assert _UNIT_CONFTEST_SPEC is not None and _UNIT_CONFTEST_SPEC.loader is not None
+_unit_conftest = importlib.util.module_from_spec(_UNIT_CONFTEST_SPEC)
+_UNIT_CONFTEST_SPEC.loader.exec_module(_unit_conftest)
+make_core = _unit_conftest.make_core
 
 # Test-side deadline for any single asyncio.Event in the race scaffolding.
 # Generous enough not to flake on slow CI, tight enough that a regression
@@ -51,42 +85,72 @@ EVENT_TIMEOUT_S = 5.0
 
 def test_perform_authed_post_has_no_await_before_post_per_iteration():
     """Within a single retry iteration of ``_perform_authed_post``, no
-    ``await`` may sit lexically before the ``client.post(...)`` call.
+    ``await`` may sit lexically inside the ``try:`` block before the
+    ``client.post(...)`` call.
 
-    Each retry iteration starts with a synchronous ``self._snapshot()`` and
-    a synchronous ``build_request(snapshot)`` — both are reads / assembly,
-    no awaits. The very next statement is the actual POST. If anyone
-    introduces an ``await`` between the snapshot read and the POST, a
-    concurrent ``refresh_auth`` could mutate ``auth.csrf_token`` /
-    ``auth.session_id`` / the cookie jar between the read and the wire,
-    producing a mismatched-generation request.
+    Each retry iteration begins with ``snapshot = await self._snapshot()``
+    + a synchronous ``build_request(snapshot)`` — both immediately
+    *before* the try block. The try body's first statement is the actual
+    POST. If anyone introduces an ``await`` between ``build_request`` and
+    the POST (or any new await inside the try body's prologue), a
+    concurrent ``refresh_auth`` could update the httpx cookie jar
+    between the snapshot read and the wire, producing a mismatched-
+    generation request on the cookie axis (the ``_auth_snapshot_lock``
+    covers csrf/sid coherence; cookies still rely on this no-await rule).
 
     The check is per-iteration: awaits *between* iterations (e.g.
     ``await self._await_refresh()`` followed by ``continue``) are fine
     because each iteration takes a fresh snapshot.
+
+    Note: the lock acquisition inside ``_snapshot`` is the only
+    pre-POST ``await``, and it lives *before* the try block — so this
+    guard (which only walks the try body) remains valid.
     """
-    src = textwrap.dedent(inspect.getsource(ClientCore._perform_authed_post))
+    src = textwrap.dedent(inspect.getsource(AuthedTransport.perform_authed_post))
     tree = ast.parse(src)
     func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
 
-    # Locate the retry loop (the outermost ``while`` in the body).
-    while_loop = next(
-        (n for n in ast.iter_child_nodes(func) if isinstance(n, ast.While)),
-        None,
-    )
+    # Locate the retry loop (the outermost ``while`` in the body). The loop
+    # may sit directly under the function body OR one level deeper inside
+    # the RPC-semaphore ``async with self._get_rpc_semaphore():`` wrapper — both
+    # structures preserve the snapshot→POST invariant this guard checks
+    # (the semaphore acquire happens once per call, not per iteration).
+    def _find_first_while(parent: ast.AST) -> ast.While | None:
+        for child in ast.iter_child_nodes(parent):
+            if isinstance(child, ast.While):
+                return child
+            if isinstance(child, ast.AsyncWith | ast.With):
+                # Descend through context managers so the guard survives
+                # wrapping the loop in ``async with semaphore``.
+                found = _find_first_while(child)
+                if found is not None:
+                    return found
+        return None
+
+    while_loop = _find_first_while(func)
     assert while_loop is not None, (
-        "Could not locate the retry-loop ``while`` in _perform_authed_post. "
+        "Could not locate the retry-loop ``while`` in AuthedTransport.perform_authed_post. "
         "If the loop was restructured, update this guard to match."
     )
 
     def is_post_await(node):
+        """Match the single per-iteration POST await.
+
+        Accepts either historical shape:
+        - ``await client.post(...)`` (pre-streaming),
+        - ``await _stream_post_with_size_cap(...)`` (the helper performs the
+          streaming POST internally, so it's the same conceptual POST site for
+          the purposes of this concurrency invariant).
+        """
         if not isinstance(node, ast.Await):
             return False
         call = node.value
         if not isinstance(call, ast.Call):
             return False
-        attr = call.func
-        return isinstance(attr, ast.Attribute) and attr.attr == "post"
+        func = call.func
+        if isinstance(func, ast.Attribute) and func.attr == "post":
+            return True
+        return isinstance(func, ast.Name) and func.id == "_stream_post_with_size_cap"
 
     def _walk_outer(parent):
         """Yield nodes lexically inside ``parent`` itself (skip nested defs).
@@ -117,7 +181,7 @@ def test_perform_authed_post_has_no_await_before_post_per_iteration():
     )
     assert try_node is not None, (
         "Could not locate the ``try:`` block guarding the POST in "
-        "_perform_authed_post. Update this guard if the structure changed."
+        "AuthedTransport.perform_authed_post. Update this guard if the structure changed."
     )
     # We only walk the try body, NOT its handlers.
     try_body_nodes: list[ast.AST] = []
@@ -129,7 +193,7 @@ def test_perform_authed_post_has_no_await_before_post_per_iteration():
     post_await_position = min(post_await_positions, default=None)
     assert post_await_position is not None, (
         "Could not locate `await ...post(...)` in the try body of "
-        "_perform_authed_post. If the call site was refactored (e.g. to "
+        "AuthedTransport.perform_authed_post. If the call site was refactored (e.g. to "
         "``client.request(...)``), update this guard to match — the "
         "invariant is 'no await between snapshot read and the POST per "
         "iteration', not specifically the `.post` attribute."
@@ -141,11 +205,134 @@ def test_perform_authed_post_has_no_await_before_post_per_iteration():
         if isinstance(n, ast.Await) and (n.lineno, n.col_offset) < post_await_position
     ]
     assert not earlier_awaits, (
-        f"_perform_authed_post gained an await before the per-iteration POST "
+        f"AuthedTransport.perform_authed_post gained an await before the per-iteration POST "
         f"at {post_await_position}: "
         f"{[(n.lineno, ast.dump(n)) for n in earlier_awaits]}. "
         "This breaks the snapshot-invariant — auth state could be mutated "
         "between the snapshot read and the actual send."
+    )
+
+
+def test_build_url_does_not_read_self_auth():
+    """``RpcExecutor.build_url`` must consume only its ``snapshot`` parameter.
+
+    pre-fix, ``_build_url`` reached into ``self.auth``
+    on every call to read ``session_id``, ``authuser``, and
+    ``account_email``. With ``_snapshot()`` and ``_build_url`` running
+    on separate Python statements, a concurrent ``refresh_auth`` could
+    flip ``self.auth.session_id`` between snapshot capture and URL build
+    — producing a request whose URL was stamped with the *new*
+    generation while the body still carried the *old* CSRF.
+
+    The fix made ``_build_url`` accept ``snapshot: _AuthSnapshot`` and
+    read every auth scalar off the snapshot. This guard asserts that
+    contract statically so a future "convenience" refactor (e.g.
+    "let's just read ``self.auth`` again, it's right there") can't
+    silently re-introduce the torn read.
+
+    Allowed reads inside ``_build_url``: ``snapshot.session_id``,
+    ``snapshot.authuser``, ``snapshot.account_email``, anything not
+    rooted at ``self.auth``. Forbidden: any ``self.auth.<field>``
+    attribute access, regardless of which field.
+    """
+    src = textwrap.dedent(inspect.getsource(RpcExecutor.build_url))
+    tree = ast.parse(src)
+    # ``_build_url`` is a sync method, not async.
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+
+    forbidden: list[tuple[int, str]] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Attribute):
+            continue
+        # Looking for ``self.auth`` (Attribute whose .value is Name "self"
+        # and .attr is "auth"). That's the immediate parent of any
+        # ``self.auth.<field>`` read.
+        if isinstance(node.value, ast.Name) and node.value.id == "self" and node.attr == "auth":
+            forbidden.append((node.lineno, ast.dump(node)))
+
+    assert not forbidden, (
+        f"RpcExecutor.build_url reads self.auth — torn-read regression. "
+        f"Read every auth scalar off the ``snapshot`` parameter instead. "
+        f"Occurrences: {forbidden}"
+    )
+
+
+def test_snapshot_acquires_auth_snapshot_lock():
+    """``ClientCore._snapshot`` must acquire ``_auth_snapshot_lock``.
+
+    The lock is the only thing that serializes the four-scalar
+    snapshot read with the matching two-scalar write in
+    ``NotebookLMClient.refresh_auth``. Removing the ``async with`` block
+    here would re-open the torn-read window between
+    ``self.auth.csrf_token`` and ``self.auth.session_id`` reads, even
+    though those two attribute reads are individually atomic at the
+    Python bytecode level.
+
+    This guard asserts that ``_snapshot``'s body contains an
+    ``async with`` whose context expression resolves to
+    ``self._get_auth_snapshot_lock()`` (or, defensively, anything
+    referencing ``_auth_snapshot_lock`` so a maintainer who inlines the
+    lazy accessor doesn't trip the guard).
+    """
+    src = textwrap.dedent(inspect.getsource(ClientCore._snapshot))
+    tree = ast.parse(src)
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
+
+    has_lock_acquisition = False
+    for node in ast.walk(func):
+        if not isinstance(node, ast.AsyncWith):
+            continue
+        # Each ``async with X`` may chain multiple items; check each.
+        for item in node.items:
+            ctx = item.context_expr
+            # Match both call form ``self._get_auth_snapshot_lock()`` and
+            # direct attribute ``self._auth_snapshot_lock``.
+            if isinstance(ctx, ast.Call):
+                ctx = ctx.func
+            if isinstance(ctx, ast.Attribute) and "auth_snapshot_lock" in ctx.attr:
+                has_lock_acquisition = True
+                break
+
+    assert has_lock_acquisition, (
+        "_snapshot() no longer acquires _auth_snapshot_lock. Atomicity "
+        "contract broken — the four-scalar snapshot read is no longer atomic with the "
+        "refresh-side write block in NotebookLMClient.refresh_auth, exposing "
+        "torn (csrf, sid) reads."
+    )
+
+
+def test_update_auth_tokens_has_no_await_inside_mutation_block():
+    """``update_auth_tokens`` may await lock acquisition, but not while mutating."""
+    src = textwrap.dedent(inspect.getsource(ClientCore.update_auth_tokens))
+    tree = ast.parse(src)
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
+
+    mutation_try = next(
+        (
+            node
+            for node in ast.walk(func)
+            if isinstance(node, ast.Try)
+            and any(
+                isinstance(stmt, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr in {"csrf_token", "session_id"}
+                    for target in stmt.targets
+                )
+                for stmt in node.body
+            )
+        ),
+        None,
+    )
+    assert mutation_try is not None, (
+        "Could not locate the guarded csrf/session_id mutation block in "
+        "ClientCore.update_auth_tokens."
+    )
+
+    awaits = [node for node in ast.walk(mutation_try) if isinstance(node, ast.Await)]
+    assert awaits == [], (
+        "ClientCore.update_auth_tokens must not await inside the critical "
+        "mutation block; doing so would let snapshots observe torn auth tokens."
     )
 
 

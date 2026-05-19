@@ -22,18 +22,20 @@ from rich.table import Table
 
 from ..client import NotebookLMClient
 from ..types import ExportType
+from .auth_runtime import with_client
 from .error_handler import _output_error, emit_cancelled_and_exit
-from .helpers import (
+from .options import json_option, list_options, notebook_option, wait_polling_options
+from .rendering import (
     cli_name_to_artifact_type,
     console,
     get_artifact_type_display,
     json_output_response,
+)
+from .resolve import (
     require_notebook,
     resolve_artifact_id,
     resolve_notebook_id,
-    with_client,
 )
-from .options import json_option, list_options, notebook_option, wait_polling_options
 
 
 @contextlib.asynccontextmanager
@@ -46,7 +48,7 @@ async def _status_with_elapsed(
     """Show a Rich spinner with a periodically updated elapsed timer.
 
     Used by ``artifact wait`` so interactive callers see live feedback during
-    the blocking poll (P5.T2 / I7). No-op (for the spinner) when
+    the blocking poll. No-op (for the spinner) when
     ``json_output`` is True so stdout stays pure JSON for automation. The
     spinner is transient — it disappears on exit, leaving only the final
     completion / failure line.
@@ -56,7 +58,7 @@ async def _status_with_elapsed(
     the wrapped block raises, the ticker is cancelled in ``finally`` and the
     exception propagates unchanged.
 
-    SIGINT handling (M2 / P5.T3): when ``resume_hint`` is provided, a
+    SIGINT handling: when ``resume_hint`` is provided, a
     ``KeyboardInterrupt`` raised inside the wrapped block is caught and
     converted into a friendly cancellation message via
     :func:`emit_cancelled_and_exit`, which prints
@@ -160,7 +162,7 @@ def artifact_list(ctx, notebook_id, artifact_type, json_output, limit, no_trunca
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             # artifacts.list() already includes mind maps from notes system
             artifacts = await client.artifacts.list(nb_id_resolved, artifact_type=type_filter)
-            # P6.T1 / I16: client-side offset slicing.
+            # Client-side offset slicing.
             if limit is not None and limit >= 0:
                 artifacts = artifacts[:limit]
 
@@ -229,17 +231,17 @@ def artifact_get(ctx, artifact_id, notebook_id, json_output, client_auth):
             )
             art = await client.artifacts.get(nb_id_resolved, resolved_id)
 
-            # C1 (Phase 3, BREAKING): not-found exits 1 with a typed error
-            # instead of the previous exit-0 ``found: false`` placeholder. See
-            # the matching change in ``cli/source.py::source_get`` and the
-            # BREAKING entry in ``CHANGELOG.md`` (Unreleased → Changed).
+            # BREAKING: not-found exits 1 with a typed error instead of the
+            # previous exit-0 ``found: false`` placeholder. See the matching
+            # change in ``cli/source.py::source_get`` and the BREAKING entry
+            # in ``CHANGELOG.md`` (Unreleased → Changed).
             #
             # The trailing ``raise AssertionError`` is unreachable at runtime
             # (``_output_error`` always raises) — it exists solely to narrow
             # ``art`` from ``Artifact | None`` to ``Artifact`` for mypy without
             # forcing a ``NoReturn`` annotation onto
-            # ``error_handler._output_error`` (which would touch a module the
-            # C1 spec says we must not).
+            # ``error_handler._output_error`` (which would change the shared
+            # error helper's typing contract).
             if art is None:
                 _output_error(
                     "Artifact not found",
@@ -335,9 +337,7 @@ def artifact_delete(ctx, artifact_id, notebook_id, yes, json_output, client_auth
 
             # ``--json`` implies ``--yes`` so a script that pipes ``--json`` but
             # forgets ``-y`` does not hang on ``click.confirm``'s stdin read
-            # (which would also clobber JSON stdout purity). Interactive users
-            # who want a confirm prompt should omit ``--json``; scripts that
-            # explicitly want the confirm round-trip can omit ``--json``.
+            # (which would also clobber JSON stdout purity).
             if not yes and not json_output and not click.confirm(f"Delete artifact {resolved_id}?"):
                 return
 
@@ -522,7 +522,7 @@ def artifact_wait(ctx, artifact_id, notebook_id, timeout, interval, json_output,
 
             try:
                 # Wrap the blocking poll in a transient spinner so interactive
-                # users see progress feedback during the wait (P5.T2 / I7).
+                # users see progress feedback during the wait.
                 # The status line includes the artifact ID and a live
                 # elapsed-seconds counter. No-op under --json so stdout stays
                 # pure JSON.

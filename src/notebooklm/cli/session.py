@@ -7,12 +7,13 @@ Commands:
     clear   Clear current notebook context
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
@@ -23,22 +24,15 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import click
-import httpx
 from rich.table import Table
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserContext, Page
     from rich.console import Console
 
-from ..auth import (
-    GOOGLE_REGIONAL_CCTLDS,
-    OPTIONAL_COOKIE_DOMAINS_BY_LABEL,
-    REQUIRED_COOKIE_DOMAINS,
-    convert_rookiepy_cookies_to_storage_state,
-    extract_cookies_from_storage,
-    fetch_tokens_with_domains,
-    read_account_metadata,
-)
+    from ..auth import Account
+    from ._chromium_profiles import ChromiumProfile
+
 from ..client import NotebookLMClient
 from ..config import get_base_host, get_base_url
 from ..exceptions import AuthError, NotebookNotFoundError
@@ -49,21 +43,18 @@ from ..paths import (
     get_path_info,
     get_storage_path,
 )
-from .error_handler import handle_errors
-from .helpers import (
+from .auth_runtime import get_auth_tokens, handle_auth_error
+from .context import (
     _current_storage_override,
     clear_context,
-    console,
-    get_auth_tokens,
     get_current_notebook,
-    handle_auth_error,
-    json_output_response,
-    resolve_notebook_id,
-    run_async,
     set_current_notebook,
 )
-from .language import set_language
-from .profile import _validate_profile_name, email_to_profile_name
+from .error_handler import handle_errors
+from .rendering import console, json_output_response
+from .resolve import resolve_notebook_id
+from .runtime import run_async
+from .services import login as login_service
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +78,13 @@ BROWSER_CLOSED_HELP = (
     "  1. Run: notebooklm login --fresh\n"
     "  2. Or run: notebooklm auth logout && notebooklm login"
 )
+
+
+async def fetch_tokens_with_domains(*args: Any, **kwargs: Any) -> Any:
+    """Patch-compatible forwarding wrapper for auth token refresh helpers."""
+    from ..auth import fetch_tokens_with_domains as auth_fetch_tokens_with_domains
+
+    return await auth_fetch_tokens_with_domains(*args, **kwargs)
 
 
 def _connection_error_help() -> str:
@@ -137,47 +135,94 @@ _CHANNEL_BROWSERS: dict[str, tuple[str, str]] = {
     "chrome": ("Google Chrome", "https://www.google.com/chrome"),
 }
 
+# Backwards-compatible patch targets for tests and downstream users. The
+# implementation lives in ``notebooklm.cli.services.login``; these shims keep
+# historical ``notebooklm.cli.session.<helper>`` monkeypatches effective.
+_ROOKIEPY_BROWSER_ALIASES = login_service._ROOKIEPY_BROWSER_ALIASES
+_INCLUDE_DOMAINS_ALL = login_service._INCLUDE_DOMAINS_ALL
+_ORIGINAL_SESSION_PATCH_TARGETS: dict[str, object] = {}
+_LOGIN_SERVICE_ALWAYS_SYNC = (
+    "NotebookLMClient",
+    "console",
+    "fetch_tokens_with_domains",
+    "get_storage_path",
+    "run_async",
+)
+_LOGIN_SERVICE_PATCH_TARGETS = (
+    "_build_google_cookie_domains",
+    "_enumerate_browser_accounts",
+    "_enumerate_chromium_profiles_fanout",
+    "_enumerate_one_jar",
+    "_handle_rookiepy_error",
+    "_login_all_accounts_from_browser",
+    "_login_browser_cookies_single",
+    "_login_with_browser_cookies",
+    "_maybe_warn_firefox_containers_in_use",
+    "_next_available_profile_name",
+    "_parse_include_domains",
+    "_profile_account_email",
+    "_profiles_by_account_email",
+    "_read_browser_cookies",
+    "_read_chromium_profile_cookies_from_selector",
+    "_read_firefox_container_cookies",
+    "_refresh_from_browser_cookies",
+    "_resolve_all_accounts_target",
+    "_resolve_optional_cookie_domains",
+    "_select_account",
+    "_select_refresh_account",
+    "_split_chromium_profile_browser_spec",
+    "_sync_server_language_to_config",
+    "_warn_missing_optional_domains",
+    "_write_extracted_cookies",
+)
 
-# Maps user-facing browser names to rookiepy function names.
-_ROOKIEPY_BROWSER_ALIASES: dict[str, str] = {
-    "arc": "arc",
-    "brave": "brave",
-    "chrome": "chrome",
-    "chromium": "chromium",
-    "edge": "edge",
-    "firefox": "firefox",
-    "ie": "ie",
-    "librewolf": "librewolf",
-    "octo": "octo",
-    "opera": "opera",
-    "opera-gx": "opera_gx",
-    "opera_gx": "opera_gx",
-    "safari": "safari",
-    "vivaldi": "vivaldi",
-    "zen": "zen",
-}
+
+def _service_attr_is_patched(name: str) -> bool:
+    return globals().get(name) is not _ORIGINAL_SESSION_PATCH_TARGETS.get(name)
+
+
+@contextmanager
+def _patched_login_service_dependencies() -> Iterator[None]:
+    login_service_mutable: Any = login_service
+    originals = {
+        name: getattr(login_service, name)
+        for name in (*_LOGIN_SERVICE_ALWAYS_SYNC, *_LOGIN_SERVICE_PATCH_TARGETS)
+    }
+    always_sync_values = {
+        "NotebookLMClient": NotebookLMClient,
+        "console": console,
+        "fetch_tokens_with_domains": fetch_tokens_with_domains,
+        "get_storage_path": get_storage_path,
+        "run_async": run_async,
+    }
+    for name, value in always_sync_values.items():
+        setattr(login_service_mutable, name, value)
+    for name in _LOGIN_SERVICE_PATCH_TARGETS:
+        if _service_attr_is_patched(name):
+            setattr(login_service_mutable, name, globals()[name])
+    try:
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(login_service, name, value)
 
 
 def _handle_rookiepy_error(e: Exception, browser_name: str) -> None:
-    """Print a user-friendly error for rookiepy exceptions."""
-    msg = str(e).lower()
-    if "lock" in msg or "database" in msg:
-        console.print(
-            f"[red]Could not read {browser_name} cookies: browser database is locked.[/red]\n"
-            "Close your browser and try again."
+    with _patched_login_service_dependencies():
+        return login_service._handle_rookiepy_error(e, browser_name)
+
+
+def _enumerate_one_jar(
+    raw_cookies: list[dict[str, Any]],
+    browser_name: str,
+    browser_profile: str | None,
+    *,
+    quiet: bool = False,
+) -> list[Account]:
+    with _patched_login_service_dependencies():
+        return login_service._enumerate_one_jar(
+            raw_cookies, browser_name, browser_profile, quiet=quiet
         )
-    elif "permission" in msg or "access" in msg:
-        console.print(
-            f"[red]Permission denied reading {browser_name} cookies.[/red]\n"
-            "You may need to grant Terminal/Python access to your browser profile directory."
-        )
-    elif "keychain" in msg or "decrypt" in msg:
-        console.print(
-            f"[red]Could not decrypt {browser_name} cookies.[/red]\n"
-            "On macOS, allow Keychain access when prompted, or try a different browser."
-        )
-    else:
-        console.print(f"[red]Failed to read cookies from {browser_name}:[/red] {e}")
 
 
 def _enumerate_browser_accounts(
@@ -185,72 +230,24 @@ def _enumerate_browser_accounts(
     *,
     verbose: bool = True,
     include_domains: set[str] | None = None,
-) -> tuple[list[Any], list[Any]]:
-    """Read cookies from ``browser_name`` and discover signed-in accounts.
-
-    Args:
-        browser_name: rookiepy browser alias.
-        verbose: Forwarded to :func:`_read_browser_cookies` to suppress the
-            human-readable progress line in JSON-output paths.
-        include_domains: Forwarded to :func:`_read_browser_cookies` to
-            broaden the extraction set with sibling-product cookies. See
-            :func:`_parse_include_domains`.
-
-    Returns:
-        ``(raw_cookies, accounts)`` — the original rookiepy cookies and the
-        list of :class:`notebooklm.auth.Account` records discovered via
-        per-index ``?authuser=N`` probing.
-
-    Raises:
-        SystemExit: On rookiepy failure, missing required cookies, or
-            authuser=0 not returning a signed-in account.
-    """
-    from ..auth import (
-        build_cookie_jar,
-        enumerate_accounts,
-        extract_cookies_with_domains,
-    )
-
-    raw_cookies = _read_browser_cookies(
-        browser_name, verbose=verbose, include_domains=include_domains
-    )
-    storage_state = convert_rookiepy_cookies_to_storage_state(raw_cookies)
-    try:
-        extract_cookies_from_storage(storage_state)
-    except ValueError as e:
-        console.print(
-            "[red]No valid Google authentication cookies found.[/red]\n"
-            f"{e}\n\n"
-            "Make sure you are logged into Google in your browser."
+) -> tuple[dict[str | None, list[dict[str, Any]]], list[Account]]:
+    with _patched_login_service_dependencies():
+        return login_service._enumerate_browser_accounts(
+            browser_name, verbose=verbose, include_domains=include_domains
         )
-        raise SystemExit(1) from None
 
-    cookie_map = extract_cookies_with_domains(storage_state)
-    jar = build_cookie_jar(cookies=cookie_map)
-    try:
-        accounts = run_async(enumerate_accounts(jar))
-    except ValueError:
-        # Cookies are present but Google rejected them (passive sign-in
-        # redirected to the account chooser, or RotateCookies returned 401).
-        # The on-disk cookie store the browser persists is too stale for
-        # Google to refresh server-side. User has to refresh it themselves.
-        console.print(
-            f"[red]Account discovery failed: {browser_name}'s saved cookies are "
-            f"too stale for Google to re-authenticate.[/red]\n\n"
-            "Refresh them by opening the browser and visiting a Google site "
-            "(e.g. https://notebooklm.google.com), then re-run this command.\n\n"
-            "If the browser is signed out, sign back in there first.\n"
-            "If you'd rather skip the browser entirely, use "
-            "[cyan]notebooklm login[/cyan] (Playwright flow)."
+
+def _enumerate_chromium_profiles_fanout(
+    browser_name: str,
+    profiles: list[ChromiumProfile],
+    *,
+    verbose: bool,
+    include_domains: set[str] | None,
+) -> tuple[dict[str | None, list[dict[str, Any]]], list[Account]]:
+    with _patched_login_service_dependencies():
+        return login_service._enumerate_chromium_profiles_fanout(
+            browser_name, profiles, verbose=verbose, include_domains=include_domains
         )
-        raise SystemExit(1) from None
-    except httpx.RequestError as e:
-        console.print(
-            f"[red]Account discovery failed (network error):[/red] {e}\n"
-            "Check your internet connection and try again."
-        )
-        raise SystemExit(1) from None
-    return raw_cookies, accounts
 
 
 def _login_browser_cookies_single(
@@ -262,144 +259,67 @@ def _login_browser_cookies_single(
     active_profile: str | None,
     include_domains: set[str] | None = None,
 ) -> None:
-    """Extract one account from ``--browser-cookies`` into a profile.
-
-    Resolves the target storage path:
-
-    - ``--storage`` wins outright.
-    - ``--profile-name`` selects a sibling profile under the home dir.
-    - ``--account`` defaults the new profile to the email's local-part
-      when the user did not pass ``--profile-name``.
-    - Otherwise we write to the active profile (existing behavior).
-    """
-    explicit_storage = Path(storage) if storage else None
-
-    if account_email is None and profile_name is None:
-        # Path 1: existing behavior — extract default account into active profile.
-        resolved_storage = explicit_storage or get_storage_path(profile=active_profile)
-        _login_with_browser_cookies(
-            resolved_storage,
+    with _patched_login_service_dependencies():
+        return login_service._login_browser_cookies_single(
             browser_cookies,
-            active_profile,
+            storage=storage,
+            account_email=account_email,
+            profile_name=profile_name,
+            active_profile=active_profile,
             include_domains=include_domains,
         )
-        return
-
-    # Path 2: targeted extraction. We need the email to derive a profile name
-    # when --profile-name is omitted.
-    raw_cookies, accounts = _enumerate_browser_accounts(
-        browser_cookies, include_domains=include_domains
-    )
-    selected = _select_account(accounts, account_email=account_email)
-
-    target_profile = profile_name or email_to_profile_name(selected.email)
-    if profile_name is not None:
-        _validate_profile_name(target_profile)
-
-    target_storage = explicit_storage or get_storage_path(profile=target_profile)
-
-    _write_extracted_cookies(
-        raw_cookies,
-        storage_path=target_storage,
-        profile=target_profile if not explicit_storage else active_profile,
-        authuser=selected.authuser,
-        email=selected.email,
-    )
 
 
 def _profiles_by_account_email(profile_names: list[str]) -> dict[str, str]:
-    """Return existing profiles keyed by account metadata email."""
-    from ..auth import read_account_metadata
+    with _patched_login_service_dependencies():
+        return login_service._profiles_by_account_email(profile_names)
 
-    profiles_by_email: dict[str, str] = {}
-    for profile in profile_names:
-        metadata = read_account_metadata(get_storage_path(profile=profile))
-        email = metadata.get("email")
-        if isinstance(email, str) and email:
-            # list_profiles() is sorted, so this also prefers the unsuffixed
-            # profile over older duplicate suffixes such as alice-2.
-            profiles_by_email.setdefault(email, profile)
-    return profiles_by_email
+
+def _profile_account_email(profile: str) -> str | None:
+    with _patched_login_service_dependencies():
+        return login_service._profile_account_email(profile)
 
 
 def _next_available_profile_name(base_name: str, unavailable: set[str]) -> str:
-    """Return ``base_name`` or the next ``-N`` suffix not in ``unavailable``."""
-    if base_name not in unavailable:
-        return base_name
-
-    suffix = 2
-    while True:
-        candidate = f"{base_name}-{suffix}"
-        if candidate not in unavailable:
-            return candidate
-        suffix += 1
+    with _patched_login_service_dependencies():
+        return login_service._next_available_profile_name(base_name, unavailable)
 
 
 def _login_all_accounts_from_browser(
     browser_cookies: str,
     *,
+    update: bool = False,
     include_domains: set[str] | None = None,
 ) -> None:
-    """Extract every signed-in Google account into its own profile."""
-    from ..paths import list_profiles
-
-    raw_cookies, accounts = _enumerate_browser_accounts(
-        browser_cookies, include_domains=include_domains
-    )
-    if not accounts:
-        console.print("[yellow]No accounts discovered.[/yellow]")
-        return
-
-    console.print(f"\n[bold]Found {len(accounts)} accounts.[/bold] Saving profiles:")
-    # Reuse a profile when its account metadata already points at the same
-    # email. This makes repeated --all-accounts runs idempotent and lets a
-    # later run update authuser if Google's account indices shifted. Only
-    # allocate a suffix when the desired profile name belongs to a different
-    # account or a hand-created profile with no account metadata.
-    existing_profiles = list_profiles()
-    profiles_by_email = _profiles_by_account_email(existing_profiles)
-    unavailable: set[str] = set(existing_profiles)
-    claimed: set[str] = set()
-    for account in accounts:
-        base_name = email_to_profile_name(account.email)
-        target_profile = profiles_by_email.get(account.email)
-        if target_profile is None or target_profile in claimed:
-            target_profile = _next_available_profile_name(base_name, unavailable | claimed)
-        unavailable.add(target_profile)
-        claimed.add(target_profile)
-
-        target_storage = get_storage_path(profile=target_profile)
-        _write_extracted_cookies(
-            raw_cookies,
-            storage_path=target_storage,
-            profile=target_profile,
-            authuser=account.authuser,
-            email=account.email,
+    with _patched_login_service_dependencies():
+        return login_service._login_all_accounts_from_browser(
+            browser_cookies, update=update, include_domains=include_domains
         )
 
 
-def _select_account(
-    accounts: list[Any],
+def _resolve_all_accounts_target(
     *,
-    account_email: str | None,
-) -> Any:
-    """Pick the requested account from a discovery result.
-
-    Email is the user-facing selector because it is stable across browser
-    account reordering. Without an email, select the browser's default account.
-    """
-    if account_email:
-        requested = account_email.strip().casefold()
-        for account in accounts:
-            if account.email.casefold() == requested:
-                return account
-        available = ", ".join(a.email for a in accounts)
-        console.print(
-            f"[red]Account {account_email} not found among signed-in accounts.[/red]\n"
-            f"Available accounts: {available}"
+    base_name: str,
+    account_email: str,
+    existing_profiles: set[str],
+    unavailable: set[str],
+    claimed: set[str],
+    update: bool,
+) -> str:
+    with _patched_login_service_dependencies():
+        return login_service._resolve_all_accounts_target(
+            base_name=base_name,
+            account_email=account_email,
+            existing_profiles=existing_profiles,
+            unavailable=unavailable,
+            claimed=claimed,
+            update=update,
         )
-        raise SystemExit(1)
-    return next(a for a in accounts if a.is_default)
+
+
+def _select_account(accounts: list[Any], *, account_email: str | None) -> Any:
+    with _patched_login_service_dependencies():
+        return login_service._select_account(accounts, account_email=account_email)
 
 
 def _write_extracted_cookies(
@@ -411,99 +331,22 @@ def _write_extracted_cookies(
     email: str,
     quiet: bool = False,
 ) -> None:
-    """Write a previously-loaded rookiepy cookie set to ``storage_path``.
-
-    Bypasses :func:`_read_browser_cookies` because the caller already has the
-    cookies in hand (e.g. ``--all-accounts`` reads once and writes N profiles).
-    """
-    storage_state = convert_rookiepy_cookies_to_storage_state(raw_cookies)
-    try:
-        extract_cookies_from_storage(storage_state)
-    except ValueError as e:
-        console.print(
-            "[red]No valid Google authentication cookies found.[/red]\n"
-            f"{e}\n\n"
-            "Make sure you are logged into Google in your browser."
-        )
-        raise SystemExit(1) from None
-
-    try:
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write with chmod 0o600 — avoids non-atomic + world-readable
-        # window from plain write_text + post-hoc chmod.
-        atomic_write_json(storage_path, storage_state)
-        if sys.platform != "win32":
-            storage_path.parent.chmod(0o700)
-    except OSError as e:
-        logger.error("Failed to save authentication to %s: %s", storage_path, e)
-        console.print(f"[red]Failed to save authentication to {storage_path}.[/red]\nDetails: {e}")
-        raise SystemExit(1) from None
-
-    from ..auth import write_account_metadata
-
-    try:
-        write_account_metadata(storage_path, authuser=authuser, email=email)
-    except OSError as e:
-        logger.error("Failed to save account metadata for %s: %s", storage_path, e)
-        console.print(
-            f"[yellow]Warning: cookies saved but account metadata write failed.[/yellow]\n"
-            f"Details: {e}"
-        )
-
-    if not quiet:
-        console.print(f"  [green]✓[/green] {profile or storage_path}  →  {email}")
-
-    # Verify cookies for the active account.
-    try:
-        run_async(fetch_tokens_with_domains(storage_path, profile))
-    except ValueError as e:
-        logger.warning("Extracted cookies for %s failed verification: %s", email, e)
-        console.print(f"    [yellow]Warning: cookies for {email} failed verification.[/yellow]")
-    except httpx.RequestError as e:
-        logger.warning("Could not verify cookies for %s: %s", email, e)
-        console.print(
-            f"    [yellow]Warning: could not verify cookies for {email} (network).[/yellow]"
+    with _patched_login_service_dependencies():
+        return login_service._write_extracted_cookies(
+            raw_cookies,
+            storage_path=storage_path,
+            profile=profile,
+            authuser=authuser,
+            email=email,
+            quiet=quiet,
         )
 
 
 def _select_refresh_account(
     accounts: list[Any], metadata: dict[str, Any], browser_name: str
 ) -> Any:
-    """Select the browser account that should refresh the active profile.
-
-    ``context.json`` stores both the account email (stable identity) and an
-    internal fallback index. If the browser's account order changed, email wins
-    and the caller rewrites the cached index.
-    """
-    expected_email = metadata.get("email")
-    if isinstance(expected_email, str) and expected_email.strip():
-        normalized = expected_email.strip().casefold()
-        for account in accounts:
-            if isinstance(account.email, str) and account.email.casefold() == normalized:
-                return account
-        available = ", ".join(a.email for a in accounts) or "none"
-        console.print(
-            f"[red]Profile account {expected_email} is not signed in to {browser_name}.[/red]\n"
-            f"Available accounts: {available}\n"
-            f"Run [cyan]notebooklm auth inspect --browser {browser_name}[/cyan] "
-            "or sign that account back into the browser."
-        )
-        raise SystemExit(1)
-
-    raw_authuser = metadata.get("authuser")
-    if isinstance(raw_authuser, int) and raw_authuser >= 0:
-        for account in accounts:
-            if account.authuser == raw_authuser:
-                return account
-        console.print(
-            "[red]Profile stores an old account route, but that browser account "
-            "is no longer available and context.json has no account email to repair from.[/red]\n"
-            f"Run [cyan]notebooklm auth inspect --browser {browser_name}[/cyan], then "
-            f"[cyan]notebooklm login --browser-cookies {browser_name} --account EMAIL[/cyan]."
-        )
-        raise SystemExit(1)
-
-    return next((account for account in accounts if account.is_default), accounts[0])
+    with _patched_login_service_dependencies():
+        return login_service._select_refresh_account(accounts, metadata, browser_name)
 
 
 def _refresh_from_browser_cookies(
@@ -514,111 +357,29 @@ def _refresh_from_browser_cookies(
     quiet: bool,
     include_domains: set[str] | None = None,
 ) -> None:
-    """Refresh the active profile from browser cookies, repairing account drift."""
-    raw_cookies, accounts = _enumerate_browser_accounts(
-        browser_name, verbose=not quiet, include_domains=include_domains
-    )
-    if not accounts:
-        console.print(f"[red]No signed-in Google accounts found in {browser_name}.[/red]")
-        raise SystemExit(1)
-
-    metadata = read_account_metadata(storage_path)
-    selected = _select_refresh_account(accounts, metadata, browser_name)
-    _write_extracted_cookies(
-        raw_cookies,
-        storage_path=storage_path,
-        profile=profile,
-        authuser=selected.authuser,
-        email=selected.email,
-        quiet=True,
-    )
-
-    if not quiet:
-        console.print(
-            f"[green]ok[/green] refreshed from {browser_name}: {storage_path}\n"
-            f"[green]account[/green] {selected.email}"
+    with _patched_login_service_dependencies():
+        return login_service._refresh_from_browser_cookies(
+            browser_name,
+            storage_path=storage_path,
+            profile=profile,
+            quiet=quiet,
+            include_domains=include_domains,
         )
-
-
-_INCLUDE_DOMAINS_ALL = "all"
 
 
 def _parse_include_domains(values: tuple[str, ...]) -> set[str]:
-    """Parse one or more ``--include-domains`` flag values into labels.
-
-    Accepts both ``--include-domains=youtube --include-domains=docs`` and
-    ``--include-domains=youtube,docs`` (and any mix). Whitespace around
-    commas is tolerated. Empty fragments are dropped.
-
-    Raises:
-        click.BadParameter: if any label is not one of
-            :data:`notebooklm.auth.OPTIONAL_COOKIE_DOMAINS_BY_LABEL` keys
-            (or the literal ``"all"``).
-    """
-    labels: set[str] = set()
-    for raw in values:
-        for part in raw.split(","):
-            label = part.strip().lower()
-            if not label:
-                continue
-            labels.add(label)
-    if not labels:
-        return labels
-    valid = set(OPTIONAL_COOKIE_DOMAINS_BY_LABEL) | {_INCLUDE_DOMAINS_ALL}
-    bad = labels - valid
-    if bad:
-        supported = ", ".join(sorted(valid))
-        raise click.BadParameter(
-            f"unknown --include-domains label(s): {', '.join(sorted(bad))}. Supported: {supported}."
-        )
-    return labels
+    with _patched_login_service_dependencies():
+        return login_service._parse_include_domains(values)
 
 
 def _warn_missing_optional_domains(include_domains: set[str]) -> None:
-    """Emit a migration warning when the default minimum-cookies set is used.
-
-    The T5.G change narrows the default extraction set to
-    :data:`REQUIRED_COOKIE_DOMAINS`. Users upgrading from the prior
-    behavior need a heads-up that YouTube / Docs / myaccount / Mail
-    cookies are no longer scraped at login. Telling them how to opt back
-    in is the entire point of the warning.
-    """
-    if include_domains:
-        return
-    supported = ", ".join(sorted(OPTIONAL_COOKIE_DOMAINS_BY_LABEL))
-    console.print(
-        "[dim]Note: sibling-product cookies not included by default. "
-        f"Pass --include-domains=<{supported}> (or =all) to extract them.[/dim]"
-    )
-    logger.info(
-        "Login extracting REQUIRED_COOKIE_DOMAINS only (T5.G default). "
-        "Pass --include-domains=%s (or =all) to include sibling cookies.",
-        supported,
-    )
+    with _patched_login_service_dependencies():
+        return login_service._warn_missing_optional_domains(include_domains)
 
 
 def _resolve_optional_cookie_domains(labels: set[str]) -> frozenset[str]:
-    """Resolve ``--include-domains`` labels to the union of their domain sets.
-
-    Contract: ``labels`` must be the output of
-    :func:`_parse_include_domains`, which validates that every label is in
-    :data:`OPTIONAL_COOKIE_DOMAINS_BY_LABEL` (or the literal ``"all"``).
-    Callers are expected to surface the ``click.BadParameter`` from the
-    parser before we ever reach this function; the dict lookup below is
-    therefore unguarded by design.
-    """
-    if not labels:
-        return frozenset()
-    if _INCLUDE_DOMAINS_ALL in labels:
-        return frozenset().union(*OPTIONAL_COOKIE_DOMAINS_BY_LABEL.values())
-    selected: set[str] = set()
-    for label in labels:
-        # ``_parse_include_domains`` guarantees ``label`` is a valid key
-        # (or ``"all"``, handled above). Unguarded lookup is intentional —
-        # a KeyError here would be a bug in our own validation, not user
-        # input.
-        selected.update(OPTIONAL_COOKIE_DOMAINS_BY_LABEL[label])
-    return frozenset(selected)
+    with _patched_login_service_dependencies():
+        return login_service._resolve_optional_cookie_domains(labels)
 
 
 def _build_google_cookie_domains(
@@ -626,42 +387,95 @@ def _build_google_cookie_domains(
     include_optional: bool = False,
     include_domains: set[str] | None = None,
 ) -> list[str]:
-    """Return the cookie-domain list fed to extractors (rookiepy / Firefox).
+    with _patched_login_service_dependencies():
+        return login_service._build_google_cookie_domains(
+            include_optional=include_optional, include_domains=include_domains
+        )
 
-    Defaults to :data:`REQUIRED_COOKIE_DOMAINS` plus all known regional
-    ``.google.<ccTLD>`` variants (T5.G tightening). Sibling-product cookies
-    (YouTube, Docs, myaccount, Mail) are excluded unless the caller opts
-    in via ``include_optional=True`` or a non-empty ``include_domains``
-    label set.
+
+def _filter_storage_state_cookies_by_domain_policy(
+    state: dict[str, Any],
+    *,
+    include_optional: bool = False,
+    include_domains: set[str] | None = None,
+) -> dict[str, Any]:
+    """Filter a Playwright ``storage_state`` dict to the configured cookie-domain policy (P1-17).
+
+    The rookiepy / ``--browser-cookies`` extraction path asks Chrome only for
+    cookies on the explicit domain allowlist from
+    :func:`_build_google_cookie_domains` — so sibling-product cookies the user
+    happens to be signed into (``mail.google.com``, ``myaccount.google.com``,
+    ``docs.google.com``, ``.youtube.com``) never reach ``storage_state.json``
+    unless the user opts in via ``--include-domains=...``.
+
+    The Playwright login flow, by contrast, captures every cookie the browser
+    context holds. Without this filter, sibling-product cookies leak into the
+    persisted ``storage_state.json`` and inflate the blast radius if the file
+    is ever read by an attacker. This helper applies the same allowlist at
+    write time so both login paths produce equivalent on-disk state.
+
+    The match is exact-against-allowlist with leading-dot/no-dot equivalence
+    (``http.cookiejar`` may normalize either form). Sibling-product subdomains
+    are deliberately not matched by a broad ``.google.com`` suffix check —
+    that's the bug we're fixing.
 
     Args:
-        include_optional: When ``True``, include every optional sibling
-            domain (equivalent to ``--include-domains=all``). Preserves
-            the pre-T5.G behavior for callers that still need the broad
-            set.
-        include_domains: Set of optional-domain labels (output of
-            :func:`_parse_include_domains`). Each label expands via
-            :data:`OPTIONAL_COOKIE_DOMAINS_BY_LABEL`. ``"all"`` is
-            accepted as a shortcut for every label.
+        state: Playwright ``storage_state`` dict (output of
+            ``BrowserContext.storage_state()``).
+        include_optional: When ``True``, opt in to every label in
+            :data:`notebooklm._auth.cookie_policy.OPTIONAL_COOKIE_DOMAINS_BY_LABEL`.
+        include_domains: Set of optional-domain labels to opt in. ``"all"``
+            is accepted as a shortcut for every label. Mirrors the rookiepy
+            path semantics.
 
     Returns:
-        List of cookie-domain strings (suitable for ``rookiepy.load(
-        domains=...)`` or :func:`extract_firefox_container_cookies`).
+        A new ``storage_state`` dict with ``cookies`` filtered and ``origins``
+        copied verbatim. The input dict is not mutated.
     """
-    selected_optional: frozenset[str]
-    if include_domains:
-        selected_optional = _resolve_optional_cookie_domains(include_domains)
-    elif include_optional:
-        selected_optional = frozenset().union(*OPTIONAL_COOKIE_DOMAINS_BY_LABEL.values())
-    else:
-        selected_optional = frozenset()
+    allowed_list = _build_google_cookie_domains(
+        include_optional=include_optional, include_domains=include_domains
+    )
+    # Set membership for O(1) lookup over the (modest but non-trivial) regional
+    # ccTLD list. Build a strip-leading-dot equivalence set so cookies stored
+    # with the opposite dot prefix still match. ``http.cookiejar`` normalization
+    # is the reason both ``accounts.google.com`` and ``.accounts.google.com``
+    # are listed verbatim in :data:`REQUIRED_COOKIE_DOMAINS`; the equivalence
+    # set is a defense-in-depth check in case a Playwright capture stores a
+    # cookie with only one of the two forms.
+    allowed: frozenset[str] = frozenset(allowed_list)
+    allowed_stripped: frozenset[str] = frozenset(d.lstrip(".") for d in allowed_list)
 
-    domains: list[str] = list(REQUIRED_COOKIE_DOMAINS | selected_optional)
-    for cctld in GOOGLE_REGIONAL_CCTLDS:
-        domain = f".google.{cctld}"
-        if domain not in domains:
-            domains.append(domain)
-    return domains
+    def _is_allowed(domain: str) -> bool:
+        return domain in allowed or domain.lstrip(".") in allowed_stripped
+
+    filtered_cookies = [
+        cookie for cookie in state.get("cookies", []) if _is_allowed(cookie.get("domain", ""))
+    ]
+    return {
+        "cookies": filtered_cookies,
+        "origins": list(state.get("origins", [])),
+    }
+
+
+def _split_chromium_profile_browser_spec(browser_name: str) -> tuple[str, str] | None:
+    with _patched_login_service_dependencies():
+        return login_service._split_chromium_profile_browser_spec(browser_name)
+
+
+def _read_chromium_profile_cookies_from_selector(
+    browser_name: str,
+    profile_selector: str,
+    *,
+    verbose: bool,
+    include_domains: set[str] | None,
+) -> tuple[ChromiumProfile, list[dict[str, Any]]]:
+    with _patched_login_service_dependencies():
+        return login_service._read_chromium_profile_cookies_from_selector(
+            browser_name,
+            profile_selector,
+            verbose=verbose,
+            include_domains=include_domains,
+        )
 
 
 def _read_firefox_container_cookies(
@@ -670,103 +484,15 @@ def _read_firefox_container_cookies(
     verbose: bool = True,
     include_domains: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Load Google cookies from a specific Firefox Multi-Account Container.
-
-    Bypasses rookiepy because rookiepy 0.5.6 does not filter on
-    ``originAttributes`` and silently merges every container's cookies (see
-    issue #366 / #367). We talk to ``cookies.sqlite`` directly via the
-    helpers in :mod:`notebooklm.cli._firefox_containers`.
-
-    Args:
-        container_spec: The part after ``firefox::`` (e.g. ``"Work"`` or
-            ``"none"`` for the no-container default).
-        verbose: When False, suppress the progress line; used by
-            ``auth inspect --json``.
-
-    Returns:
-        Rookiepy-shape cookie dicts (compatible with
-        :func:`convert_rookiepy_cookies_to_storage_state`).
-
-    Raises:
-        SystemExit: With a friendly message on any failure (no Firefox
-            installed, unknown container, locked DB, …).
-    """
-    from ._firefox_containers import (
-        extract_firefox_container_cookies,
-        find_firefox_profile_path,
-        resolve_container_id,
-    )
-
-    profile_path = find_firefox_profile_path()
-    if profile_path is None:
-        console.print(
-            "[red]Could not locate a Firefox profile.[/red]\n"
-            "Looked for profiles.ini in the standard Firefox locations. "
-            "If you have Firefox installed in a non-standard location, the "
-            "container-aware extractor cannot find it. Drop the '::<container>' "
-            "suffix to fall back to rookiepy's autodetection."
+    with _patched_login_service_dependencies():
+        return login_service._read_firefox_container_cookies(
+            container_spec, verbose=verbose, include_domains=include_domains
         )
-        raise SystemExit(1)
-
-    try:
-        container_id = resolve_container_id(profile_path, container_spec)
-    except ValueError as e:
-        console.print(f"[red]{e}[/red]")
-        raise SystemExit(1) from None
-
-    if verbose:
-        if container_id == "none":
-            console.print("[yellow]Reading cookies from Firefox (no container)...[/yellow]")
-        else:
-            console.print(
-                f"[yellow]Reading cookies from Firefox container "
-                f"'{container_spec}' (userContextId={container_id})...[/yellow]"
-            )
-
-    domains = _build_google_cookie_domains(include_domains=include_domains)
-    try:
-        return extract_firefox_container_cookies(profile_path, container_id, domains=domains)
-    except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
-        raise SystemExit(1) from None
-    except (OSError, RuntimeError) as e:
-        _handle_rookiepy_error(e, "firefox")
-        raise SystemExit(1) from None
-    except sqlite3.DatabaseError as e:
-        console.print(f"[red]Failed to read Firefox cookies database:[/red] {e}")
-        raise SystemExit(1) from None
 
 
 def _maybe_warn_firefox_containers_in_use() -> None:
-    """Emit a one-line warning when unscoped ``firefox`` is risky.
-
-    Triggers when ``cookies.sqlite`` has at least one row whose
-    ``originAttributes`` carries a ``userContextId=`` field — i.e. the user
-    really stored cookies inside some container. Cookie-driven (not
-    ``containers.json``-driven) so stock built-in containers count just the
-    same as user-created ones; First-Party-Isolation cookies (which only
-    carry ``firstPartyDomain=``) do not trigger.
-
-    Any probe failure is swallowed inside ``has_container_cookies_in_use``.
-    """
-    from ._firefox_containers import (
-        find_firefox_profile_path,
-        has_container_cookies_in_use,
-    )
-
-    profile_path = find_firefox_profile_path()
-    if profile_path is None:
-        return
-    if has_container_cookies_in_use(profile_path):
-        console.print(
-            "[yellow]Warning: this Firefox profile has cookies stored inside "
-            "a Multi-Account Container, but '--browser-cookies firefox' "
-            "merges every container into one jar. If your Google session "
-            "lives inside a container, re-run with "
-            "[cyan]--browser-cookies 'firefox::<container-name>'[/cyan] "
-            "(or [cyan]'firefox::none'[/cyan] for the no-container "
-            "default).[/yellow]"
-        )
+    with _patched_login_service_dependencies():
+        return login_service._maybe_warn_firefox_containers_in_use()
 
 
 def _read_browser_cookies(
@@ -775,105 +501,10 @@ def _read_browser_cookies(
     verbose: bool = True,
     include_domains: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Load Google cookies from an installed browser via rookiepy.
-
-    Wraps rookiepy import + dispatch + error handling so multiple commands
-    (``login --browser-cookies``, ``auth inspect``) share one code path.
-
-    Args:
-        browser_name: ``"auto"`` to use ``rookiepy.load()``, a specific
-            browser alias from :data:`_ROOKIEPY_BROWSER_ALIASES`, or
-            ``"firefox::<container-name>"`` (or ``"firefox::none"``) to
-            extract from a single Firefox Multi-Account Container, bypassing
-            rookiepy entirely.
-        verbose: When False, suppress the "Reading cookies from …" progress
-            line. Used by ``auth inspect --json`` to keep stdout pure JSON.
-        include_domains: Optional set of ``--include-domains`` labels
-            (output of :func:`_parse_include_domains`) that broaden the
-            extraction set with sibling-product cookies. ``None`` (the
-            default) keeps the extraction tight to
-            :data:`REQUIRED_COOKIE_DOMAINS`.
-
-    Returns:
-        Raw cookie dicts as returned by rookiepy (or by the Firefox
-        container extractor, which mirrors rookiepy's shape).
-
-    Raises:
-        SystemExit: With a user-friendly message printed to console on any
-            rookiepy import / dispatch / read failure.
-    """
-    # Firefox container syntax: ``firefox::<name>`` or ``firefox::none``.
-    # Routed to a direct sqlite3 reader because rookiepy does not honor
-    # ``originAttributes`` — see issue #367.
-    if browser_name.lower().startswith("firefox::"):
-        container_spec = browser_name.split("::", 1)[1].strip()
-        if not container_spec:
-            # Empty spec would silently fall through to an unfiltered SELECT —
-            # i.e. the merged-jar bug this feature exists to prevent. Reject.
-            console.print(
-                "[red]Empty Firefox container specifier in --browser-cookies.[/red]\n"
-                "Use [cyan]firefox::<container-name>[/cyan] (e.g. 'firefox::Work') or "
-                "[cyan]firefox::none[/cyan] for the no-container default."
-            )
-            raise SystemExit(1)
-        return _read_firefox_container_cookies(
-            container_spec, verbose=verbose, include_domains=include_domains
+    with _patched_login_service_dependencies():
+        return login_service._read_browser_cookies(
+            browser_name, verbose=verbose, include_domains=include_domains
         )
-
-    try:
-        import rookiepy
-    except ImportError:
-        console.print(
-            "[red]rookiepy is not installed.[/red]\n"
-            "Install it with:\n"
-            "  pip install 'notebooklm-py[cookies]'\n"
-            "or directly:\n"
-            "  pip install rookiepy"
-        )
-        raise SystemExit(1) from None
-
-    domains = _build_google_cookie_domains(include_domains=include_domains)
-
-    if browser_name == "auto":
-        if verbose:
-            console.print(
-                "[yellow]Reading cookies from installed browser (auto-detect)...[/yellow]"
-            )
-        try:
-            return rookiepy.load(domains=domains)
-        except (OSError, RuntimeError) as e:
-            _handle_rookiepy_error(e, "auto-detect")
-            raise SystemExit(1) from None
-
-    canonical = _ROOKIEPY_BROWSER_ALIASES.get(browser_name.lower())
-    if canonical is None:
-        console.print(
-            f"[red]Unknown browser: '{browser_name}'[/red]\n"
-            f"Supported: {', '.join(sorted(_ROOKIEPY_BROWSER_ALIASES))}"
-        )
-        raise SystemExit(1)
-    if verbose:
-        console.print(f"[yellow]Reading cookies from {browser_name}...[/yellow]")
-    browser_fn = getattr(rookiepy, canonical, None)
-    if browser_fn is None or not callable(browser_fn):
-        console.print(
-            f"[red]rookiepy does not support '{canonical}' on this platform.[/red]\n"
-            "Check that rookiepy is properly installed: pip install rookiepy"
-        )
-        raise SystemExit(1)
-    try:
-        cookies = browser_fn(domains=domains)
-    except (OSError, RuntimeError) as e:
-        _handle_rookiepy_error(e, browser_name)
-        raise SystemExit(1) from None
-
-    # Back-compat warning: unscoped 'firefox' silently merges cookies from
-    # every Multi-Account Container. Skip when ``verbose=False`` so callers
-    # like ``auth inspect --json`` don't pollute stdout before their JSON.
-    if canonical == "firefox" and verbose:
-        _maybe_warn_firefox_containers_in_use()
-
-    return cookies
 
 
 def _login_with_browser_cookies(
@@ -885,129 +516,25 @@ def _login_with_browser_cookies(
     email: str | None = None,
     include_domains: set[str] | None = None,
 ) -> None:
-    """Extract Google cookies from an installed browser via rookiepy.
-
-    Args:
-        storage_path: Where to write storage_state.json.
-        browser_name: "auto" to use rookiepy.load(), or a specific browser name.
-        profile: Profile name (forwarded to verification step).
-        authuser: Internal Google account index fallback for this profile.
-        email: Optional account email to record for stable routing.
-        include_domains: Optional ``--include-domains`` label set forwarded
-            to :func:`_read_browser_cookies`.
-    """
-    raw_cookies = _read_browser_cookies(browser_name, include_domains=include_domains)
-
-    storage_state = convert_rookiepy_cookies_to_storage_state(raw_cookies)
-    try:
-        extract_cookies_from_storage(storage_state)  # validates SID is present
-    except ValueError as e:
-        console.print(
-            "[red]No valid Google authentication cookies found.[/red]\n"
-            f"{e}\n\n"
-            "Make sure you are logged into Google in your browser."
+    with _patched_login_service_dependencies():
+        return login_service._login_with_browser_cookies(
+            storage_path,
+            browser_name,
+            profile,
+            authuser=authuser,
+            email=email,
+            include_domains=include_domains,
         )
-        raise SystemExit(1) from None
-
-    # Create parent directory (avoid mode= on Windows to prevent ACL issues)
-    try:
-        storage_path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write with chmod 0o600 — avoids non-atomic + world-readable
-        # window from plain write_text + post-hoc chmod.
-        atomic_write_json(storage_path, storage_state)
-        if sys.platform != "win32":
-            # On Unix: ensure directory has restrictive permissions
-            # (atomic_write_json handles the file mode).
-            storage_path.parent.chmod(0o700)
-    except OSError as e:
-        logger.error("Failed to save authentication to %s: %s", storage_path, e)
-        console.print(f"[red]Failed to save authentication to {storage_path}.[/red]\nDetails: {e}")
-        raise SystemExit(1) from None
-
-    # Record account metadata so future calls target the same Google account.
-    # Even on a default-account login (authuser=0, no email), remove stale
-    # metadata so refreshed cookies cannot keep routing to an older account.
-    if authuser or email:
-        from ..auth import write_account_metadata
-
-        try:
-            write_account_metadata(storage_path, authuser=authuser, email=email)
-        except OSError as e:
-            logger.error("Failed to save account metadata for %s: %s", storage_path, e)
-            console.print(
-                f"[yellow]Warning: cookies saved but account metadata write failed.[/yellow]\n"
-                f"Details: {e}"
-            )
-    else:
-        from ..auth import clear_account_metadata
-
-        try:
-            clear_account_metadata(storage_path)
-        except OSError as e:
-            logger.warning("Failed to clear stale account metadata for %s: %s", storage_path, e)
-
-    saved_msg = f"\n[green]Authentication saved to:[/green] {storage_path}"
-    if email:
-        saved_msg += f"\n[green]Account:[/green] {email}"
-    console.print(saved_msg)
-
-    # Verify that cookies work.
-    try:
-        run_async(fetch_tokens_with_domains(storage_path, profile))
-        logger.info("Cookies verified successfully")
-        console.print("[green]Cookies verified successfully.[/green]")
-    except ValueError as e:
-        # Cookie validation failed - the extracted cookies are invalid
-        logger.error("Extracted cookies are invalid: %s", e)
-        console.print(
-            "[red]Warning: Extracted cookies failed validation.[/red]\n"
-            "The cookies may be expired or malformed.\n"
-            f"Error: {e}\n\n"
-            "Saved anyway, but you may need to re-run login if these are invalid."
-        )
-    except httpx.RequestError as e:
-        # Network error - can't verify but cookies might be OK
-        logger.warning("Could not verify cookies due to network error: %s", e)
-        console.print(
-            "[yellow]Warning: Could not verify cookies (network issue).[/yellow]\n"
-            "Cookies saved but may not be working.\n"
-            "Try running 'notebooklm ask' to test authentication."
-        )
-    except Exception as e:
-        # Unexpected error - log it fully
-        logger.warning("Unexpected error verifying cookies: %s: %s", type(e).__name__, e)
-        console.print(
-            f"[yellow]Warning: Unexpected error during verification: {e}[/yellow]\n"
-            "Cookies saved but please verify with 'notebooklm auth check --test'"
-        )
-
-    _sync_server_language_to_config()
 
 
 def _sync_server_language_to_config() -> None:
-    """Fetch server language setting and persist to local config.
+    with _patched_login_service_dependencies():
+        return login_service._sync_server_language_to_config()
 
-    Called after login to ensure the local config reflects the server's
-    global language setting. This prevents generate commands from defaulting
-    to 'en' when the user has configured a different language on the server.
 
-    Non-critical: logs errors at debug level to avoid blocking login.
-    """
-
-    async def _fetch():
-        async with await NotebookLMClient.from_storage() as client:
-            return await client.settings.get_output_language()
-
-    try:
-        server_lang = run_async(_fetch())
-        if server_lang:
-            set_language(server_lang)
-    except Exception as e:
-        logger.debug("Failed to sync server language to config: %s", e)
-        console.print(
-            "[dim]Warning: Could not sync language setting. "
-            "Run 'notebooklm language get' to sync manually.[/dim]"
-        )
+_ORIGINAL_SESSION_PATCH_TARGETS.update(
+    {name: globals()[name] for name in _LOGIN_SERVICE_PATCH_TARGETS}
+)
 
 
 @contextmanager
@@ -1086,7 +613,7 @@ def _ensure_chromium_installed() -> None:
         )
 
 
-def _recover_page(context: "BrowserContext", console: "Console") -> "Page":
+def _recover_page(context: BrowserContext, console: Console) -> Page:
     """Get a fresh page from a persistent browser context.
 
     Used when the current page reference is stale (TargetClosedError).
@@ -1108,6 +635,352 @@ def _recover_page(context: "BrowserContext", console: "Console") -> "Page":
         # Not a TargetClosedError — don't mask the real problem
         logger.error("Failed to create new page for recovery: %s", error_str)
         raise
+
+
+def _validate_login_flag_conflicts(
+    *,
+    browser_cookies: str | None,
+    account_email: str | None,
+    all_accounts: bool,
+    update: bool,
+    profile_name: str | None,
+    storage: str | None,
+) -> None:
+    """Enforce ``login`` flag mutual-exclusion rules.
+
+    Emits a styled error and ``raise SystemExit(1)`` on the first conflict.
+    The ``NOTEBOOKLM_AUTH_JSON`` env-var check is intentionally not handled
+    here: it is an environment vs file-auth conflict, distinct from flag
+    mutual-exclusion, and stays in the ``login`` orchestrator.
+    """
+    if browser_cookies is None and (
+        account_email is not None or all_accounts or profile_name is not None
+    ):
+        console.print(
+            "[red]Error: --account, --all-accounts, and --profile-name "
+            "require --browser-cookies.[/red]"
+        )
+        raise SystemExit(1)
+    if all_accounts and (account_email is not None or profile_name is not None):
+        console.print(
+            "[red]Error: --all-accounts cannot be combined with --account or --profile-name.[/red]"
+        )
+        raise SystemExit(1)
+    if all_accounts and storage:
+        console.print(
+            "[red]Error: --all-accounts writes one profile per account "
+            "and cannot be combined with --storage.[/red]"
+        )
+        raise SystemExit(1)
+    if update and not all_accounts:
+        console.print("[red]Error: --update only applies to --all-accounts.[/red]")
+        raise SystemExit(1)
+
+
+def _prepare_login_paths(
+    profile: str | None, storage: str | None, fresh: bool
+) -> tuple[Path, Path]:
+    """Resolve storage and browser-profile paths for the Playwright login flow.
+
+    Clears the cached browser profile on ``--fresh`` (exiting 1 on OSError),
+    then creates both parent directories with platform-aware permissions.
+    Returns ``(storage_path, browser_profile)``.
+    """
+    if storage:
+        storage_path = Path(storage)
+    elif profile:
+        storage_path = get_storage_path(profile=profile)
+    else:
+        storage_path = get_storage_path()
+    browser_profile = get_browser_profile_dir()
+
+    if fresh and browser_profile.exists():
+        try:
+            shutil.rmtree(browser_profile)
+            console.print("[yellow]Cleared cached browser session (--fresh)[/yellow]")
+        except OSError as exc:
+            logger.error("Failed to clear browser profile %s: %s", browser_profile, exc)
+            console.print(
+                f"[red]Cannot clear browser profile: {exc}[/red]\n"
+                "Close any open browser windows and try again.\n"
+                f"If the problem persists, manually delete: {browser_profile}"
+            )
+            raise SystemExit(1) from exc
+
+    if sys.platform == "win32":
+        # On Windows < Python 3.13, mode= is ignored by mkdir(). On
+        # Python 3.13+, mode= applies Windows ACLs that can be overly
+        # restrictive (0o700 blocks other same-user processes). Skip mode
+        # and chmod entirely; Windows inherits ACLs from the parent.
+        storage_path.parent.mkdir(parents=True, exist_ok=True)
+        browser_profile.mkdir(parents=True, exist_ok=True)
+    else:
+        storage_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        storage_path.parent.chmod(0o700)
+        browser_profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+        browser_profile.chmod(0o700)
+
+    return storage_path, browser_profile
+
+
+def _run_playwright_login(
+    *,
+    browser: str,
+    browser_profile: Path,
+    storage_path: Path,
+    include_domains: set[str] | None = None,
+) -> None:
+    """Drive the Playwright-based Google login and persist storage state.
+
+    Imports Playwright lazily (raising ``SystemExit(1)`` with an install hint
+    on ImportError), runs the chromium pre-flight when the bundled browser is
+    selected, opens a persistent context, retries navigation on transient
+    connection errors, waits for login completion, pins ``.google.com``
+    cookies, applies the cookie-domain allowlist filter (P1-17), atomically
+    writes ``storage_state.json``, and clears stale account metadata.
+
+    Args:
+        include_domains: Optional set of ``--include-domains`` labels. When
+            ``None`` or empty, only :data:`REQUIRED_COOKIE_DOMAINS` and the
+            regional ccTLDs survive the filter. Mirrors the rookiepy path so
+            both login surfaces produce equivalent on-disk state.
+    """
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        # NOTE: passing markup=False so rich does not interpret `[browser]` as a style tag
+        # (which would strip it, leaving the user with `pip install "notebooklm-py"` — no extras).
+        if browser in _CHANNEL_BROWSERS:
+            install_hint = '  pip install "notebooklm-py[browser]"'
+        else:
+            install_hint = '  pip install "notebooklm-py[browser]"\n  playwright install chromium'
+        console.print("[red]Playwright not installed. Run:[/red]")
+        console.print(install_hint, markup=False)
+        raise SystemExit(1) from None
+
+    # Pre-flight check: verify Chromium browser is installed (system Chrome
+    # and Edge are checked at launch time by Playwright's channel routing).
+    if browser == "chromium":
+        _ensure_chromium_installed()
+
+    from ..paths import resolve_profile
+
+    profile_name = resolve_profile()
+    channel_info = _CHANNEL_BROWSERS.get(browser)
+    browser_label = channel_info[0] if channel_info else "Chromium"
+    console.print(f"[dim]Profile: {profile_name}[/dim]")
+    console.print(f"[yellow]Opening {browser_label} for Google login...[/yellow]")
+    console.print(f"[dim]Using persistent profile: {browser_profile}[/dim]")
+
+    # Use context manager to restore ProactorEventLoop for Playwright on Windows
+    # (fixes #89: NotImplementedError on Windows Python 3.12)
+    with _windows_playwright_event_loop(), sync_playwright() as p:
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(browser_profile),
+            "headless": False,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--password-store=basic",  # Avoid macOS keychain encryption for headless compatibility
+            ],
+            "ignore_default_args": ["--enable-automation"],
+        }
+        if browser in _CHANNEL_BROWSERS:
+            launch_kwargs["channel"] = browser
+
+        context = None
+        try:
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+
+            page = context.pages[0] if context.pages else _recover_page(context, console)
+
+            # Retry navigation on transient connection errors with backoff
+            for attempt in range(1, LOGIN_MAX_RETRIES + 1):
+                try:
+                    page.goto(f"{get_base_url()}/", timeout=30000)
+                    break
+                except PlaywrightError as exc:
+                    error_str = str(exc)
+                    is_retryable = any(code in error_str for code in RETRYABLE_CONNECTION_ERRORS)
+                    is_target_closed = TARGET_CLOSED_ERROR in error_str
+
+                    # Check if we should retry
+                    if (is_retryable or is_target_closed) and attempt < LOGIN_MAX_RETRIES:
+                        # For TargetClosedError, get a fresh page reference
+                        if is_target_closed:
+                            page = _recover_page(context, console)
+
+                        backoff_seconds = attempt  # Linear backoff: 1s, 2s
+                        logger.debug(
+                            "Retryable error on attempt %d/%d: %s",
+                            attempt,
+                            LOGIN_MAX_RETRIES,
+                            error_str,
+                        )
+                        if is_target_closed:
+                            console.print(
+                                f"[yellow]Browser page closed "
+                                f"(attempt {attempt}/{LOGIN_MAX_RETRIES}). "
+                                f"Retrying with fresh page...[/yellow]"
+                            )
+                        else:
+                            console.print(
+                                f"[yellow]Connection interrupted "
+                                f"(attempt {attempt}/{LOGIN_MAX_RETRIES}). "
+                                f"Retrying in {backoff_seconds}s...[/yellow]"
+                            )
+                            time.sleep(backoff_seconds)
+                    elif is_target_closed:
+                        # Exhausted retries on browser-closed errors
+                        logger.error(
+                            "Browser closed during login after %d attempts. Last error: %s",
+                            LOGIN_MAX_RETRIES,
+                            error_str,
+                        )
+                        console.print(BROWSER_CLOSED_HELP)
+                        raise SystemExit(1) from exc
+                    elif is_retryable:
+                        # Exhausted retries on network errors
+                        logger.error(
+                            f"Failed to connect to NotebookLM after {LOGIN_MAX_RETRIES} attempts. "
+                            f"Last error: {error_str}"
+                        )
+                        console.print(_connection_error_help())
+                        raise SystemExit(1) from exc
+                    else:
+                        # Non-retryable error - re-raise immediately
+                        logger.debug("Non-retryable error: %s", error_str)
+                        raise
+
+            if _url_matches_base_host(page.url):
+                # Persistent browser profile already has a valid session.
+                console.print("[green]Already logged in.[/green]")
+            else:
+                console.print("\n[bold green]Instructions:[/bold green]")
+                console.print("1. Complete the Google login in the browser window")
+                console.print(
+                    "2. Authentication will be saved automatically once login is detected\n"
+                )
+                console.print("[dim]Waiting for login (up to 5 minutes)...[/dim]")
+                try:
+                    page.wait_for_url(f"{get_base_url()}/**", timeout=300_000)
+                except PlaywrightTimeout:
+                    console.print(
+                        "[red]Login not detected within 5 minutes.[/red]\n"
+                        "Try again with: notebooklm login"
+                    )
+                    raise SystemExit(1) from None
+                except PlaywrightError as exc:
+                    # Browser/tab closed during the wait. Cannot resume a
+                    # partially completed SSO form, so surface the same
+                    # help text other browser-closed paths use.
+                    if TARGET_CLOSED_ERROR in str(exc):
+                        console.print(BROWSER_CLOSED_HELP)
+                        raise SystemExit(1) from exc
+                    raise
+                console.print("[green]Login detected.[/green]")
+
+            # Force .google.com cookies for regional users (e.g. UK lands on
+            # .google.co.uk). Use "commit" to resolve once response headers
+            # (including Set-Cookie) are processed, before any client-side
+            # JS redirect can interrupt. See #214.
+            for url in [GOOGLE_ACCOUNTS_URL, f"{get_base_url()}/"]:
+                try:
+                    page.goto(url, wait_until="commit")
+                except PlaywrightError as exc:
+                    error_str = str(exc)
+                    if TARGET_CLOSED_ERROR in error_str:
+                        # Page was destroyed (e.g. user switched accounts) -- get fresh page
+                        page = _recover_page(context, console)
+                        try:
+                            page.goto(url, wait_until="commit")
+                        except PlaywrightError as inner_exc:
+                            if TARGET_CLOSED_ERROR in str(inner_exc):
+                                # Recovered page also dead -- context/browser is gone
+                                console.print(BROWSER_CLOSED_HELP)
+                                raise SystemExit(1) from inner_exc
+                            elif not _is_navigation_interrupted_error(inner_exc):
+                                raise
+                    elif not _is_navigation_interrupted_error(error_str):
+                        raise
+
+            # Defense-in-depth: wait_for_url proved we reached the host,
+            # but the cookie-forcing round-trip above can land us back on
+            # accounts.google.com if the session was invalidated mid-flow
+            # (rare, but the old interactive path defended against this
+            # via a "save anyway?" confirm). Auto-detect is non-interactive,
+            # so fail fast with a clear next step instead.
+            if not _url_matches_base_host(page.url):
+                console.print(
+                    f"[red]Unexpected URL after login: {page.url}[/red]\n"
+                    "Authentication may be incomplete. "
+                    "Try: notebooklm login --fresh"
+                )
+                raise SystemExit(1)
+
+            # Atomic write with chmod 0o600 — Playwright's path= argument
+            # writes directly (non-atomic + world-readable window).
+            #
+            # P1-17: apply the same cookie-domain allowlist that the rookiepy
+            # path uses (``_build_google_cookie_domains``) so sibling-product
+            # cookies (mail, myaccount, docs, youtube) the user happens to be
+            # signed into in the same browser session don't leak into
+            # ``storage_state.json``. Opt-in via ``--include-domains=...``
+            # mirrors the rookiepy semantics.
+            # Playwright's ``storage_state()`` returns a ``TypedDict``-shaped
+            # value; widen to a plain ``dict[str, Any]`` for the filter helper
+            # (which is independently testable without the Playwright import).
+            playwright_state = context.storage_state()
+            filtered_state: dict[str, Any] = _filter_storage_state_cookies_by_domain_policy(
+                dict(playwright_state), include_domains=include_domains
+            )
+            atomic_write_json(storage_path, filtered_state)
+            from ..auth import clear_account_metadata
+
+            try:
+                clear_account_metadata(storage_path)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to clear stale account metadata for %s: %s",
+                    storage_path,
+                    exc,
+                )
+
+        except Exception as e:
+            # Handle browser launch errors specially (context will be None if launch failed)
+            if context is None and browser in _CHANNEL_BROWSERS:
+                err = str(e).lower()
+                is_not_found = any(
+                    marker in err
+                    for marker in (
+                        "executable doesn't exist",
+                        "is not found at",
+                        "no such file",
+                        "failed to launch",
+                    )
+                )
+                if is_not_found:
+                    label, install_url = _CHANNEL_BROWSERS[browser]
+                    logger.error("%s not found: %s", label, e)
+                    console.print(
+                        f"[red]{label} not found.[/red]\n"
+                        f"Install from: {install_url}\n"
+                        "Or use the default Chromium browser: notebooklm login"
+                    )
+                    raise SystemExit(1) from e
+            # Downgraded from ``logger.error(..., exc_info=True)``:
+            # the previous traceback dump duplicated whatever ``handle_errors``
+            # already shows the user. Keep the diagnostic available at
+            # debug level (-vv) without flooding stderr by default. The
+            # bare ``raise`` propagates to ``handle_errors`` which converts
+            # it to a friendly ``Unexpected error: <msg>`` line + exit 2.
+            logger.debug("Login failed: %s", e, exc_info=True)
+            raise
+        finally:
+            # Always close the browser context to prevent resource leaks
+            if context:
+                context.close()
 
 
 def register_session_commands(cli):
@@ -1139,6 +1012,8 @@ def register_session_commands(cli):
         help=(
             "Read cookies from an installed browser instead of launching Playwright. "
             "Optionally specify browser: chrome, firefox, brave, edge, safari, arc, ... "
+            "For Chromium-family profiles, target one with 'chrome::<profile>' "
+            "(e.g. 'chrome::Profile 1' or 'brave::Work'). "
             "For Firefox Multi-Account Containers, target a specific container with "
             "'firefox::<container-name>' (or 'firefox::none' for the default). "
             "Requires: pip install 'notebooklm-py[cookies]'"
@@ -1162,6 +1037,20 @@ def register_session_commands(cli):
             "Extract every Google account signed in to the browser into its own "
             "profile (auto-named from each account's email). Only valid with "
             "--browser-cookies."
+        ),
+    )
+    @click.option(
+        "--update",
+        "update",
+        is_flag=True,
+        default=False,
+        help=(
+            "With --all-accounts: when an account's natural profile name "
+            "(e.g. 'alice' for alice@gmail.com) already exists but has no "
+            "account metadata, update that profile in place instead of "
+            "creating a suffixed 'alice-2'. Profiles that already bind a "
+            "different email are still given a suffix to avoid clobbering. "
+            "Only valid with --all-accounts."
         ),
     )
     @click.option(
@@ -1201,6 +1090,7 @@ def register_session_commands(cli):
         browser_cookies,
         account_email,
         all_accounts,
+        update,
         profile_name,
         fresh,
         include_domains_raw,
@@ -1218,12 +1108,12 @@ def register_session_commands(cli):
         """
         # Wrap entire body in handle_errors so unexpected failures (e.g.
         # Playwright internal crashes that bubble out of the catch-all
-        # except-block below) emit a friendly 'Unexpected error: <msg>'
-        # line + exit 2 instead of a Python traceback (I15). Existing
-        # ``raise SystemExit(N)`` calls inside the body propagate
-        # unchanged — handle_errors does not intercept SystemExit.
+        # except-block in _run_playwright_login) emit a friendly
+        # 'Unexpected error: <msg>' line + exit 2 instead of a Python
+        # traceback. Existing ``raise SystemExit(N)`` calls inside the
+        # body propagate unchanged — handle_errors does not intercept
+        # SystemExit.
         with handle_errors():
-            # Check for conflicting env var
             if os.environ.get("NOTEBOOKLM_AUTH_JSON"):
                 console.print(
                     "[red]Error: Cannot run 'login' when NOTEBOOKLM_AUTH_JSON is set.[/red]\n"
@@ -1235,26 +1125,14 @@ def register_session_commands(cli):
                 )
                 raise SystemExit(1)
 
-            if browser_cookies is None and (
-                account_email is not None or all_accounts or profile_name is not None
-            ):
-                console.print(
-                    "[red]Error: --account, --all-accounts, and --profile-name "
-                    "require --browser-cookies.[/red]"
-                )
-                raise SystemExit(1)
-            if all_accounts and (account_email is not None or profile_name is not None):
-                console.print(
-                    "[red]Error: --all-accounts cannot be combined with "
-                    "--account or --profile-name.[/red]"
-                )
-                raise SystemExit(1)
-            if all_accounts and storage:
-                console.print(
-                    "[red]Error: --all-accounts writes one profile per account "
-                    "and cannot be combined with --storage.[/red]"
-                )
-                raise SystemExit(1)
+            _validate_login_flag_conflicts(
+                browser_cookies=browser_cookies,
+                account_email=account_email,
+                all_accounts=all_accounts,
+                update=update,
+                profile_name=profile_name,
+                storage=storage,
+            )
 
             # Parse + validate --include-domains. Raises click.BadParameter on
             # unknown labels (Click converts that to a non-zero exit + stderr
@@ -1274,7 +1152,9 @@ def register_session_commands(cli):
                 _warn_missing_optional_domains(include_domains)
                 if all_accounts:
                     _login_all_accounts_from_browser(
-                        browser_cookies, include_domains=include_domains
+                        browser_cookies,
+                        update=update,
+                        include_domains=include_domains,
                     )
                     return
                 active_profile = ctx.obj.get("profile") if ctx.obj else None
@@ -1288,281 +1168,18 @@ def register_session_commands(cli):
                 )
                 return
 
-            # Playwright path does not consult ``_build_google_cookie_domains``
-            # (the browser owns its own cookie jar via persistent context), so
-            # ``--include-domains`` is a no-op here. Warn rather than silently
-            # ignore so a user doesn't think it took effect.
-            if include_domains:
-                console.print(
-                    "[yellow]Warning: --include-domains has no effect without "
-                    "--browser-cookies (the Playwright login flow saves whatever "
-                    "cookies the browser context already holds).[/yellow]"
-                )
-
+            # P1-17: the Playwright path now applies the same cookie-domain
+            # allowlist as the rookiepy path. ``--include-domains`` opts the
+            # named sibling-product domains back in; default keeps only
+            # ``REQUIRED_COOKIE_DOMAINS`` + regional ccTLDs.
             profile = ctx.obj.get("profile") if ctx.obj else None
-            storage_path = (
-                Path(storage)
-                if storage
-                else get_storage_path(profile=profile)
-                if profile
-                else get_storage_path()
+            storage_path, browser_profile = _prepare_login_paths(profile, storage, fresh)
+            _run_playwright_login(
+                browser=browser,
+                browser_profile=browser_profile,
+                storage_path=storage_path,
+                include_domains=include_domains,
             )
-            browser_profile = get_browser_profile_dir()
-
-            if fresh and browser_profile.exists():
-                try:
-                    shutil.rmtree(browser_profile)
-                    console.print("[yellow]Cleared cached browser session (--fresh)[/yellow]")
-                except OSError as exc:
-                    logger.error("Failed to clear browser profile %s: %s", browser_profile, exc)
-                    console.print(
-                        f"[red]Cannot clear browser profile: {exc}[/red]\n"
-                        "Close any open browser windows and try again.\n"
-                        f"If the problem persists, manually delete: {browser_profile}"
-                    )
-                    raise SystemExit(1) from exc
-
-            if sys.platform == "win32":
-                # On Windows < Python 3.13, mode= is ignored by mkdir(). On
-                # Python 3.13+, mode= applies Windows ACLs that can be overly
-                # restrictive (0o700 blocks other same-user processes). Skip mode
-                # and chmod entirely; Windows inherits ACLs from the parent.
-                storage_path.parent.mkdir(parents=True, exist_ok=True)
-                browser_profile.mkdir(parents=True, exist_ok=True)
-            else:
-                storage_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                storage_path.parent.chmod(0o700)
-                browser_profile.mkdir(parents=True, exist_ok=True, mode=0o700)
-                browser_profile.chmod(0o700)
-
-            try:
-                from playwright.sync_api import Error as PlaywrightError
-                from playwright.sync_api import TimeoutError as PlaywrightTimeout
-                from playwright.sync_api import sync_playwright
-            except ImportError:
-                # NOTE: passing markup=False so rich does not interpret `[browser]` as a style tag
-                # (which would strip it, leaving the user with `pip install "notebooklm-py"` — no extras).
-                if browser in _CHANNEL_BROWSERS:
-                    install_hint = '  pip install "notebooklm-py[browser]"'
-                else:
-                    install_hint = (
-                        '  pip install "notebooklm-py[browser]"\n  playwright install chromium'
-                    )
-                console.print("[red]Playwright not installed. Run:[/red]")
-                console.print(install_hint, markup=False)
-                raise SystemExit(1) from None
-
-            # Pre-flight check: verify Chromium browser is installed (system Chrome
-            # and Edge are checked at launch time by Playwright's channel routing).
-            if browser == "chromium":
-                _ensure_chromium_installed()
-
-            from ..paths import resolve_profile
-
-            profile_name = resolve_profile()
-            channel_info = _CHANNEL_BROWSERS.get(browser)
-            browser_label = channel_info[0] if channel_info else "Chromium"
-            console.print(f"[dim]Profile: {profile_name}[/dim]")
-            console.print(f"[yellow]Opening {browser_label} for Google login...[/yellow]")
-            console.print(f"[dim]Using persistent profile: {browser_profile}[/dim]")
-
-            # Use context manager to restore ProactorEventLoop for Playwright on Windows
-            # (fixes #89: NotImplementedError on Windows Python 3.12)
-            with _windows_playwright_event_loop(), sync_playwright() as p:
-                launch_kwargs: dict[str, Any] = {
-                    "user_data_dir": str(browser_profile),
-                    "headless": False,
-                    "args": [
-                        "--disable-blink-features=AutomationControlled",
-                        "--password-store=basic",  # Avoid macOS keychain encryption for headless compatibility
-                    ],
-                    "ignore_default_args": ["--enable-automation"],
-                }
-                if browser in _CHANNEL_BROWSERS:
-                    launch_kwargs["channel"] = browser
-
-                context = None
-                try:
-                    context = p.chromium.launch_persistent_context(**launch_kwargs)
-
-                    page = context.pages[0] if context.pages else _recover_page(context, console)
-
-                    # Retry navigation on transient connection errors with backoff
-                    for attempt in range(1, LOGIN_MAX_RETRIES + 1):
-                        try:
-                            page.goto(f"{get_base_url()}/", timeout=30000)
-                            break
-                        except PlaywrightError as exc:
-                            error_str = str(exc)
-                            is_retryable = any(
-                                code in error_str for code in RETRYABLE_CONNECTION_ERRORS
-                            )
-                            is_target_closed = TARGET_CLOSED_ERROR in error_str
-
-                            # Check if we should retry
-                            if (is_retryable or is_target_closed) and attempt < LOGIN_MAX_RETRIES:
-                                # For TargetClosedError, get a fresh page reference
-                                if is_target_closed:
-                                    page = _recover_page(context, console)
-
-                                backoff_seconds = attempt  # Linear backoff: 1s, 2s
-                                logger.debug(
-                                    "Retryable error on attempt %d/%d: %s",
-                                    attempt,
-                                    LOGIN_MAX_RETRIES,
-                                    error_str,
-                                )
-                                if is_target_closed:
-                                    console.print(
-                                        f"[yellow]Browser page closed "
-                                        f"(attempt {attempt}/{LOGIN_MAX_RETRIES}). "
-                                        f"Retrying with fresh page...[/yellow]"
-                                    )
-                                else:
-                                    console.print(
-                                        f"[yellow]Connection interrupted "
-                                        f"(attempt {attempt}/{LOGIN_MAX_RETRIES}). "
-                                        f"Retrying in {backoff_seconds}s...[/yellow]"
-                                    )
-                                    time.sleep(backoff_seconds)
-                            elif is_target_closed:
-                                # Exhausted retries on browser-closed errors
-                                logger.error(
-                                    "Browser closed during login after %d attempts. Last error: %s",
-                                    LOGIN_MAX_RETRIES,
-                                    error_str,
-                                )
-                                console.print(BROWSER_CLOSED_HELP)
-                                raise SystemExit(1) from exc
-                            elif is_retryable:
-                                # Exhausted retries on network errors
-                                logger.error(
-                                    f"Failed to connect to NotebookLM after {LOGIN_MAX_RETRIES} attempts. "
-                                    f"Last error: {error_str}"
-                                )
-                                console.print(_connection_error_help())
-                                raise SystemExit(1) from exc
-                            else:
-                                # Non-retryable error - re-raise immediately
-                                logger.debug("Non-retryable error: %s", error_str)
-                                raise
-
-                    if _url_matches_base_host(page.url):
-                        # Persistent browser profile already has a valid session.
-                        console.print("[green]Already logged in.[/green]")
-                    else:
-                        console.print("\n[bold green]Instructions:[/bold green]")
-                        console.print("1. Complete the Google login in the browser window")
-                        console.print(
-                            "2. Authentication will be saved automatically once login is detected\n"
-                        )
-                        console.print("[dim]Waiting for login (up to 5 minutes)...[/dim]")
-                        try:
-                            page.wait_for_url(f"{get_base_url()}/**", timeout=300_000)
-                        except PlaywrightTimeout:
-                            console.print(
-                                "[red]Login not detected within 5 minutes.[/red]\n"
-                                "Try again with: notebooklm login"
-                            )
-                            raise SystemExit(1) from None
-                        except PlaywrightError as exc:
-                            # Browser/tab closed during the wait. Cannot resume a
-                            # partially completed SSO form, so surface the same
-                            # help text other browser-closed paths use.
-                            if TARGET_CLOSED_ERROR in str(exc):
-                                console.print(BROWSER_CLOSED_HELP)
-                                raise SystemExit(1) from exc
-                            raise
-                        console.print("[green]Login detected.[/green]")
-
-                    # Force .google.com cookies for regional users (e.g. UK lands on
-                    # .google.co.uk). Use "commit" to resolve once response headers
-                    # (including Set-Cookie) are processed, before any client-side
-                    # JS redirect can interrupt. See #214.
-                    for url in [GOOGLE_ACCOUNTS_URL, f"{get_base_url()}/"]:
-                        try:
-                            page.goto(url, wait_until="commit")
-                        except PlaywrightError as exc:
-                            error_str = str(exc)
-                            if TARGET_CLOSED_ERROR in error_str:
-                                # Page was destroyed (e.g. user switched accounts) -- get fresh page
-                                page = _recover_page(context, console)
-                                try:
-                                    page.goto(url, wait_until="commit")
-                                except PlaywrightError as inner_exc:
-                                    if TARGET_CLOSED_ERROR in str(inner_exc):
-                                        # Recovered page also dead -- context/browser is gone
-                                        console.print(BROWSER_CLOSED_HELP)
-                                        raise SystemExit(1) from inner_exc
-                                    elif not _is_navigation_interrupted_error(inner_exc):
-                                        raise
-                            elif not _is_navigation_interrupted_error(error_str):
-                                raise
-
-                    # Defense-in-depth: wait_for_url proved we reached the host,
-                    # but the cookie-forcing round-trip above can land us back on
-                    # accounts.google.com if the session was invalidated mid-flow
-                    # (rare, but the old interactive path defended against this
-                    # via a "save anyway?" confirm). Auto-detect is non-interactive,
-                    # so fail fast with a clear next step instead.
-                    if not _url_matches_base_host(page.url):
-                        console.print(
-                            f"[red]Unexpected URL after login: {page.url}[/red]\n"
-                            "Authentication may be incomplete. "
-                            "Try: notebooklm login --fresh"
-                        )
-                        raise SystemExit(1)
-
-                    # Atomic write with chmod 0o600 — Playwright's path= argument
-                    # writes directly (non-atomic + world-readable window).
-                    state = context.storage_state()
-                    atomic_write_json(storage_path, state)
-                    from ..auth import clear_account_metadata
-
-                    try:
-                        clear_account_metadata(storage_path)
-                    except OSError as exc:
-                        logger.warning(
-                            "Failed to clear stale account metadata for %s: %s",
-                            storage_path,
-                            exc,
-                        )
-
-                except Exception as e:
-                    # Handle browser launch errors specially (context will be None if launch failed)
-                    if context is None and browser in _CHANNEL_BROWSERS:
-                        err = str(e).lower()
-                        is_not_found = any(
-                            marker in err
-                            for marker in (
-                                "executable doesn't exist",
-                                "is not found at",
-                                "no such file",
-                                "failed to launch",
-                            )
-                        )
-                        if is_not_found:
-                            label, install_url = _CHANNEL_BROWSERS[browser]
-                            logger.error("%s not found: %s", label, e)
-                            console.print(
-                                f"[red]{label} not found.[/red]\n"
-                                f"Install from: {install_url}\n"
-                                "Or use the default Chromium browser: notebooklm login"
-                            )
-                            raise SystemExit(1) from e
-                    # Downgraded from ``logger.error(..., exc_info=True)`` (I15):
-                    # the previous traceback dump duplicated whatever ``handle_errors``
-                    # already shows the user. Keep the diagnostic available at
-                    # debug level (-vv) without flooding stderr by default. The
-                    # bare ``raise`` propagates to ``handle_errors`` which converts
-                    # it to a friendly ``Unexpected error: <msg>`` line + exit 2.
-                    logger.debug("Login failed: %s", e, exc_info=True)
-                    raise
-                finally:
-                    # Always close the browser context to prevent resource leaks
-                    if context:
-                        context.close()
-
             console.print(f"\n[green]Authentication saved to:[/green] {storage_path}")
 
             # Sync server language setting to local config so generate commands
@@ -1605,10 +1222,10 @@ def register_session_commands(cli):
         if force:
             set_current_notebook(notebook_id)
             if json_output:
-                # I12: surface the new active notebook id as the primary
-                # signal so script callers can pipe `notebooklm use --json`
-                # straight into downstream automation. ``verified: false``
-                # mirrors the "(not verified — --force)" cell in text mode.
+                # Surface the new active notebook id as the primary signal
+                # so script callers can pipe `notebooklm use --json` straight
+                # into downstream automation. ``verified: false`` mirrors the
+                # "(not verified — --force)" cell in text mode.
                 json_output_response(
                     {
                         "active_notebook_id": notebook_id,
@@ -1629,7 +1246,7 @@ def register_session_commands(cli):
             # with an unverified ID) and route through the typed
             # ``handle_auth_error`` UX so JSON callers get the standard
             # ``AUTH_REQUIRED`` envelope and text callers get the rich
-            # multi-line "Run notebooklm login" walkthrough. (I13.)
+            # multi-line "Run notebooklm login" walkthrough.
             handle_auth_error(json_output)
             return  # unreachable — handle_auth_error raises SystemExit
         except click.ClickException:
@@ -1662,8 +1279,8 @@ def register_session_commands(cli):
             # Auth expired (e.g. SID/SSID cookies stale). Route through the
             # typed UX so the user sees "Run notebooklm login" instead of
             # the generic "Pass --force to persist without verification"
-            # catch-all that previously hid the real remediation. (Audit row
-            # I13 — see helpers.handle_auth_error for the canonical message.)
+            # catch-all that previously hid the real remediation.
+            # See ``helpers.handle_auth_error`` for the canonical message.
             handle_auth_error(json_output)
             return  # unreachable — handle_auth_error raises SystemExit
         except Exception as exc:
@@ -1679,9 +1296,9 @@ def register_session_commands(cli):
         set_current_notebook(resolved_id, nb.title, nb.is_owner, created_str)
 
         if json_output:
-            # I12: scriptable envelope surfaces the new active notebook id
-            # plus enough metadata that callers don't have to round-trip
-            # through `notebooklm status --json` to render a confirmation.
+            # Scriptable envelope surfaces the new active notebook id plus
+            # enough metadata that callers don't have to round-trip through
+            # `notebooklm status --json` to render a confirmation.
             json_output_response(
                 {
                     "active_notebook_id": resolved_id,
@@ -1938,6 +1555,8 @@ def register_session_commands(cli):
         help=(
             "Browser to read cookies from (chrome, firefox, brave, edge, "
             "safari, arc, ...). 'auto' picks the first one rookiepy can read. "
+            "Use 'chrome::<profile>' for one Chromium profile or "
+            "'firefox::<container>' for one Firefox container. "
             "Requires: pip install 'notebooklm-py[cookies]'"
         ),
     )
@@ -1955,16 +1574,37 @@ def register_session_commands(cli):
         ),
     )
     @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
-    def auth_inspect(browser_name, include_domains_raw, json_output):
+    @click.option(
+        "-v",
+        "--verbose",
+        "verbose",
+        is_flag=True,
+        default=False,
+        help=(
+            "Also show which browser user-profile each account's cookies came "
+            "from. Useful for Chromium-family browsers with multiple "
+            "user-profiles."
+        ),
+    )
+    def auth_inspect(browser_name, include_domains_raw, json_output, verbose):
         """List Google accounts visible to a browser's cookie store.
 
         Read-only — never writes to disk. Use this before
         ``notebooklm login --browser-cookies <browser> --account <email>`` to
         see which account emails are available.
 
+        For Chromium-family browsers (chrome, brave, edge, …) with multiple
+        user-profiles, accounts from every populated profile are surfaced and
+        deduped by email. Pass ``-v`` to see the originating user-profile per
+        account, or ``--json`` for a structured ``browser_profile`` field.
+        Use ``chrome::<profile-name-or-directory>`` to inspect only one
+        Chromium user-profile.
+
         \b
         Examples:
           notebooklm auth inspect --browser chrome
+          notebooklm auth inspect --browser 'chrome::Profile 1'
+          notebooklm auth inspect --browser chrome -v
           notebooklm auth inspect --browser firefox --json
         """
         include_domains = _parse_include_domains(include_domains_raw)
@@ -1975,30 +1615,44 @@ def register_session_commands(cli):
             json_output_response(
                 {
                     "browser": browser_name,
-                    "accounts": [{"email": a.email, "is_default": a.is_default} for a in accounts],
+                    "accounts": [
+                        {
+                            "email": a.email,
+                            "is_default": a.is_default,
+                            "browser_profile": a.browser_profile,
+                        }
+                        for a in accounts
+                    ],
                 }
             )
             return
         console.print(f"\n[bold]Browser:[/bold] {browser_name}")
         console.print(f"[bold]Found {len(accounts)} signed-in Google account(s):[/bold]\n")
+        show_browser_profile = verbose and any(a.browser_profile for a in accounts)
         table = Table(show_header=True, header_style="bold")
         table.add_column("email")
+        if show_browser_profile:
+            table.add_column(f"{browser_name} user")
         table.add_column("default", justify="center")
         for a in accounts:
-            table.add_row(
-                a.email,
-                "[green]✓[/green]" if a.is_default else "",
-            )
+            row = [a.email]
+            if show_browser_profile:
+                row.append(a.browser_profile or "")
+            row.append("[green]✓[/green]" if a.is_default else "")
+            table.add_row(*row)
         console.print(table)
-        console.print(
-            "\n[dim]Note: --browser-cookies <browser> reads cookies from the "
-            "browser's default user-data profile only. Accounts in other "
-            "browser profiles will not appear here.[/dim]\n"
-            "Pick one with: [cyan]notebooklm login --browser-cookies "
+        hint = (
+            f"Pick one with: [cyan]notebooklm login --browser-cookies "
             f"{browser_name} --account EMAIL[/cyan]\n"
-            "Or extract them all: [cyan]notebooklm login --browser-cookies "
+            f"Or extract them all: [cyan]notebooklm login --browser-cookies "
             f"{browser_name} --all-accounts[/cyan]"
         )
+        if not verbose and any(a.browser_profile for a in accounts):
+            hint = (
+                "[dim]Pass -v to see which browser user-profile each account "
+                "came from.[/dim]\n" + hint
+            )
+        console.print("\n" + hint)
 
     @auth_group.command("check")
     @click.option(
@@ -2024,7 +1678,7 @@ def register_session_commands(cli):
           notebooklm auth check --test    # Full validation with network test
           notebooklm auth check --json    # Machine-readable output
         """
-        from ..auth import extract_cookies_from_storage, fetch_tokens_with_domains
+        from ..auth import extract_cookies_from_storage
 
         profile = ctx.obj.get("profile") if ctx.obj else None
         storage_path = get_storage_path(profile=profile)
@@ -2220,7 +1874,9 @@ def register_session_commands(cli):
         help=(
             "Re-extract cookies from an installed browser and match the profile "
             "account from context.json. Optionally specify browser: chrome, "
-            "firefox, brave, edge, safari, arc, ..."
+            "firefox, brave, edge, safari, arc, ... Use 'chrome::<profile>' "
+            "for one Chromium profile or 'firefox::<container>' for one "
+            "Firefox container."
         ),
     )
     @click.option(
@@ -2267,9 +1923,7 @@ def register_session_commands(cli):
         See docs/troubleshooting.md ("Cookie freshness for long-running /
         unattended use") for launchd / systemd / cron recipes.
         """
-        from ..auth import fetch_tokens_with_domains
-
-        # Wrap the entire body in handle_errors (I15 polish): typed exceptions
+        # Wrap the entire body in handle_errors: typed exceptions
         # (AuthError, NetworkError, ValidationError, ...) get user-friendly
         # one-liners + hints; unexpected exceptions become 'Unexpected error:
         # <msg>' (exit 2) instead of leaking ``type(exc).__name__`` into the

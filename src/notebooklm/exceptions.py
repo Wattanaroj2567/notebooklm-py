@@ -19,6 +19,7 @@ import re
 from typing import Any
 
 from ._env import DEFAULT_BASE_URL, get_base_url
+from ._logging import scrub_secrets
 
 
 def _truncate_response_preview(raw: str | None) -> str | None:
@@ -55,14 +56,17 @@ __all__ = [
     "ServerError",
     "ClientError",
     "RPCTimeoutError",
-    # Idempotency (T7.B2)
+    "RPCResponseTooLargeError",
+    # Idempotency
     "NonIdempotentRetryError",
+    "IdempotencyVariantError",
     # Domain: Notebooks
     "NotebookError",
     "NotebookNotFoundError",
     "NotebookLimitError",
     # Domain: Chat
     "ChatError",
+    "ChatResponseParseError",
     # Domain: Sources
     "SourceError",
     "SourceAddError",
@@ -75,6 +79,8 @@ __all__ = [
     "ArtifactNotReadyError",
     "ArtifactParseError",
     "ArtifactDownloadError",
+    # Domain: Research
+    "ResearchTaskMismatchError",
 ]
 
 
@@ -342,12 +348,22 @@ class AuthExtractionError(RPCError):
         message: str | None = None,
     ):
         self.key = key
-        # Slice before substituting so we don't run the regex over a multi-MB
-        # response body just to throw away most of it. A 5x headroom over
-        # PREVIEW_LENGTH guarantees we still have enough non-whitespace
-        # characters left after collapsing runs of whitespace, even on heavily
-        # indented HTML where ~80% of the prefix may be indentation.
-        head = payload_preview[: self.PREVIEW_LENGTH * 5]
+        # Two-stage slice with the scrub in the middle, so we bound regex work
+        # without giving up boundary-straddle safety:
+        #
+        # 1. Pre-slice to a generous 10x cap. Bounds the scrub at O(2000 chars)
+        #    instead of O(len(payload)) — a multi-MB HTML body would otherwise
+        #    cost ~7 regex passes over the whole thing just to throw most away.
+        # 2. Scrub the slice. A secret straddling the 10x boundary is
+        #    theoretically possible but the 2000-char window gives ~19x more
+        #    slack than the 5x preview limit, so any realistic ``f.sid=``,
+        #    ``Bearer ...``, or ``Set-Cookie:`` value fits well inside.
+        # 3. Re-slice to 5x. The scrub already neutralized anything that would
+        #    have leaked from the 5x cut, including secrets that originally
+        #    straddled the 5x boundary inside the 10x window.
+        pre_sliced = payload_preview[: self.PREVIEW_LENGTH * 10]
+        scrubbed = scrub_secrets(pre_sliced)
+        head = scrubbed[: self.PREVIEW_LENGTH * 5]
         # Collapse runs of whitespace so the preview stays compact and useful
         # even when the upstream HTML is heavily indented or contains newlines.
         collapsed = re.sub(r"\s+", " ", head).strip()
@@ -469,8 +485,35 @@ class RPCTimeoutError(NetworkError):
         self.timeout_seconds = timeout_seconds
 
 
+class RPCResponseTooLargeError(RPCError):
+    """RPC response body exceeded the configured maximum size.
+
+    Raised by the streaming transport when a response body grows past
+    ``MAX_RPC_RESPONSE_BYTES`` (currently 50 MiB) while being read. The guard
+    aborts the read mid-stream rather than buffering an unbounded body, so a
+    runaway or hostile server can't exhaust process memory.
+
+    Attributes:
+        limit_bytes: The configured maximum (in bytes) that was exceeded.
+        bytes_read: Number of bytes already buffered when the guard fired
+            (always strictly greater than ``limit_bytes``).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        limit_bytes: int | None = None,
+        bytes_read: int | None = None,
+        method_id: str | None = None,
+    ):
+        super().__init__(message, method_id=method_id)
+        self.limit_bytes = limit_bytes
+        self.bytes_read = bytes_read
+
+
 # =============================================================================
-# Idempotency (T7.B2)
+# Idempotency
 # =============================================================================
 
 
@@ -485,6 +528,23 @@ class NonIdempotentRetryError(NotebookLMError):
 
     See ``docs/python-api.md#idempotency`` for guidance on building
     idempotent text-source workflows.
+    """
+
+
+class IdempotencyVariantError(NotebookLMError):
+    """Raised when an unknown ``operation_variant`` is requested for an RPC
+    that has explicit variant-table entries.
+
+    The mutating-RPC idempotency registry keys policies on
+    ``(RPCMethod, operation_variant | None)``. When a method has variant
+    entries (e.g. ``"upsert"``, ``"overwrite"``) AND the caller supplies a
+    variant name that is not in that table, the registry MUST raise this
+    error rather than silently falling back to the ``(method, None)``
+    default — silent fallback would hide caller typos and API drift.
+
+    Methods that only have a ``(method, None)`` entry tolerate any variant
+    name (the variant table is effectively empty, so there is no typo to
+    catch). See :func:`notebooklm._idempotency.IdempotencyRegistry.get_entry`.
     """
 
 
@@ -595,6 +655,24 @@ class NotebookLimitError(NotebookError):
 
 class ChatError(NotebookLMError):
     """Base for chat operations."""
+
+
+class ChatResponseParseError(ChatError):
+    """The streaming chat response yielded no parseable chunks.
+
+    Raised when :func:`notebooklm._chat_protocol.parse_streaming_chat_response`
+    iterates the streamed response and finds zero ``wrb.fr`` envelopes it
+    could decode — that is, the wire protocol drifted or the response body
+    was empty/malformed.
+
+    This is distinct from "the model returned an empty answer": a real
+    empty answer still produces at least one parseable ``wrb.fr`` chunk
+    (with empty answer text), in which case the parser returns a
+    ``StreamingChatParseResult("", [], conv_id)`` rather than raising.
+
+    Inherits from :class:`ChatError` so existing chat-domain ``except
+    ChatError`` clauses continue to catch it without modification.
+    """
 
 
 # =============================================================================
@@ -795,3 +873,39 @@ class ArtifactDownloadError(ArtifactError):
         if details:
             msg += f": {details}"
         super().__init__(msg)
+
+
+# =============================================================================
+# Domain: Research
+# =============================================================================
+
+
+class ResearchTaskMismatchError(ValidationError):
+    """Per-source ``research_task_id`` does not match the caller's ``task_id``.
+
+    Raised by :meth:`ResearchAPI.import_sources` when one of the supplied
+    sources carries a ``research_task_id`` that differs from the
+    discriminator ``task_id`` passed by the caller. This is the wire-crossing
+    bug: the caller intends to import results for task A, but one of the
+    source entries was actually discovered under task B. Importing under
+    the wrong task would mis-attribute provenance, so this check fails
+    loud before any RPC traffic is issued.
+
+    Inherits from :class:`ValidationError` so existing ``except
+    ValidationError`` clauses on ``import_sources`` continue to catch it.
+
+    Attributes:
+        task_id: The discriminator ``task_id`` passed by the caller.
+        source_research_task_id: The ``research_task_id`` carried by the
+            offending source dict.
+    """
+
+    def __init__(self, *, task_id: str, source_research_task_id: str):
+        self.task_id = task_id
+        self.source_research_task_id = source_research_task_id
+        super().__init__(
+            f"research_task_id mismatch: source carries "
+            f"research_task_id={source_research_task_id!r} but caller passed "
+            f"task_id={task_id!r}. Sources discovered under one research "
+            f"task cannot be imported under another."
+        )

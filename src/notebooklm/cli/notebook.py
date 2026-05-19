@@ -17,17 +17,11 @@ import click
 from rich.table import Table
 
 from ..client import NotebookLMClient
-from .helpers import (
-    clear_context,
-    console,
-    get_current_notebook,
-    json_output_response,
-    require_notebook,
-    resolve_notebook_id,
-    set_current_notebook,
-    with_client,
-)
+from .auth_runtime import with_client
+from .context import clear_context, get_current_notebook, set_current_notebook
 from .options import list_options, notebook_option
+from .rendering import console, json_output_response
+from .resolve import require_notebook, resolve_notebook_id
 
 
 def register_notebook_commands(cli):
@@ -50,7 +44,7 @@ def register_notebook_commands(cli):
             async with NotebookLMClient(client_auth) as client:
                 notebooks = await client.notebooks.list()
 
-                # P6.T1 / I16: client-side offset slicing. No server-side
+                # Client-side offset slicing. No server-side
                 # cursors in scope for this phase — `client.notebooks.list()`
                 # always returns the full result set, we just trim before
                 # rendering / counting.
@@ -76,7 +70,7 @@ def register_notebook_commands(cli):
 
                 table = Table(title="Notebooks")
                 table.add_column("ID", style="cyan")
-                # P6.T1 / I16: keep the legacy unconstrained Title rendering
+                # Keep the legacy unconstrained Title rendering
                 # by default and rely on the explicit --no-truncate to also
                 # disable Rich's auto-ellipsis at narrow terminals via
                 # overflow="fold".
@@ -129,8 +123,8 @@ def register_notebook_commands(cli):
                             "created_at": nb.created_at.isoformat() if nb.created_at else None,
                         }
                     }
-                    # I12: when --use switched the active context, surface the
-                    # new active notebook id at the top level so callers can
+                    # When --use switched the active context, surface the new
+                    # active notebook id at the top level so callers can
                     # branch on the field without scraping the "Context set
                     # to ..." prose or round-tripping through `status --json`.
                     if switch_context:

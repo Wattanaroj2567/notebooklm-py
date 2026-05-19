@@ -1,7 +1,4 @@
-"""Tests for DownloadResult dataclass and _download_urls_batch return shape.
-
-Phase 1 / T1. See .sisyphus/plans/phase-1-implementation.md.
-"""
+"""Tests for DownloadResult dataclass and _download_urls_batch return shape."""
 
 from __future__ import annotations
 
@@ -57,6 +54,17 @@ def test_failed_preserves_url_and_exception():
     assert url == "https://example/x"
     assert err is exc
     assert isinstance(err, httpx.HTTPError)
+
+
+def test_artifacts_module_preserves_download_patch_targets():
+    """Private compatibility names remain available through _artifacts."""
+    import notebooklm._artifacts as artifacts_module
+
+    assert artifacts_module.DownloadResult is DownloadResult
+    assert artifacts_module.ArtifactDownloadError is not None
+    assert artifacts_module.load_httpx_cookies is not None
+    assert artifacts_module._mind_map is not None
+    assert artifacts_module.json.dump is not None
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +138,7 @@ async def test_download_batch_all_fail(mock_artifacts_api, tmp_path):
 
 @pytest.mark.asyncio
 async def test_download_batch_logs_warning_per_failure(mock_artifacts_api, tmp_path, caplog):
-    """Each failed URL emits a WARNING (Phase 0 redaction applies automatically)."""
+    """Each failed URL emits a WARNING (URL redaction applies automatically)."""
     api, _ = mock_artifacts_api
 
     success = _mock_response(b"ok")

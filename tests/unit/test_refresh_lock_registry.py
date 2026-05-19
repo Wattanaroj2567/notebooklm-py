@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from _fixtures import patch_auth_seam
 from notebooklm import auth as auth_mod
 
 
@@ -144,7 +145,7 @@ class TestResolvedPathEquivalence:
 
         # Force a refresh attempt and short-circuit downstream side effects.
         monkeypatch.setenv(auth_mod.NOTEBOOKLM_REFRESH_CMD_ENV, "dummy")
-        monkeypatch.setattr(auth_mod, "_get_refresh_lock", spy_get_refresh_lock)
+        patch_auth_seam(monkeypatch, "_get_refresh_lock", spy_get_refresh_lock)
 
         call_phase = {"first": True}
 
@@ -165,10 +166,10 @@ class TestResolvedPathEquivalence:
         def fake_snapshot(_j):
             return None
 
-        monkeypatch.setattr(auth_mod, "_fetch_tokens_with_jar", fake_fetch_tokens_with_jar)
-        monkeypatch.setattr(auth_mod, "_run_refresh_cmd", fake_run_refresh_cmd)
-        monkeypatch.setattr(auth_mod, "build_httpx_cookies_from_storage", fake_build)
-        monkeypatch.setattr(auth_mod, "snapshot_cookie_jar", fake_snapshot)
+        patch_auth_seam(monkeypatch, "_fetch_tokens_with_jar", fake_fetch_tokens_with_jar)
+        patch_auth_seam(monkeypatch, "_run_refresh_cmd", fake_run_refresh_cmd)
+        patch_auth_seam(monkeypatch, "build_httpx_cookies_from_storage", fake_build)
+        patch_auth_seam(monkeypatch, "snapshot_cookie_jar", fake_snapshot)
 
         async def drive(path: Path):
             jar = httpx.Cookies()
@@ -220,22 +221,40 @@ class TestWeakKeyDictionaryCleanup:
 
 
 class TestCrossLoopGenerationGuard:
-    def test_two_loops_one_refresh(self, monkeypatch, tmp_path):
+    def test_two_loops_at_most_two_refreshes(self, monkeypatch, tmp_path):
         """Two concurrent event loops both call ``_fetch_tokens_with_refresh``;
-        only ONE actual refresh command runs (the second is short-circuited
-        by the generation check guarded by ``_REFRESH_STATE_LOCK``).
+        AT MOST 2 subprocess invocations occur (each loop runs once at the
+        worst), and crucially BOTH calls succeed without raising.
 
         Race model: both loops observe an auth-expiry failure, each
         capture the same pre-refresh generation, each acquire their OWN
         per-loop asyncio lock (the registry hands out distinct locks per
         loop), then race the check-and-claim under ``_REFRESH_STATE_LOCK``.
-        Exactly one wins.
+
+        Legacy contract (before the gated-generation fix): this test
+        asserted ``run_count == 1`` because the old code bumped
+        ``_REFRESH_GENERATIONS`` EAGERLY pre-subprocess; the cross-loop
+        loser saw the bump and skipped. That eager-bump behavior was the
+        root cause of the phantom-bump failure — when the subprocess
+        failed, the bump fooled concurrent waiters into skipping with
+        stale storage.
+
+        Current contract (gated-generation fix): generation is bumped
+        ONLY after the subprocess succeeds. Cross-loop callers cannot
+        signal "in flight" to each other (``asyncio.Future`` is
+        loop-bound). In the rare
+        cross-loop-concurrent-refresh case both loops may run their own
+        subprocess — equivalent to two ``RotateCookies`` POSTs against
+        the same storage. The end-state is correct (fresh cookies on
+        disk; last writer wins, but both write the same fresh data).
+
+        For SAME-LOOP coalescing (the dominant real-world case), the
+        per-loop in-flight future ensures exactly-once subprocess
+        execution; see ``tests/integration/concurrency/test_refresh_cmd_race.py``.
 
         To force a deterministic race in a unit test, we use a barrier at
         the point AFTER both threads have captured the generation but
-        BEFORE either has entered the inner sync mutex. Without this
-        alignment, GIL scheduling could let the first thread complete its
-        entire refresh before the second even captures the generation.
+        BEFORE either has entered the inner sync mutex.
         """
         import httpx
 
@@ -303,11 +322,11 @@ class TestCrossLoopGenerationGuard:
         def wrapped_get_refresh_lock(p):
             return _BarrierLock(original_get_refresh_lock(p))
 
-        monkeypatch.setattr(auth_mod, "_run_refresh_cmd", fake_run_refresh_cmd)
-        monkeypatch.setattr(auth_mod, "_fetch_tokens_with_jar", fake_fetch_tokens_with_jar)
-        monkeypatch.setattr(auth_mod, "build_httpx_cookies_from_storage", fake_build_httpx_cookies)
-        monkeypatch.setattr(auth_mod, "snapshot_cookie_jar", fake_snapshot)
-        monkeypatch.setattr(auth_mod, "_get_refresh_lock", wrapped_get_refresh_lock)
+        patch_auth_seam(monkeypatch, "_run_refresh_cmd", fake_run_refresh_cmd)
+        patch_auth_seam(monkeypatch, "_fetch_tokens_with_jar", fake_fetch_tokens_with_jar)
+        patch_auth_seam(monkeypatch, "build_httpx_cookies_from_storage", fake_build_httpx_cookies)
+        patch_auth_seam(monkeypatch, "snapshot_cookie_jar", fake_snapshot)
+        patch_auth_seam(monkeypatch, "_get_refresh_lock", wrapped_get_refresh_lock)
 
         results: list[BaseException | tuple] = []
         results_lock = threading.Lock()
@@ -340,9 +359,18 @@ class TestCrossLoopGenerationGuard:
         for r in results:
             assert not isinstance(r, BaseException), f"Refresh raised: {r!r}"
 
-        # The critical assertion: only ONE actual refresh command ran across
-        # the two event loops sharing the storage path.
-        assert run_count == 1, (
-            f"Expected exactly 1 refresh across loops, observed {run_count}. "
-            "Cross-loop generation guard failed."
+        # The critical assertion under the gated-generation contract:
+        # AT MOST one subprocess invocation per loop (== 2 across two
+        # loops). Under the legacy eager-bump contract this asserted
+        # ``run_count == 1`` (cross-loop coalescing); the fix dropped
+        # eager-bump to close the phantom-bump failure mode, accepting
+        # that two cross-loop callers may both run their subprocess in
+        # the rare concurrent-refresh case (correct end-state: fresh
+        # cookies on disk).
+        assert 1 <= run_count <= 2, (
+            f"Expected 1–2 refresh invocations across loops, observed "
+            f"{run_count}. ``run_count == 0`` would mean the cross-loop "
+            "generation guard SKIPPED both refreshes (phantom-bump regression). "
+            "``run_count > 2`` means each loop ran refresh more than once "
+            "(per-loop coalescing broken)."
         )

@@ -190,10 +190,13 @@ def parse_chunked_response(response: str) -> list[Any]:
     Note:
         Malformed chunks are skipped with a warning logged. A byte-count line
         without a following payload is malformed. A byte-count mismatch is
-        logged but tolerated when the following payload is still valid JSON,
-        because recorded and proxy-transformed streams may not preserve Google's
-        original byte count. If the malformed-record rate exceeds 10%, raises
-        RPCError as this likely indicates API changes.
+        logged at DEBUG and tolerated when the following payload is still
+        valid JSON, because recorded and proxy-transformed streams may not
+        preserve Google's original byte count and live Google responses use a
+        different unit (likely UTF-16 code units) than ``len(s.encode("utf-8"))``.
+        A JSONDecodeError on the payload still emits a WARNING on the
+        subsequent parse-failure path. If the malformed-record rate exceeds
+        10%, raises RPCError as this likely indicates API changes.
     """
     if not response or not response.strip():
         return []
@@ -227,7 +230,9 @@ def parse_chunked_response(response: str) -> list[Any]:
             json_str = lines[i]
             actual_byte_count = len(json_str.encode("utf-8"))
             if actual_byte_count != byte_count:
-                logger.warning(
+                # DEBUG (not WARNING): live multi-chunk responses trip this on
+                # every chunk; see the Note: block in this function's docstring.
+                logger.debug(
                     "Chunk at line %d declares %d bytes but payload is %d bytes; "
                     "parsing valid JSON payload anyway. Preview: %s",
                     i + 1,
@@ -298,19 +303,28 @@ def collect_rpc_ids(chunks: list[Any]) -> list[str]:
     Returns:
         List of RPC method IDs found in the response.
     """
+    source = "decoder.collect_rpc_ids"
     found_ids = []
     for chunk in chunks:
         if not isinstance(chunk, list):
             continue
 
-        items = chunk if (chunk and isinstance(chunk[0], list)) else [chunk]
+        # Preserve the truthy short-circuit on an empty chunk so safe_index
+        # (which would raise under NOTEBOOKLM_STRICT_DECODE=1) is only called
+        # when the index is structurally valid.
+        if not chunk:
+            continue
+        first = safe_index(chunk, 0, method_id=None, source=source)
+        items = chunk if isinstance(first, list) else [chunk]
 
         for item in items:
             if not isinstance(item, list) or len(item) < 2:
                 continue
 
-            if item[0] in ("wrb.fr", "er") and isinstance(item[1], str):
-                found_ids.append(item[1])
+            tag = safe_index(item, 0, method_id=None, source=source)
+            rpc_id = safe_index(item, 1, method_id=None, source=source)
+            if tag in ("wrb.fr", "er") and isinstance(rpc_id, str):
+                found_ids.append(rpc_id)
 
     return found_ids
 
@@ -352,18 +366,28 @@ def _find_wrb_status(chunks: list[Any], rpc_id: str) -> tuple[int, str] | None:
     Used by ``decode_response`` to enrich the null-result error message when
     the server explicitly flagged the RPC with a status code.
     """
+    source = "decoder._find_wrb_status"
     for chunk in chunks:
         if not isinstance(chunk, list):
             continue
-        items = chunk if (chunk and isinstance(chunk[0], list)) else [chunk]
+        # Skip empty chunks before safe_index, which would raise under
+        # NOTEBOOKLM_STRICT_DECODE=1 on an out-of-bounds descent.
+        if not chunk:
+            continue
+        first = safe_index(chunk, 0, method_id=rpc_id, source=source)
+        items = chunk if isinstance(first, list) else [chunk]
         for item in items:
             if not isinstance(item, list) or len(item) < 6:
                 continue
-            if item[0] != "wrb.fr" or item[1] != rpc_id:
+            tag = safe_index(item, 0, method_id=rpc_id, source=source)
+            id_field = safe_index(item, 1, method_id=rpc_id, source=source)
+            if tag != "wrb.fr" or id_field != rpc_id:
                 continue
-            if item[2] is not None or item[5] is None:
+            result_data = safe_index(item, 2, method_id=rpc_id, source=source)
+            error_info = safe_index(item, 5, method_id=rpc_id, source=source)
+            if result_data is not None or error_info is None:
                 continue
-            status = _extract_status_code(item[5])
+            status = _extract_status_code(error_info)
             if status is not None:
                 return status
     return None
@@ -393,18 +417,27 @@ def _contains_user_displayable_error(obj: Any) -> bool:
 
 def extract_rpc_result(chunks: list[Any], rpc_id: str) -> Any:
     """Extract result data for a specific RPC ID from chunks."""
+    source = "decoder.extract_rpc_result"
     for chunk in chunks:
         if not isinstance(chunk, list):
             continue
 
-        items = chunk if (chunk and isinstance(chunk[0], list)) else [chunk]
+        # Skip empty chunks before safe_index, which would raise under
+        # NOTEBOOKLM_STRICT_DECODE=1 on an out-of-bounds descent.
+        if not chunk:
+            continue
+        first = safe_index(chunk, 0, method_id=rpc_id, source=source)
+        items = chunk if isinstance(first, list) else [chunk]
 
         for item in items:
             if not isinstance(item, list) or len(item) < 3:
                 continue
 
-            if item[0] == "er" and item[1] == rpc_id:
-                error_code = item[2] if len(item) > 2 else None
+            tag = safe_index(item, 0, method_id=rpc_id, source=source)
+            id_field = safe_index(item, 1, method_id=rpc_id, source=source)
+
+            if tag == "er" and id_field == rpc_id:
+                error_code = safe_index(item, 2, method_id=rpc_id, source=source)
 
                 # Try to get human-readable message for integer error codes
                 if isinstance(error_code, int):
@@ -425,13 +458,14 @@ def extract_rpc_result(chunks: list[Any], rpc_id: str) -> Any:
                     rpc_code=error_code,
                 )
 
-            if item[0] == "wrb.fr" and item[1] == rpc_id:
-                result_data = item[2]
+            if tag == "wrb.fr" and id_field == rpc_id:
+                result_data = safe_index(item, 2, method_id=rpc_id, source=source)
 
                 # Check for embedded UserDisplayableError when result is null
                 # This indicates rate limiting, quota exceeded, or other API restrictions
-                if result_data is None and len(item) > 5 and item[5] is not None:
-                    if _contains_user_displayable_error(item[5]):
+                if result_data is None and len(item) > 5:
+                    error_info = safe_index(item, 5, method_id=rpc_id, source=source)
+                    if error_info is not None and _contains_user_displayable_error(error_info):
                         raise RateLimitError(
                             "API rate limit or quota exceeded. Please wait before retrying.",
                             method_id=rpc_id,

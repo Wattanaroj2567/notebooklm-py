@@ -1,6 +1,6 @@
 """Unit tests for ``ArtifactsAPI._download_url`` httpx-error wrapping.
 
-These tests pin the T3.F contract: every httpx failure (auth, generic HTTP,
+These tests pin the contract: every httpx failure (auth, generic HTTP,
 timeout, connection error) is surfaced as :class:`ArtifactDownloadError`,
 never as a raw ``httpx`` subclass. 401/403 carry an explicit
 ``Authentication required ... try `notebooklm login``` hint plus the
@@ -10,6 +10,7 @@ never as a raw ``httpx`` subclass. 401/403 carry an explicit
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -101,7 +102,7 @@ def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
 
 
 class TestDownloadUrlErrorWrapping:
-    """Pin T3.F: httpx errors become ArtifactDownloadError."""
+    """Pin the contract that httpx errors become ArtifactDownloadError."""
 
     @pytest.mark.asyncio
     async def test_happy_path_returns_output_path(self, mock_artifacts_api):
@@ -242,3 +243,39 @@ class TestDownloadUrlErrorWrapping:
             assert exc_info.value.status_code is None
             assert "Network error" in str(exc_info.value)
             assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_write_removes_temp_file(self, mock_artifacts_api, tmp_path):
+        """Cancelled streaming writes must not leave the mkstemp temp file behind."""
+        api = mock_artifacts_api
+        output_path = tmp_path / "file.mp4"
+        response = _build_mock_response(content=b"partial media payload")
+        client_patch, cookies_patch = _patch_httpx_client(response)
+
+        original_to_thread = asyncio.to_thread
+        write_started = asyncio.Event()
+        release_write = asyncio.Event()
+
+        async def controlled_to_thread(func, /, *args, **kwargs):
+            if getattr(func, "__name__", "") == "write":
+                write_started.set()
+                await release_write.wait()
+            return await original_to_thread(func, *args, **kwargs)
+
+        with (
+            client_patch,
+            cookies_patch,
+            patch("notebooklm._artifact_downloads.asyncio.to_thread", controlled_to_thread),
+        ):
+            task = asyncio.create_task(
+                api._download_url("https://storage.googleapis.com/file.mp4", str(output_path))
+            )
+            await asyncio.wait_for(write_started.wait(), timeout=1)
+            task.cancel()
+            release_write.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert not output_path.exists()
+        assert list(tmp_path.glob("file.mp4.*.tmp")) == []

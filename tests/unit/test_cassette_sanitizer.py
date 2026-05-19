@@ -2,17 +2,17 @@
 
 Coverage map:
 
-1. Structural display-name scrub (PR-T5.E) — positive + negative cases on
+1. Structural display-name scrub — positive + negative cases on
    ``tests/vcr_config.scrub_string``.
 2. Two-Capitalized-word source title regression — confirms we don't reintroduce
    the broad ``>[A-Z][a-z]+\\s[A-Z][a-z]+<`` pattern that would clobber legit
    fixture content.
-3. Broadened email scrub (PR-T5.E) — positive + idempotency.
-4. The Python guard ``tests/scripts/check_cassettes_clean.py`` (T8.A5a):
+3. Broadened email scrub — positive + idempotency.
+4. The Python guard ``tests/scripts/check_cassettes_clean.py``:
    - exits 0 on clean cassettes
    - exits 1 on email / cookie-header / JSON-key / storage_state leaks
    - explicit ``SCRUB_PLACEHOLDERS`` allowlist (NOT a "starts with S"
-     heuristic) — closes I7
+     heuristic) — closes the cookie-leak gap
    - accepts the ``SCRUBBED`` sentinel in all three cookie shapes
    - honors the repair allowlist by default; ``--strict`` disables it
    - emits ``file:line`` for every leak
@@ -43,7 +43,7 @@ REGRESSION_FIXTURE = TESTS_DIR / "fixtures" / "bad_cassettes" / "bad_sid_startin
 
 
 # ---------------------------------------------------------------------------
-# Structural display-name scrub (PR-T5.E)
+# Structural display-name scrub
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +125,7 @@ def test_two_capital_word_in_html_text_not_scrubbed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Broadened email scrub (PR-T5.E)
+# Broadened email scrub
 # ---------------------------------------------------------------------------
 
 
@@ -176,8 +176,42 @@ def test_email_scrub_negative_unrelated_text() -> None:
     assert scrub_string(text) == text
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Public provider (already covered, kept here as regression baseline).
+        "https://notebooklm.google.com/path?authuser=alice%40gmail.com&rt=c",
+        # Workspace / custom domain — the leak class the round-2 scrubber widening
+        # closes. Provider-anchored detection would miss this.
+        "https://notebooklm.google.com/path?authuser=alice%40company.com&rt=c",
+        # Plus-aliased local part, custom domain. URL-encoded ``+`` arrives as
+        # ``%2B`` in the wire form.
+        "https://notebooklm.google.com/path?authuser=alice%2Btag%40corp.example.io&rt=c",
+        # Multi-dot subdomain TLD.
+        "https://notebooklm.google.com/path?authuser=ops%40eng.corp.example.co.uk&rt=c",
+    ],
+)
+def test_authuser_email_scrubbed_for_any_domain(url: str) -> None:
+    """``?authuser=<email>`` URL params get scrubbed regardless of provider.
+
+    Pins the round-2 scrubber widening: anchoring on ``authuser=`` (not the
+    email's domain) is what prevents the Workspace / corporate email-leak
+    class. A regression that re-narrows the pattern to the public-provider
+    allowlist would fail this test.
+    """
+    scrubbed = scrub_string(url)
+    # The original email value is gone in every shape.
+    assert "alice" not in scrubbed
+    assert "ops" not in scrubbed
+    assert "company.com" not in scrubbed
+    assert "corp.example" not in scrubbed
+    # And the canonical placeholder is present with the URL-encoded ``%40`` shape
+    # so VCR's URL-match path still sees a well-formed ``authuser=`` value.
+    assert "authuser=SCRUBBED_EMAIL%40example.com" in scrubbed
+
+
 # ---------------------------------------------------------------------------
-# Python guard tool: ``tests/scripts/check_cassettes_clean.py`` (T8.A5a)
+# Python guard tool: ``tests/scripts/check_cassettes_clean.py``
 #
 # The guard is invoked as a subprocess so we exercise the real CLI entry
 # point — including argparse wiring, exit codes, and stdout/stderr.  It is
@@ -259,7 +293,7 @@ def test_python_guard_exits_one_on_storage_state_value_first(tmp_path: Path) -> 
 
 
 def test_python_guard_catches_sid_starting_with_s(tmp_path: Path) -> None:
-    """Regression for I7 — a real cookie value starting with ``S`` is a leak.
+    """Regression: a real cookie value starting with ``S`` is a leak.
 
     The old bash guard's ``[^S"][^"]*`` capture rejected any value whose
     first byte was ``S``, which silently allowed a real session token that
@@ -326,8 +360,16 @@ def test_python_guard_skips_allowlisted_basename(tmp_path: Path) -> None:
     assert "0 cassettes scanned" in result.stdout
 
 
-def test_python_guard_strict_flag_disables_allowlist(tmp_path: Path) -> None:
-    """``--strict`` re-arms the guard against allow-listed cassettes."""
+def test_python_guard_strict_flag_fails_on_nonempty_allowlist(tmp_path: Path) -> None:
+    """``--strict`` fails with exit 1 if the repair allowlist is non-empty (P1-5).
+
+    Strict mode is the one-way ratchet against the allowlist growing past
+    the cleanup phase. The guard exits before scanning any cassettes so the
+    operator sees a clear actionable error message naming each lingering
+    entry. (Before P1-5, ``--strict`` merely disabled the allowlist for
+    skip purposes and reported leaks per-cassette; the new behaviour is
+    strictly more conservative.)
+    """
     cassette = tmp_path / "leak_in_allowlist.yaml"
     cassette.write_text('{"email":"realname@gmail.com"}\n')
     allowlist = tmp_path / "allowlist.txt"
@@ -339,7 +381,80 @@ def test_python_guard_strict_flag_disables_allowlist(tmp_path: Path) -> None:
         str(cassette),
     )
     assert result.returncode == 1
+    assert "--strict requires the allowlist to be empty" in result.stdout
+    # The lingering entry is listed by basename so the operator can act on it.
+    assert "leak_in_allowlist.yaml" in result.stdout
+
+
+def test_python_guard_strict_flag_passes_on_empty_allowlist(tmp_path: Path) -> None:
+    """``--strict`` with an empty (or all-comment) allowlist scans normally.
+
+    Companion to ``test_python_guard_strict_flag_fails_on_nonempty_allowlist``:
+    once the allowlist is cleared (the P1-5 end state) strict mode passes
+    through to the regular scan. A leak in the cassette is still reported
+    as ``Leak (email)`` and the exit code is 1.
+    """
+    cassette = tmp_path / "leak_in_allowlist.yaml"
+    cassette.write_text('{"email":"realname@gmail.com"}\n')
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("# header only, no entries\n")
+    result = _run_guard(
+        "--strict",
+        "--allowlist",
+        str(allowlist),
+        str(cassette),
+    )
+    assert result.returncode == 1
     assert "Leak (email)" in result.stdout
+
+
+def test_python_guard_recursive_flag_descends_into_subdirs(tmp_path: Path) -> None:
+    """``--recursive`` scans nested ``*.yaml`` files (P1-5).
+
+    A leak in ``tmp/sub/leak.yaml`` is invisible without ``--recursive`` and
+    flagged when the flag is on. The ``examples/`` exclusion is enforced via
+    a separate path filter — covered by
+    ``test_python_guard_recursive_skips_examples_subdir``.
+    """
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    cassette = nested / "leak.yaml"
+    cassette.write_text('{"email":"realname@gmail.com"}\n')
+
+    # Without --recursive, the nested file is invisible.
+    res_no_recurse = _run_guard(str(tmp_path))
+    assert res_no_recurse.returncode == 0
+    # No top-level cassettes means "no cassettes to scan" — the OK message.
+    assert "no cassettes" in res_no_recurse.stdout
+
+    # With --recursive, the nested file is scanned and the leak surfaces.
+    res_recurse = _run_guard("--recursive", str(tmp_path))
+    assert res_recurse.returncode == 1
+    assert "Leak (email)" in res_recurse.stdout
+
+
+def test_python_guard_recursive_skips_examples_subdir(tmp_path: Path) -> None:
+    """``--recursive`` skips any file under an ``examples/`` directory (P1-5).
+
+    Example fixtures carry placeholder cookies and YAML formatting quirks
+    that look like leaks under the scanner but aren't real secrets — the
+    scanner filters them by directory name. Explicit-path scans still hit
+    them (the operator asked by name).
+    """
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    cassette = examples / "example_leak.yaml"
+    cassette.write_text('{"email":"realname@gmail.com"}\n')
+
+    # Recursive directory scan should skip the ``examples/`` file entirely.
+    res_recurse = _run_guard("--recursive", str(tmp_path))
+    assert res_recurse.returncode == 0
+    assert "0 cassettes scanned" in res_recurse.stdout or "no cassettes" in res_recurse.stdout
+
+    # But an explicit file path still scans it — the operator opted in.
+    res_explicit = _run_guard(str(cassette))
+    assert res_explicit.returncode == 1
+    assert "Leak (email)" in res_explicit.stdout
 
 
 def test_python_guard_exits_zero_when_no_cassettes_found(tmp_path: Path) -> None:
@@ -367,24 +482,24 @@ def test_python_guard_repo_allowlist_is_explicit_basename_list() -> None:
         if line.strip() and not line.strip().startswith("#")
     }
     # Spec-explicit entries that must always be in the allowlist while
-    # phase-2 repair is outstanding.
-    # ``sources_add_file.yaml`` is NOT in this required-set anymore — it was
-    # repaired in T8.B4 (the audit's I17 upload-token leak scrubbed in place).
-    # ``sources_add_drive.yaml`` + ``sources_check_freshness_drive.yaml`` are
-    # NOT in this required-set anymore — they were repaired in T8.B5 (the
-    # audit's I17 Drive AONS-token leak scrubbed in place).
-    # ``example_httpbin_{get,post}.yaml`` are NOT in this required-set anymore —
-    # they were deleted in T8.B7 (the audit's I-misc origin-IP leak was in
-    # illustrative VCR fixtures, not real NotebookLM cassettes).
+    # cassette repair is outstanding.
+    # ``sources_add_file.yaml`` is NOT in this required-set anymore — it
+    # was repaired (upload-token leak scrubbed in place).
+    # ``sources_add_drive.yaml`` + ``sources_check_freshness_drive.yaml``
+    # are NOT in this required-set anymore — they were repaired (Drive
+    # AONS-token leak scrubbed in place).
+    # ``example_httpbin_{get,post}.yaml`` are NOT in this required-set
+    # anymore — they were deleted (the origin-IP leak was in illustrative
+    # VCR fixtures, not real NotebookLM cassettes).
     # ``chat_ask.yaml`` + ``chat_ask_with_references.yaml`` are NOT in this
-    # required-set anymore — they were re-recorded in T8.B2 against the
-    # current 9-param streaming-chat builder (C3 stale-shape regression).
-    # ``artifacts_revise_slide.yaml`` is NOT in this required-set anymore —
-    # it was repaired in T8.B1 (re-recorded so f.req carries a real
-    # urlencoded JSON payload with only sensitive scalars scrubbed inside).
-    # ``sharing_get_status.yaml`` + ``sharing_set_public.yaml`` are NOT in
-    # this required-set anymore — they were re-scrubbed in T8.B3.
-    # With all phase-2 cassette repairs landed, this loop has nothing to
-    # assert; future regressions would re-introduce entries here.
+    # required-set anymore — they were re-recorded against the current
+    # 9-param streaming-chat builder (stale-shape regression).
+    # ``artifacts_revise_slide.yaml`` is NOT in this required-set anymore
+    # — it was repaired (re-recorded so f.req carries a real urlencoded
+    # JSON payload with only sensitive scalars scrubbed inside).
+    # ``sharing_get_status.yaml`` + ``sharing_set_public.yaml`` are NOT
+    # in this required-set anymore — they were re-scrubbed.
+    # With all cassette repairs landed, this loop has nothing to assert;
+    # future regressions would re-introduce entries here.
     for required in ():
         assert required in entries, f"missing required allowlist entry: {required}"

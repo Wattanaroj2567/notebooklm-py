@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -18,8 +18,15 @@ jobs:
   health-check:
     name: RPC Health Check
     runs-on: ubuntu-latest
-    # Only run on main repo (not forks) due to secrets requirement
-    if: github.repository == 'teng-lin/notebooklm-py'
+    # Secret-bearing job. The scheduled cron canary must keep running without
+    # human-in-the-loop approval (it's the whole point of the canary), but
+    # `workflow_dispatch` runs are human-initiated and may originate from
+    # non-maintainers — those go through the `protected-readonly` GitHub
+    # Environment, which requires maintainer approval before secrets unlock.
+    # An empty environment string means "no environment association" (GHA
+    # treats falsy expressions as unset), so schedule runs are unaffected.
+    # See docs/development.md → "Workflow secret gates".
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'protected-readonly' || '' }}
 
     steps:
     - uses: actions/checkout@v6
@@ -30,10 +37,14 @@ jobs:
         python-version: "3.12"
         cache: 'pip'
 
+    - name: Install uv
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # @ v7.0.0
+
     - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e .
+      # `uv sync --frozen` reproduces the lockfile-pinned dep tree. The RPC
+      # health script (`scripts/check_rpc_health.py`) only needs the core
+      # runtime deps — no `[browser]`/`[dev]`/`[markdown]` extras required.
+      run: uv sync --frozen
 
     - name: Run RPC Health Check
       id: health
@@ -45,36 +56,127 @@ jobs:
         NOTEBOOKLM_GENERATION_NOTEBOOK_ID: ${{ secrets.NOTEBOOKLM_GENERATION_NOTEBOOK_ID }}
       run: |
         set +e
-        python scripts/check_rpc_health.py --full 2>&1 | tee health-report.txt
+        uv run python scripts/check_rpc_health.py --full 2>&1 | tee health-report.txt
         exit_code=${PIPESTATUS[0]}
         echo "exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
-        exit $exit_code
+        exit "$exit_code"
+
+    - name: Scrub secrets from health-report.txt
+      # Defence-in-depth: the script itself avoids printing credential-shaped
+      # data, but raw response bodies and exception tracebacks can still
+      # surface session/CSRF/cookie material on regressions. We re-run the
+      # report through ``notebooklm._logging.scrub_secrets`` before any
+      # downstream consumer reads it (Add Summary, Create Issue on …,
+      # Upload Report). Idempotent — safe to re-apply on subsequent runs.
+      if: always()
+      shell: bash
+      run: |
+        if [ ! -f health-report.txt ]; then
+          echo "::warning::health-report.txt not produced; skipping scrub."
+          exit 0
+        fi
+        uv run python - <<'PY'
+        from pathlib import Path
+        from notebooklm._logging import scrub_secrets
+
+        report = Path("health-report.txt")
+        original = report.read_text(encoding="utf-8", errors="replace")
+        scrubbed = scrub_secrets(original)
+        if scrubbed != original:
+            report.write_text(scrubbed, encoding="utf-8")
+            # ``abs`` because replacement tokens (``***``) may be longer
+            # OR shorter than the redacted secret depending on the
+            # pattern, so the raw delta can be negative; the magnitude
+            # is what's interesting for sanity-checking the scrub.
+            print(
+                f"Scrubbed health-report.txt "
+                f"(delta {abs(len(original) - len(scrubbed))} chars)."
+            )
+        else:
+            print("No secret-shaped substrings detected in health-report.txt.")
+        PY
 
     - name: Add Summary
       if: always()
       shell: bash
       run: |
-        echo "## RPC Health Check Results" >> $GITHUB_STEP_SUMMARY
-        grep -A 10 "^SUMMARY$" health-report.txt >> $GITHUB_STEP_SUMMARY || echo "No summary found" >> $GITHUB_STEP_SUMMARY
+        echo "## RPC Health Check Results" >> "$GITHUB_STEP_SUMMARY"
+        grep -A 10 "^SUMMARY$" health-report.txt >> "$GITHUB_STEP_SUMMARY" || echo "No summary found" >> "$GITHUB_STEP_SUMMARY"
+
+    # Each issue-creating step is paired with a dedup probe that counts
+    # open issues sharing the same title + automated label. Without this,
+    # back-to-back failing runs (manual reruns, cron + workflow_dispatch)
+    # farm one fresh issue per run instead of letting the open one
+    # accumulate context.
+    - name: Check for existing RPC Mismatch issue
+      if: steps.health.outputs.exit_code == '1'
+      id: dup_mismatch
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if ! count=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+          --state open --label automated --label rpc-breakage \
+          --search 'in:title "RPC ID Mismatch Detected"' \
+          --json number --jq 'length'); then
+          echo "::warning::RPC mismatch dedup probe failed; allowing issue creation"
+          count=0
+        fi
+        echo "open=${count}" >> "$GITHUB_OUTPUT"
 
     - name: Create Issue on RPC Mismatch
-      if: steps.health.outputs.exit_code == '1'
-      uses: peter-evans/create-issue-from-file@v6
+      if: |
+        steps.health.outputs.exit_code == '1'
+        && steps.dup_mismatch.outputs.open == '0'
+      uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710  # @ v6.0.0
       with:
         title: "RPC ID Mismatch Detected"
         content-filepath: health-report.txt
         labels: bug, rpc-breakage, automated
 
-    - name: Create Issue on Auth Failure
+    - name: Check for existing Auth Failure issue
       if: steps.health.outputs.exit_code == '2'
-      uses: peter-evans/create-issue-from-file@v6
+      id: dup_auth
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if ! count=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+          --state open --label automated \
+          --search 'in:title "RPC Health Check: Authentication Failure"' \
+          --json number --jq 'length'); then
+          echo "::warning::Auth failure dedup probe failed; allowing issue creation"
+          count=0
+        fi
+        echo "open=${count}" >> "$GITHUB_OUTPUT"
+
+    - name: Create Issue on Auth Failure
+      if: |
+        steps.health.outputs.exit_code == '2'
+        && steps.dup_auth.outputs.open == '0'
+      uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710  # @ v6.0.0
       with:
         title: "RPC Health Check: Authentication Failure"
         content-filepath: health-report.txt
         labels: bug, automated
 
-    - name: Extract failing methods for ERROR issue
+    - name: Check for existing non-transient ERROR issue
       if: steps.health.outputs.exit_code == '3'
+      id: dup_error
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if ! count=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+          --state open --label automated --label rpc-error \
+          --search 'in:title "RPC Health Check: Non-transient ERROR detected"' \
+          --json number --jq 'length'); then
+          echo "::warning::Non-transient ERROR dedup probe failed; allowing issue creation"
+          count=0
+        fi
+        echo "open=${count}" >> "$GITHUB_OUTPUT"
+
+    - name: Extract failing methods for ERROR issue
+      if: |
+        steps.health.outputs.exit_code == '3'
+        && steps.dup_error.outputs.open == '0'
       id: error_details
       shell: bash
       run: |
@@ -101,8 +203,10 @@ jobs:
         } > error-issue-body.md
 
     - name: Create Issue on Non-transient ERROR
-      if: steps.health.outputs.exit_code == '3'
-      uses: peter-evans/create-issue-from-file@v6
+      if: |
+        steps.health.outputs.exit_code == '3'
+        && steps.dup_error.outputs.open == '0'
+      uses: peter-evans/create-issue-from-file@fca9117c27cdc29c6c4db3b86c48e4115a786710  # @ v6.0.0
       with:
         title: "RPC Health Check: Non-transient ERROR detected"
         content-filepath: error-issue-body.md

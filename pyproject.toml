@@ -29,7 +29,7 @@ classifiers = [
 dependencies = [
     "httpx>=0.27.0,<0.29",
     "click>=8.0.0,<9",
-    "rich>=13.0.0,<15",
+    "rich>=13.0.0,<16",
     "filelock>=3.13,<4",
 ]
 
@@ -50,12 +50,14 @@ dev = [
     "pytest-cov>=4.0.0,<8",
     "pytest-rerunfailures>=14.0,<17",
     "pytest-timeout>=2.3.0,<3",
+    "pytest-xdist>=3.6.0,<4",
     "python-dotenv>=1.0.0,<2",
-    "mypy>=1.0.0,<2",
+    "mypy>=1.0.0,<3",
     "pre-commit>=4.5.1,<5",
-    "ruff==0.15.12",
+    "ruff==0.15.13",
     "tomli>=2.0.0,<3; python_version < '3.11'",  # for tests/unit/test_install_docs.py on Python 3.10 (tomllib is 3.11+)
     "vcrpy>=6.0.0,<9",
+    "packaging>=23.0,<27",  # for tests/unit/test_version_gate.py (PEP 440 version parsing)
 ]
 # `all` deliberately excludes `cookies` — rookiepy has install issues on Python 3.13+
 # (see CHANGELOG [0.4.1]). Opt in explicitly via `pip install "notebooklm-py[cookies]"`.
@@ -112,6 +114,9 @@ markers = [
     "variants: parameter variant tests (skip to save quota)",
     "readonly: read-only tests against user's test notebook",
     "vcr: tests using VCR.py recorded cassettes (run with NOTEBOOKLM_VCR_RECORD=1 to record)",
+    "no_keepalive_disable: opt a VCR test out of the global NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1 autouse fixture in tests/integration/conftest.py",
+    "allow_no_vcr: opt a tests/integration/ test out of the integration-tree enforcement hook; use for mock-only tests that legitimately live under tests/integration/",
+    "characterization: behavior-pinning unit tests that lock in current observable contracts and would be too synthetic to cassette-back",
 ]
 
 [tool.coverage.run]

@@ -16,34 +16,42 @@ import pytest
 
 from notebooklm._artifacts import ArtifactsAPI
 from notebooklm._chat import ChatAPI
-from notebooklm.auth import AuthTokens
 from notebooklm.exceptions import ValidationError
 from notebooklm.rpc import InfographicStyle, VideoFormat, VideoStyle
 
 
 @pytest.fixture
-def auth_tokens():
-    return AuthTokens(
-        cookies={"SID": "test"},
-        csrf_token="test_csrf",
-        session_id="test_session",
-    )
-
-
-@pytest.fixture
-def mock_core():
+def mock_core(monkeypatch):
     """Create a mock ClientCore.
 
-    After Tier-2 T2.D, ``ChatAPI.ask`` goes through ``core.query_post`` and
-    ``core.next_reqid`` instead of the legacy direct ``post`` / counter
-    mutation. Tests that need to assert on URL or body now drive
-    ``query_post`` via its ``build_request`` factory rather than poking the
-    raw httpx client.
+    After the D2 cutover, ``ChatAPI.ask`` calls
+    :func:`notebooklm._chat_transport.chat_aware_authed_post` (not
+    ``core.query_post``). Tests that need to assert on the chat URL or
+    body patch ``chat_aware_authed_post`` at the
+    ``notebooklm._chat.chat_aware_authed_post`` binding so the
+    ``build_request`` factory runs against a frozen snapshot.
     """
     from notebooklm._core import _AuthSnapshot
 
     core = MagicMock()
-    core.rpc_call = AsyncMock()
+
+    # ``ChatAPI.get_conversation_id`` uses ``core.rpc_call`` with the
+    # ``hPTbtc`` (GET_LAST_CONVERSATION_ID) method. Issue #659: after a
+    # new-conversation ask, ``ChatAPI.ask`` calls this to recover the real
+    # conversation_id. Route only that method to a hPTbtc-shaped reply;
+    # every other RPC honors ``mock_core.rpc_call.return_value`` so the
+    # artifact tests in this module (which set ``return_value`` per call)
+    # are unaffected.
+    from notebooklm.rpc import RPCMethod as _RPC
+
+    core.rpc_call = AsyncMock(return_value=MagicMock())
+
+    async def _rpc_call_dispatch(method, params, **kwargs):
+        if method == _RPC.GET_LAST_CONVERSATION_ID:
+            return [[["mock-core-conv-id"]]]
+        return core.rpc_call.return_value
+
+    core.rpc_call.side_effect = _rpc_call_dispatch
     core.get_source_ids = AsyncMock(return_value=[])
     core.auth = MagicMock()
     core.auth.csrf_token = "test_csrf"
@@ -54,16 +62,16 @@ def mock_core():
     # ``_reqid_counter`` attribute remains for backwards-compat assertions.
     core._reqid_counter = 0
     core.next_reqid = AsyncMock(return_value=100000)
+    core.bound_loop = None
     core.get_http_client = MagicMock()
-    core.get_cached_conversation = MagicMock(return_value=[])
-    core.cache_conversation_turn = MagicMock()
 
-    # Default ``query_post`` stub: invokes the caller-supplied
-    # ``build_request`` factory with a frozen snapshot (so the URL/body the
-    # test wants to assert on actually gets assembled) and returns a stock
-    # answer response. Individual tests that need to inspect the URL/body
-    # can read ``core._last_chat_request`` after calling ``ChatAPI.ask``.
-    async def _query_post_default(*, build_request, parse_label):
+    # Default ``chat_aware_authed_post`` stub: invokes the caller-supplied
+    # ``build_request`` factory with a frozen snapshot (so the URL/body
+    # the test wants to assert on actually gets assembled) and returns a
+    # stock answer response. Individual tests that need to inspect the
+    # URL/body can read ``core._last_chat_request`` after calling
+    # ``ChatAPI.ask``.
+    async def _chat_aware_authed_post_default(core_arg, *, build_request, parse_label):
         snapshot = _AuthSnapshot(
             csrf_token=core.auth.csrf_token,
             session_id=core.auth.session_id,
@@ -73,12 +81,27 @@ def mock_core():
         url, body, headers = build_request(snapshot)
         core._last_chat_request = {"url": url, "body": body, "headers": headers}
         resp = MagicMock()
-        inner = json.dumps([["Default answer long enough to be valid.", None, None, None, [1]]])
+        # ``first[2][0]`` carries the server-assigned conversation_id; new
+        # conversations require this slot (issue #659).
+        inner = json.dumps(
+            [
+                [
+                    "Default answer long enough to be valid.",
+                    None,
+                    ["server-source-selection-conv", 12345],
+                    None,
+                    [1],
+                ]
+            ]
+        )
         chunk = json.dumps([["wrb.fr", None, inner]])
         resp.text = f")]}}'\n{len(chunk)}\n{chunk}\n"
         return resp
 
-    core.query_post = AsyncMock(side_effect=_query_post_default)
+    # Track call counts so tests can assert on transport invocation.
+    chat_post_mock = AsyncMock(side_effect=_chat_aware_authed_post_default)
+    monkeypatch.setattr("notebooklm._chat.chat_aware_authed_post", chat_post_mock)
+    core._chat_aware_authed_post_mock = chat_post_mock
     return core
 
 
@@ -86,7 +109,7 @@ def mock_core():
 def mock_notes_api():
     """Placeholder for the legacy ``ArtifactsAPI(core, notes_api)`` signature.
 
-    After T6.F, ``ArtifactsAPI`` no longer reads ``notes_api`` (it consumes
+    After the mind-map relocation, ``ArtifactsAPI`` no longer reads ``notes_api`` (it consumes
     the shared ``_mind_map`` module directly). The arg is still accepted for
     backward compatibility and immediately discarded inside ``__init__``, so
     this fixture intentionally returns a bare mock — no method stubs, since
@@ -114,7 +137,7 @@ class TestChatSourceSelection:
 
         assert result.answer == "Default answer long enough to be valid."
 
-        # query_post is the transport entry point; the request body is
+        # chat_aware_authed_post is the transport entry point; the request body is
         # captured into ``_last_chat_request`` by the mock_core fixture.
         body = mock_core._last_chat_request["body"]
 
@@ -154,9 +177,9 @@ class TestChatSourceSelection:
             source_ids=["s1", "s2", "s3"],
         )
 
-        # query_post should have been called once with a build_request factory
+        # chat_aware_authed_post should have been called once with a build_request factory
         # that produces the URL-encoded body with the triple-nested sources.
-        mock_core.query_post.assert_called_once()
+        mock_core._chat_aware_authed_post_mock.assert_called_once()
         body = mock_core._last_chat_request["body"]
 
         # The body contains URL-encoded f.req parameter
@@ -583,7 +606,7 @@ class TestArtifactsSourceSelection:
         # Verify get_source_ids was called
         mock_core.get_source_ids.assert_called_once_with("nb_123")
 
-        # After T6.F, ``generate_mind_map`` also drives the CREATE_NOTE +
+        # After the mind-map relocation, ``generate_mind_map`` also drives the CREATE_NOTE +
         # UPDATE_NOTE calls itself (previously delegated to NotesAPI), so
         # rpc_call is invoked three times. The source-encoding assertion
         # targets the GENERATE_MIND_MAP call specifically.

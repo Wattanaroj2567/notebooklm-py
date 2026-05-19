@@ -4,21 +4,31 @@ Provides operations for creating, updating, listing, and deleting
 user-created notes in notebooks. Notes are distinct from artifacts -
 they are user-created content, not AI-generated.
 
-Mind-map-related RPC primitives live in :mod:`_mind_map` and are shared
-with :class:`ArtifactsAPI`. This module exposes them through the
+Mind-map-related service behavior lives in :mod:`_mind_map` and is shared
+with :class:`ArtifactsAPI`. This module exposes it through the
 historical ``NotesAPI`` method surface for backward compatibility.
 """
 
 import builtins
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 from . import _mind_map
-from ._core import ClientCore
-from .rpc import RPCMethod
-from .types import Note
+from ._capabilities import CoreRPCProvider
+from .types import AskResult, Note
 
 logger = logging.getLogger(__name__)
+
+
+class _NotesCore(CoreRPCProvider, Protocol):
+    """Narrow per-sub-client view of the core required by :class:`NotesAPI`.
+
+    Co-located with the sub-client that consumes it (per ADR-002). Inherits
+    only the single capability NotesAPI actually uses: ``rpc_call`` (from
+    :class:`CoreRPCProvider`).
+    """
+
+    pass
 
 
 class NotesAPI:
@@ -38,13 +48,24 @@ class NotesAPI:
             await client.notes.delete(notebook_id, note.id)
     """
 
-    def __init__(self, core: ClientCore):
+    def __init__(
+        self,
+        core: _NotesCore,
+        *,
+        mind_map_service: _mind_map.MindMapService | None = None,
+    ):
         """Initialize the notes API.
 
         Args:
             core: The core client infrastructure.
+            mind_map_service: Optional private service for note-backed
+                mind-map and note-row operations. Keyword-only so the public
+                positional constructor contract stays unchanged.
         """
         self._core = core
+        self._mind_map_service = (
+            _mind_map.MindMapService(core) if mind_map_service is None else mind_map_service
+        )
 
     async def list(self, notebook_id: str) -> list[Note]:
         """List all text notes in the notebook.
@@ -69,8 +90,7 @@ class NotesAPI:
                 continue
 
             content = self._extract_content(item)
-            is_mind_map = content and ('"children":' in content or '"nodes":' in content)
-            if not is_mind_map:
+            if not self._mind_map_service.is_mind_map_content(content):
                 notes.append(self._parse_note(item, notebook_id))
 
         return notes
@@ -107,7 +127,68 @@ class NotesAPI:
         Returns:
             The created Note object.
         """
-        return await _mind_map.create_note(self._core, notebook_id, title=title, content=content)
+        return await self._mind_map_service.create_note(
+            notebook_id,
+            title=title,
+            content=content,
+        )
+
+    async def create_from_chat(
+        self,
+        notebook_id: str,
+        ask_result: AskResult,
+        *,
+        title: str | None = None,
+    ) -> Note:
+        """Save a chat answer as a citation-rich note (issue #660).
+
+        Unlike :meth:`create`, this preserves the ``[N]`` citation
+        markers as interactive hover-anchored references in the
+        NotebookLM web UI. It mirrors the wire format the web UI's
+        "Save to note" button uses.
+
+        The notebook must already have a streaming-chat response in
+        ``ask_result`` with non-empty ``references``. Callers without
+        citations should fall back to :meth:`create` for plain-text
+        notes — this method raises :class:`ValueError` rather than
+        silently degrading to plain text, so the caller can decide.
+
+        Args:
+            notebook_id: The notebook ID.
+            ask_result: Result from a prior ``client.chat.ask()`` call.
+                Must have non-empty ``references`` — otherwise this
+                method raises ``ValueError``.
+            title: Note title. When ``None`` (default), a title is
+                derived from the first 50 characters of the answer.
+                The NotebookLM server may apply smart-title generation
+                for saved-from-chat notes; the returned ``Note.title``
+                reflects what the server actually stored.
+
+        Returns:
+            The created ``Note``. ``Note.content`` holds the answer
+            text WITH ``[N]`` markers; the rich citation anchors live
+            server-side and surface via the NotebookLM web UI.
+
+        Raises:
+            ValueError: If ``ask_result.references`` is empty.
+        """
+        if not ask_result.references:
+            raise ValueError(
+                "create_from_chat requires AskResult.references to be "
+                "non-empty; use notes.create() for plain-text notes."
+            )
+        resolved_title = (
+            title
+            if title is not None
+            else f"Chat: {ask_result.answer[:50].strip().replace(chr(10), ' ')}"
+        )
+        return await _mind_map.save_chat_answer_as_note(
+            self._core,
+            notebook_id,
+            ask_result.answer,
+            ask_result.references,
+            resolved_title,
+        )
 
     async def update(
         self,
@@ -124,7 +205,7 @@ class NotesAPI:
             content: The new content.
             title: The new title.
         """
-        await _mind_map.update_note(self._core, notebook_id, note_id, content, title)
+        await self._mind_map_service.update_note(notebook_id, note_id, content, title)
 
     async def delete(self, notebook_id: str, note_id: str) -> bool:
         """Delete a note from the notebook.
@@ -140,14 +221,7 @@ class NotesAPI:
             True if deletion succeeded.
         """
         logger.debug("Deleting note %s from notebook %s", note_id, notebook_id)
-        params = [notebook_id, None, [note_id]]
-        await self._core.rpc_call(
-            RPCMethod.DELETE_NOTE,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        return True
+        return await self._mind_map_service.delete_note(notebook_id, note_id)
 
     async def list_mind_maps(self, notebook_id: str) -> builtins.list[Any]:
         """List all mind maps in the notebook.
@@ -166,7 +240,7 @@ class NotesAPI:
         Returns:
             List of raw mind map data.
         """
-        return await _mind_map.list_mind_maps(self._core, notebook_id)
+        return await self._mind_map_service.list_mind_maps(notebook_id)
 
     async def delete_mind_map(self, notebook_id: str, mind_map_id: str) -> bool:
         """Delete a mind map from the notebook.
@@ -178,14 +252,7 @@ class NotesAPI:
         Returns:
             True if deletion succeeded.
         """
-        params = [notebook_id, None, [mind_map_id]]
-        await self._core.rpc_call(
-            RPCMethod.DELETE_NOTE,
-            params,
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        return True
+        return await self._mind_map_service.delete_note(notebook_id, mind_map_id)
 
     # =========================================================================
     # Private Helpers
@@ -193,7 +260,7 @@ class NotesAPI:
 
     async def _get_all_notes_and_mind_maps(self, notebook_id: str) -> builtins.list[Any]:
         """Fetch all notes and mind maps from the API."""
-        return await _mind_map.fetch_all_notes_and_mind_maps(self._core, notebook_id)
+        return await self._mind_map_service.fetch_all_notes_and_mind_maps(notebook_id)
 
     def _is_deleted(self, item: builtins.list[Any]) -> bool:
         """Check if a note/mind map item is deleted (status=2).
@@ -207,11 +274,11 @@ class NotesAPI:
         Returns:
             True if the item is deleted (soft-deleted with status=2).
         """
-        return _mind_map.is_deleted(item)
+        return self._mind_map_service.is_deleted(item)
 
     def _extract_content(self, item: builtins.list[Any]) -> str | None:
         """Extract content string from note/mind map item."""
-        return _mind_map.extract_content(item)
+        return self._mind_map_service.extract_content(item)
 
     def _parse_note(self, item: builtins.list[Any], notebook_id: str) -> Note:
         """Parse a raw note item into a Note object."""

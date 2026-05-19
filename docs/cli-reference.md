@@ -1,7 +1,7 @@
 # CLI Reference
 
 **Status:** Active
-**Last Updated:** 2026-05-15 (T6 Part C)
+**Last Updated:** 2026-05-15
 
 Complete command reference for the `notebooklm` CLI—providing full programmatic access to all NotebookLM features, including capabilities not exposed in the web UI.
 
@@ -119,12 +119,13 @@ See [Configuration](configuration.md) for full env-var precedence and CI/CD setu
 | `ask -` | Read question from stdin (Unix `-` convention) | `echo "what is X?" \| notebooklm ask -` |
 | `ask --prompt-file PATH` | Read question from file (use `-` for stdin) | `notebooklm ask --prompt-file q.txt` |
 | `ask -c <id>` | Continue a specific conversation | `notebooklm ask -c conv_abc "..."` |
-| `ask --new` | Start fresh (skip auto-resume of last conversation) | `notebooklm ask --new "ignore last"` |
+| `ask --new` | **DESTRUCTIVE.** Permanently delete the notebook's current server-side conversation (turns are not recoverable) and start fresh on the next `ask`. Prompts for confirmation with the conversation's short id; pass `--yes`/`-y` to skip the prompt. `--json` implies `--yes` so scripted callers don't hang on stdin. Closes the workaround documented in [#659](https://github.com/teng-lin/notebooklm-py/issues/659). | `notebooklm ask --new -y "start fresh"` |
+| `ask --new --yes` (alias `-y`) | Skip the `--new` destructive-delete confirmation prompt. | `notebooklm ask --new --yes "..."` |
 | `ask -s <id>` | Limit to specific source IDs (repeatable) | `notebooklm ask "Summarize" -s src1 -s src2` |
 | `ask --json` | Get answer with source references | `notebooklm ask "Explain X" --json` |
 | `ask --timeout N` | Per-invocation HTTP timeout in seconds (default: library default 30s) | `notebooklm ask "long prompt" --timeout 120` |
-| `ask --save-as-note` | Save response as a note | `notebooklm ask "Explain X" --save-as-note` |
-| `ask --save-as-note --note-title` | Save response with custom note title | `notebooklm ask "Explain X" --save-as-note --note-title "Title"` |
+| `ask --save-as-note` | Save response as a note. When the answer contains `[N]` citations, the saved note preserves interactive hover-anchored citation links matching the NotebookLM web UI's "Save to note" behavior ([issue #660](https://github.com/teng-lin/notebooklm-py/issues/660)). Answers without citations fall back to a plain-text note. | `notebooklm ask "Explain X" --save-as-note` |
+| `ask --save-as-note --note-title` | Save response with custom note title. The NotebookLM server may apply smart-title generation for citation-rich saves and override the requested title; the success message reflects what the server actually stored. | `notebooklm ask "Explain X" --save-as-note --note-title "Title"` |
 | `configure --mode` | Set predefined chat mode (`default`, `learning-guide`, `concise`, `detailed`) | `notebooklm configure --mode learning-guide` |
 | `configure --persona` | Set custom persona prompt (up to 10,000 chars) | `notebooklm configure --persona "Act as a tutor"` |
 | `configure --response-length` | Response verbosity (`default`, `longer`, `shorter`) | `notebooklm configure --response-length longer` |
@@ -259,7 +260,7 @@ Every `download` subcommand accepts the same selection / safety / output flag se
 
 All `note` subcommands also accept `-n/--notebook ID`.
 
-> **`source get` / `artifact get` / `note get` exit `1` on not-found (BREAKING, landed in Phase 3).** All three `get` commands now exit `1` when the requested ID does not resolve to an existing item, matching the rest of the CLI's user-error convention. Under `--json` the failure body is the standard typed error envelope (`{"error": true, "code": "NOT_FOUND", "message": "...", "id": "...", "notebook_id": "..."}`); without `--json` the message is written to stderr. The previous behavior was exit `0` with a "not found" line on stdout. The pre-existing "no partial-ID match" branch (raised by `_resolve_partial_id` as a `ClickException`) was already exit `1` and is unchanged. See [CLI Exit-Code Convention → C1](cli-exit-codes.md#c1--get-on-not-found-exits-1-was-0--landed-in-phase-3) for migration guidance.
+> **`source get` / `artifact get` / `note get` exit `1` on not-found (BREAKING).** All three `get` commands now exit `1` when the requested ID does not resolve to an existing item, matching the rest of the CLI's user-error convention. Under `--json` the failure body is the standard typed error envelope (`{"error": true, "code": "NOT_FOUND", "message": "...", "id": "...", "notebook_id": "..."}`); without `--json` the message is written to stderr. The previous behavior was exit `0` with a "not found" line on stdout. The pre-existing "no partial-ID match" branch (raised by `_resolve_partial_id` as a `ClickException`) was already exit `1` and is unchanged. See [CLI Exit-Code Convention](cli-exit-codes.md#get-on-not-found-exits-1-was-0--landed) for migration guidance.
 
 ### Metadata Command
 
@@ -348,7 +349,7 @@ By default, opens a Chromium browser with a persistent profile. Complete the Goo
 **Options:**
 - `--storage PATH` - Where to save storage_state.json (default: `$NOTEBOOKLM_HOME/profiles/<profile>/storage_state.json`)
 - `--browser [chromium|msedge|chrome]` - Browser to use for login (default: `chromium`). Use `chrome` for system Google Chrome (workaround when bundled Chromium crashes, e.g. macOS 15+); use `msedge` for Microsoft Edge. **Note:** only `chromium` is auto-installed by the CLI on first login (~170 MB Chromium download); `--browser msedge` and `--browser chrome` require the corresponding browser to be already installed on your system.
-- `--browser-cookies <auto|chrome|edge|firefox|safari|brave|arc|...>` - Read cookies from an installed browser instead of launching Playwright. Pass an explicit browser name, or `auto` to let rookiepy auto-detect. For Firefox Multi-Account Containers, use `firefox::<container-name>` to extract from a single container, or `firefox::none` for the no-container default — unscoped `firefox` merges every container's cookies (and emits a warning when that's happening). Requires `pip install "notebooklm-py[cookies]"` (full extras matrix: [docs/installation.md#optional-extras-matrix](installation.md#optional-extras-matrix)).
+- `--browser-cookies <auto|chrome|edge|firefox|safari|brave|arc|...>` - Read cookies from an installed browser instead of launching Playwright. Pass an explicit browser name, or `auto` to let rookiepy auto-detect. For Chromium-family user profiles, use `chrome::<profile-name-or-directory>` (for example `chrome::Profile 1` or `brave::Work`) to extract from one profile explicitly. For Firefox Multi-Account Containers, use `firefox::<container-name>` to extract from a single container, or `firefox::none` for the no-container default — unscoped `firefox` merges every container's cookies (and emits a warning when that's happening). Requires `pip install "notebooklm-py[cookies]"` (full extras matrix: [docs/installation.md#optional-extras-matrix](installation.md#optional-extras-matrix)).
 - `--account EMAIL` - Pick a signed-in Google account by email when several are present in the browser. Only valid with `--browser-cookies`.
 - `--all-accounts` - Extract every Google account signed in to the browser into separate profiles named from each account email. Only valid with `--browser-cookies`.
 - `--profile-name NAME` - Name the profile created by a targeted `--account` import. Defaults to the account email's local part. Only valid with `--browser-cookies`.
@@ -365,6 +366,7 @@ notebooklm login --browser msedge
 
 # Reuse cookies from your already-logged-in Chrome session
 notebooklm login --browser-cookies chrome
+notebooklm login --browser-cookies 'chrome::Profile 1'  # one Chromium profile
 
 # Auto-detect any supported browser via rookiepy
 notebooklm login --browser-cookies auto
@@ -388,8 +390,9 @@ notebooklm login --fresh
 
 **Notes on `--browser-cookies`:**
 - Honors `--profile` / `NOTEBOOKLM_PROFILE` and writes to that profile's `storage_state.json`.
-- Without `--account` or `--all-accounts`, imports the browser's default Google account into the target profile.
-- Use `notebooklm auth inspect --browser <browser>` to see available account emails before a targeted import.
+- Without `--account` or `--all-accounts`, imports the selected browser/profile's default Google account into the target profile.
+- For Chromium-family browsers, unscoped `chrome`, `brave`, `edge`, etc. fan out across populated user profiles when account selection is needed. Use `chrome::<profile-name-or-directory>` to read exactly one profile; directory names such as `Default` and `Profile 1` are stable across UI renames.
+- Use `notebooklm auth inspect --browser <browser>` to see available account emails before a targeted import; pass `-v` to show the Chromium profile directory each account came from.
 
 ### Session: `use`
 
@@ -593,7 +596,7 @@ notebooklm auth refresh [OPTIONS]
 ```
 
 **Options:**
-- `--browser-cookies <browser>`, `--browser-cookie <browser>` - Re-extract cookies from an installed browser and match the current profile's account from `context.json`. This repairs account routing when browser account order changes after another account logs out.
+- `--browser-cookies <browser>`, `--browser-cookie <browser>` - Re-extract cookies from an installed browser and match the current profile's account from `context.json`. This repairs account routing when browser account order changes after another account logs out. Accepts the same scoped syntax as `login`: `chrome::<profile-name-or-directory>` for one Chromium profile, and `firefox::<container-name>` or `firefox::none` for one Firefox container.
 - `--include-domains LABEL[,LABEL...]` - Forward to the browser-cookie reader (only meaningful with `--browser-cookies`). Same syntax as `notebooklm login --include-domains`.
 - `--quiet`, `-q` - Suppress success output; print only on error (cron-friendly)
 
@@ -615,6 +618,7 @@ notebooklm --profile work auth refresh
 
 # Re-extract from Chrome and repair account routing if browser account order changed
 notebooklm --profile work auth refresh --browser-cookies chrome
+notebooklm --profile work auth refresh --browser-cookies 'chrome::Profile 1'
 
 # Quiet variant for cron / systemd
 notebooklm --profile work auth refresh --quiet
@@ -628,20 +632,21 @@ See [Troubleshooting](troubleshooting.md) for full per-OS scheduler recipes (lau
 
 ### Authentication: `auth inspect`
 
-List Google accounts visible to a browser's cookie store. **Read-only — never writes to disk.** Use this before `notebooklm login --browser-cookies <browser> --account <email>` to see which account emails are available.
+List Google accounts visible to a browser's cookie store. **Read-only — never writes to disk.** Use this before `notebooklm login --browser-cookies <browser> --account <email>` to see which account emails are available. Chromium-family browsers fan out across populated user profiles by default; use `chrome::<profile-name-or-directory>` to inspect only one profile.
 
 ```bash
 notebooklm auth inspect [OPTIONS]
 ```
 
 **Options:**
-- `--browser TEXT` - Browser to read cookies from (`chrome`, `firefox`, `brave`, `edge`, `safari`, `arc`, ...). `auto` picks the first one rookiepy can read. Requires `pip install "notebooklm-py[cookies]"`.
+- `--browser TEXT` - Browser to read cookies from (`chrome`, `firefox`, `brave`, `edge`, `safari`, `arc`, ...). `auto` picks the first one rookiepy can read. Use `chrome::<profile-name-or-directory>` for one Chromium profile, or `firefox::<container-name>` / `firefox::none` for one Firefox container. Requires `pip install "notebooklm-py[cookies]"`.
 - `--include-domains LABEL[,LABEL...]` - Opt in to enumerating accounts via sibling-product cookies (same syntax as `notebooklm login --include-domains`). By default this command consults only required Google auth cookies, which is sufficient for account discovery on every tested path.
 - `--json` - Output as JSON
 
 **Examples:**
 ```bash
 notebooklm auth inspect --browser chrome
+notebooklm auth inspect --browser 'chrome::Profile 1' --json
 notebooklm auth inspect --browser firefox --json
 ```
 
@@ -683,7 +688,7 @@ echo 'source ~/.notebooklm-complete.bash' >> ~/.bashrc
 notebooklm completion fish > ~/.config/fish/completions/notebooklm.fish
 ```
 
-**ID-aware tab completion (P7.T1 / M1):** Once the script is installed, `-n/--notebook`, `-s/--source`, and `-a/--artifact` complete from the active profile's live IDs:
+**ID-aware tab completion:** Once the script is installed, `-n/--notebook`, `-s/--source`, and `-a/--artifact` complete from the active profile's live IDs:
 
 ```bash
 notebooklm ask -n <TAB>            # lists notebook IDs (filtered by what you've typed)

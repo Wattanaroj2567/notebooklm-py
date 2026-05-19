@@ -10,17 +10,19 @@ import asyncio
 import click
 
 from ..client import NotebookLMClient
-from .helpers import (
+from .auth_runtime import with_client
+from .options import notebook_option
+from .rendering import (
     console,
     display_report,
     display_research_sources,
-    import_research_sources,
     json_output_response,
+)
+from .research_import import import_research_sources
+from .resolve import (
     require_notebook,
     resolve_notebook_id,
-    with_client,
 )
-from .options import notebook_option
 
 # UI-only cap for the research summary preview shown in `research status` /
 # `research wait`. Unlike RPC error previews (see
@@ -151,10 +153,18 @@ def research_wait(
             task_id = None
 
             async def _poll_loop() -> bool:
-                """Poll until completion or terminal state; returns True on success."""
+                """Poll until completion or terminal state; returns True on success.
+
+                Once the first poll identifies a task_id, subsequent polls pin
+                to that specific task via the ``task_id`` discriminator. This
+                guards the wait loop against the cross-wire bug where a second
+                research task started mid-wait (e.g. by a concurrent caller
+                or a retry) could substitute its results into ``status`` /
+                ``sources`` and mis-attribute provenance on import.
+                """
                 nonlocal status, task_id
                 for _ in range(max_iterations):
-                    status = await client.research.poll(nb_id_resolved)
+                    status = await client.research.poll(nb_id_resolved, task_id=task_id)
                     status_val = status.get("status", "unknown")
 
                     if status_val == "completed":
@@ -168,6 +178,13 @@ def research_wait(
                         else:
                             console.print("[red]No research running[/red]")
                         raise SystemExit(1)
+
+                    # Pin to the discovered task_id on subsequent iterations.
+                    # The first in-progress poll is unambiguous if only one
+                    # task is in flight; on the next iteration we have a
+                    # concrete discriminator from the wire.
+                    if task_id is None:
+                        task_id = status.get("task_id")
 
                     await asyncio.sleep(interval)
 

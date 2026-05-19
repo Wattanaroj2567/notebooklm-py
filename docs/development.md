@@ -23,13 +23,18 @@ src/notebooklm/
 ├── types.py             # Dataclasses and type definitions
 ├── _core.py             # Core HTTP/RPC infrastructure
 ├── _notebooks.py        # NotebooksAPI implementation
+├── _notebook_metadata.py # Private notebook metadata composition service
 ├── _sources.py          # SourcesAPI implementation
+├── _source_*.py         # Private source services
 ├── _artifacts.py        # ArtifactsAPI implementation
+├── _artifact_*.py       # Private artifact services
 ├── _chat.py             # ChatAPI implementation
 ├── _research.py         # ResearchAPI implementation
 ├── _notes.py            # NotesAPI implementation
+├── _mind_map.py         # Private note-backed mind-map service
 ├── _settings.py         # SettingsAPI implementation
 ├── _sharing.py          # SharingAPI implementation
+├── _sharing_manager.py  # Private legacy notebook share-link service
 ├── rpc/                 # RPC protocol layer
 │   ├── __init__.py
 │   ├── types.py         # RPCMethod enum and constants
@@ -59,6 +64,7 @@ src/notebooklm/
 ┌───────────────────────────▼─────────────────────────────────┐
 │                      Client Layer                           │
 │  NotebookLMClient → NotebooksAPI, SourcesAPI, ArtifactsAPI  │
+│       private services compose cross-facade behavior         │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -78,8 +84,75 @@ src/notebooklm/
 |-------|-------|----------------|
 | **CLI** | `cli/*.py` | User commands, input validation, Rich output |
 | **Client** | `client.py`, `_*.py` | High-level Python API, returns typed dataclasses |
-| **Core** | `_core.py` | HTTP client, request counter, RPC abstraction |
+| **Core** | `_core.py`, `_core_*.py` | `ClientCore` orchestrator + seam-module helpers (HTTP client lifecycle, RPC dispatch, metrics, drain bookkeeping, request-id counter, auth refresh, conversation cache, polling registry, cookie persistence) |
 | **RPC** | `rpc/*.py` | Protocol encoding/decoding, method IDs |
+
+#### Core-layer seam modules
+
+The `Core` layer is split across `_core.py` (orchestrator) and a family of
+single-responsibility `_core_*.py` helper modules. Each helper exposes a
+Protocol-shim host interface so it can be unit-tested against a stub `ClientCore`:
+
+| Module | Class | Responsibility |
+|---|---|---|
+| `_core.py` | `ClientCore` | Orchestrator owning the `httpx.AsyncClient` + `AuthTokens`; module-level constants and re-exports; error-injection seam (`_SyntheticErrorTransport`, `_get_error_injection_mode`) used by `_core_transport`'s retry loops via `httpx.AsyncBaseTransport` wrapping. |
+| `_core_metrics.py` | `ClientMetrics` | `ClientMetricsSnapshot` counters, queue-wait recorders, `on_rpc_event` async callback. |
+| `_core_drain.py` | `TransportDrainTracker` | In-flight transport counters, `_TransportOperationToken`, lazy `asyncio.Condition` powering `client.drain(...)`. |
+| `_core_reqid.py` | `ReqidCounter` | Monotonic `_reqid` counter for chat backend (baseline 100000, step 100000). |
+| `_core_auth.py` (Phase 2 in progress) | `AuthRefreshCoordinator` | Refresh-task lifecycle, refresh lock, `_AuthSnapshot` rotation. |
+| `_core_lifecycle.py` (Phase 2 in progress) | `ClientLifecycle` | Loop-affinity guard, `aclose` plumbing, keepalive task wiring. |
+| `_core_rpc.py` | `RpcExecutor` | RPC dispatch executor with `DecodeResponse` + `RpcOwner` Protocols. |
+| `_core_transport.py` | `AuthedTransport` | Authed HTTP POST path, retry loops (429 + 5xx). |
+| `_core_cache.py` | `ConversationCache` | Per-instance LRU conversation cache for `ChatAPI` continuity. |
+| `_core_polling.py` | `PollRegistry` | Pending-poll registry shared by long-running artifact generations. |
+| `_core_cookie_persistence.py` | `CookiePersistence` | Cookie-jar → storage-state serialization, `__Secure-1PSIDTS` rotation. |
+
+The capability surface that sub-clients depend on is pinned in
+`notebooklm._capabilities` via 9 narrow Protocols (`CoreRPCProvider`,
+`SourceListProvider`, `CoreReqIdProvider`, `ChatStreamingProvider`,
+`PollRegistryProvider`, `AuthRouteProvider`, `CookieJarProvider`,
+`TransportOperationProvider`, `UploadConcurrencyProvider`), composed into
+the concrete `ClientCoreCapabilities` adapter. Adding or removing a
+method on `ClientCore` is a Protocol change — review `_capabilities.py`
+alongside any change to the orchestrator's public method surface.
+
+Private service modules sit inside the client layer but below the public
+facades. They own cross-facade composition without importing sibling facades:
+`_notebook_metadata.py` composes notebook metadata through a narrow source
+lister, `_sharing_manager.py` owns legacy `SHARE_ARTIFACT` link behavior, and
+`_mind_map.py` owns note-backed mind-map rows shared by notes and artifacts.
+Facade modules keep the public method surface stable and delegate to these
+services.
+
+### Boundary Guardrails
+
+The architecture tests encode the current layer contract:
+
+- `tests/unit/test_public_shims.py` has a documented public import manifest.
+  When a docs change adds or removes a supported import path, update the
+  manifest in the same PR so public API drift is intentional and reviewable.
+- `tests/unit/test_cli_boundary.py` parses `src/notebooklm/cli/**/*.py` and
+  rejects CLI imports from `notebooklm._*`, `notebooklm.rpc.*`, or `_private`
+  names exposed by public modules. Promote needed symbols through a public
+  facade (`notebooklm.types`, `notebooklm.auth`, `notebooklm.research`, etc.)
+  before using them from the CLI.
+- Auth internals may move under `notebooklm._auth` during architecture work,
+  but first-party callers continue to import through `notebooklm.auth`. The
+  compatibility manifest in `tests/unit/test_public_shims.py` enforces the
+  current first-party surface for that move; it is not a broader public API
+  decision, and removing a listed name needs a separate deprecation plan.
+- `tests/unit/test_init_order.py` records the temporary baseline of feature
+  APIs that still access `ClientCore` private state directly. Future capability
+  migration PRs should reduce that baseline as private state moves behind
+  explicit `ClientCore` methods; do not add new entries unless the PR also
+  explains the follow-up migration path.
+- `tests/unit/test_init_order.py` also guards the notebook-composition
+  boundaries: `NotebookLMClient` constructs `SourcesAPI` before `NotebooksAPI`
+  and passes it through the legacy `sources_api=` slot; notebook metadata
+  services must not import or construct `SourcesAPI`; artifact/source/notebook
+  composition services must not runtime-import facade APIs or `ClientCore`.
+  Add new private services to those guard lists when they take ownership of
+  cross-facade behavior.
 
 ### Key Design Decisions
 
@@ -307,8 +380,9 @@ Run the setup script once per Google account that records cassettes:
 uv run python tests/scripts/setup-generation-notebook.py
 ```
 
-The script is idempotent: it reuses an existing notebook titled
-`VCR Generation Notebook (Tier 8)` if one already exists, otherwise creates it.
+The script is idempotent: it reuses the notebook whose title matches
+`GENERATION_NOTEBOOK_TITLE` (defined in `tests/scripts/setup-generation-notebook.py`)
+if one already exists, otherwise creates it.
 It prints the notebook UUID and an `export` line. Copy the export line into
 your maintainer environment (e.g. `~/.zshrc` or a profile-specific `.env`
 file you do NOT commit):
@@ -331,8 +405,89 @@ emails, and other sensitive patterns before the cassette hits disk. Verify
 the result with the cassette guard before committing:
 
 ```bash
-# Current guard (a Python replacement is landing in the Tier 8 arc)
+# Current guard (a Python replacement is planned)
 tests/check_cassettes_clean.sh
+```
+
+#### Synthetic error cassettes
+
+> [!WARNING]
+> **Error cassettes generated through this plumbing are SYNTHETIC.** They
+> validate the client's exception-mapping branches (`RateLimitError`,
+> `ServerError`, the auth-refresh path), NOT Google's actual error response
+> shapes. If you need to validate a real-world error shape, capture a live
+> recording instead — these synthetic shapes are intentionally minimal.
+
+The `NOTEBOOKLM_VCR_RECORD_ERRORS` env var opts a recording session into
+substituting the next outgoing batchexecute RPC with a synthetic error
+response. Three modes are supported:
+
+| Mode            | HTTP status | Maps to                                         |
+|-----------------|-------------|-------------------------------------------------|
+| `429`           | 429         | `RateLimitError` (after retry budget exhausted) |
+| `5xx`           | 500         | `ServerError`   (after retry budget exhausted) |
+| `expired_csrf`  | 400         | auth-refresh path (NotebookLM uses 400, not 401)|
+
+The plumbing has three opt-in layers:
+
+1. **Env var**: `NOTEBOOKLM_VCR_RECORD_ERRORS=<mode>` activates the transport
+   wrapper inside `ClientCore.open()`.
+2. **Pytest marker**: `@pytest.mark.synthetic_error("<mode>")` sets the env
+   var for the duration of a single test (auto-reverted on teardown).
+3. **Filename prefix**: cassettes recorded under this mode MUST be named
+   `error_synthetic_<mode>_<slug>.yaml` — use
+   `tests.cassette_patterns.synthetic_error_cassette_name(mode, slug)` to
+   build the filename so reviewers can tell synthetic shapes apart from
+   real recordings at a glance.
+
+Example recording session (this is the workflow a maintainer uses to
+record the actual error cassettes — the transport-wrapper module itself
+ships only the plumbing):
+
+```bash
+NOTEBOOKLM_VCR_RECORD=1 \
+NOTEBOOKLM_VCR_RECORD_ERRORS=429 \
+  uv run pytest tests/integration/test_error_cassettes.py::test_rate_limit_records
+```
+
+Production behavior is unchanged when `NOTEBOOKLM_VCR_RECORD_ERRORS` is
+unset — the transport wrapper is only constructed when the env var resolves
+to a recognized mode, and a typo'd value resolves to `None` (the recording
+session continues without substitution).
+
+### Per-method RPC coverage gate
+
+`tests/scripts/check_method_coverage.py` enforces, on every PR, that each
+member of `RPCMethod` has **both**:
+
+1. **A test reference** — at least one file under `tests/` (excluding the
+   gate script itself) mentions the enum member by its qualified name
+   (`RPCMethod.LIST_NOTEBOOKS`) OR by its raw RPC id string value
+   (`"wXbhsf"`).
+2. **A cassette covering the RPC id** — at least one cassette YAML under
+   `tests/cassettes/` contains the RPC id string in its body.
+
+The gate is a pure-text static check (no pytest, no network) and runs in the
+`quality` job of `test.yml`.
+
+**Adding a new `RPCMethod`?** Ship it with:
+- a unit or integration test that imports the enum member (or asserts on its
+  raw id), AND
+- at least one cassette whose recorded request/response body contains the
+  RPC id.
+
+**Pre-existing gaps.** A small `PREEXISTING_GAPS` set inside the script
+grandfathers methods that lacked coverage when the gate first landed
+(currently: `GET_INTERACTIVE_HTML`, `GET_SUGGESTED_REPORTS`,
+`IMPORT_RESEARCH`, `REFRESH_SOURCE`). The set is a **one-way ratchet** —
+it must not grow. When you backfill coverage for a grandfathered method,
+delete its entry from `PREEXISTING_GAPS` in the same PR. The gate prints a
+`NOTICE:` to stderr when a `PREEXISTING_GAPS` entry has acquired full
+coverage so maintainers see the prompt to remove it.
+
+```bash
+# Run locally before pushing changes that touch RPCMethod
+uv run python tests/scripts/check_method_coverage.py
 ```
 
 ### E2E Fixtures
@@ -467,6 +622,102 @@ The `RedactingFilter` preserves `record.exc_info` (the live exception object) so
 |------|-----------|
 | Refresh credentials | Every 1-2 weeks |
 | Check nightly results | Daily |
+
+### Workflow secret gates
+
+Every workflow that consumes user-provided secrets (`secrets.NOTEBOOKLM_AUTH_JSON`,
+`secrets.NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID`, `secrets.CLAUDE_CODE_OAUTH_TOKEN`, …)
+is wrapped in at least one of three gates so that a non-maintainer cannot exfiltrate
+credentials by dispatching a workflow on a feature branch:
+
+| Gate | Where | Mechanism |
+|------|-------|-----------|
+| `environment: protected-readonly` | Job-level | GitHub Environment with a required reviewer — secrets do not resolve until the maintainer approves the run. Use `${{ github.event_name == 'workflow_dispatch' && 'protected-readonly' \|\| '' }}` to require approval only on manual dispatch while leaving scheduled cron canaries unattended. |
+| `needs.<job>.outputs.is_standard == 'true'` | Step-level `if:` | Pin secret-using steps to standard branches (`main` / `develop` / scheduled cron). Non-standard branches skip the step outright — no secret values land in the runner env. |
+| `github.event.sender.login == 'teng-lin'` | Job-level `if:` | Pin webhook-triggered workflows (e.g. `claude.yml`) to a specific maintainer actor. Any other actor's trigger never reaches the secret-bearing steps. |
+
+`scripts/check_workflow_secret_gates.py` (wired into the `test.yml` quality job)
+asserts every workflow file in `.github/workflows/` satisfies at least one of
+the above gates for every `secrets.*` reference (except `secrets.GITHUB_TOKEN`,
+which is covered separately by `scripts/check_workflow_permissions.py`).
+
+#### One-time GitHub Environment setup
+
+The `protected-readonly` environment must be configured in the GitHub repository
+settings before any workflow that references it can run **with an approval gate**.
+
+> **Important — silent auto-creation**: GitHub Actions silently creates a
+> referenced environment that doesn't exist, with **no protection rules**, the
+> first time a workflow references it. A typo in the environment name (e.g.
+> `protectd-readonly`) or a never-configured environment would therefore
+> bypass maintainer approval at runtime even though the workflow YAML appears
+> to gate on it. The static checker `scripts/check_workflow_secret_gates.py`
+> pins the accepted environment names to an explicit allow-list
+> (`_APPROVED_ENVIRONMENTS`) to prevent typos from passing CI — but the
+> *runtime* gate still depends on the manual setup below being done correctly.
+> Verify by triggering a `workflow_dispatch` and confirming the run pauses at
+> "Waiting for review" before any secret is exposed.
+
+This is a manual UI/API step — Pull Requests cannot create environments on
+their own.
+
+1. Open the repository on GitHub and navigate to
+   **Settings → Environments → New environment**.
+2. Name the environment **`protected-readonly`** (exact spelling — the workflow
+   YAML files match this string verbatim, and the checker enforces the same
+   spelling).
+3. Under **Deployment protection rules**, enable **Required reviewers** and add
+   the maintainer GitHub account (e.g. `teng-lin`) to the reviewer list.
+4. Leave **Wait timer** at `0` minutes (manual approval is the gate; we don't
+   need a cool-down).
+5. Save. The environment is now ready; the next `workflow_dispatch` against
+   `verify-package.yml`, `verify-artifacts.yml`, `rpc-health.yml`, or
+   `nightly.yml` will pause at the maintainer-approval prompt before any
+   secret resolves.
+6. **Smoke-test the gate.** Dispatch one of the workflows above from a
+   non-maintainer account (or from the maintainer account if no second
+   account is available — the approval prompt should still fire) and
+   confirm the run pauses at "Waiting for review" instead of immediately
+   acquiring secrets. If the run does not pause, the environment was not
+   configured correctly; do not rely on the gate until this smoke-test
+   passes.
+
+For automation-driven setup (e.g. infrastructure-as-code), the same configuration
+can be applied via the GitHub REST API:
+
+```bash
+gh api -X PUT \
+  /repos/teng-lin/notebooklm-py/environments/protected-readonly \
+  -f 'wait_timer=0' \
+  -f 'reviewers[][type]=User' \
+  -F 'reviewers[][id]=<github-user-id-for-teng-lin>'
+```
+
+#### Adding a new secret-bearing workflow
+
+When introducing a workflow that touches `secrets.*`:
+
+1. Pick the gate shape that matches the trigger surface:
+   - `workflow_dispatch` only → job-level `environment: protected-readonly`.
+   - `workflow_dispatch` + `schedule` → conditional environment expression
+     (approve manual runs, leave cron unattended).
+   - Webhook-triggered (`issue_comment`, etc.) → job-level `if:` pinning
+     `sender.login` to the maintainer.
+   - Multi-branch CI (`push`, `pull_request`, nightly) → step-level `if:`
+     referencing an upstream `is_standard` output.
+2. Run `python scripts/check_workflow_secret_gates.py` locally to verify the
+   gate is recognised.
+3. If the new workflow references the `protected-readonly` environment for
+   the first time, **double-check the Environment exists** (see "One-time
+   GitHub Environment setup" above). GitHub Actions will **silently
+   auto-create** a referenced environment that doesn't exist, **with no
+   protection rules**, so a never-configured `protected-readonly`
+   environment would let the workflow run without any approval gate —
+   exactly the opposite of what the YAML implies. The static checker
+   rejects unapproved *names* via `_APPROVED_ENVIRONMENTS`, but it cannot
+   verify that GitHub-side configuration has actually been applied; that
+   verification is the maintainer's responsibility per the smoke-test
+   step in "One-time GitHub Environment setup".
 
 ### Troubleshooting CI/CD Auth
 

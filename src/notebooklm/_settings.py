@@ -2,13 +2,25 @@
 
 import logging
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Protocol
 
-from ._core import ClientCore
+from ._capabilities import CoreRPCProvider
 from .rpc import RPCMethod
 from .types import AccountLimits, AccountTier
 
 logger = logging.getLogger(__name__)
+
+
+class _SettingsCore(CoreRPCProvider, Protocol):
+    """Narrow per-sub-client view of the core required by :class:`SettingsAPI`.
+
+    Co-located with the sub-client that consumes it (per ADR-002). Inherits
+    only the single capability the settings RPCs use: ``rpc_call`` (from
+    :class:`CoreRPCProvider`).
+    """
+
+    pass
+
 
 _ACCOUNT_LIMITS_PATH = (0, 1)
 _NOTEBOOK_LIMIT_INDEX = 1
@@ -140,7 +152,7 @@ class SettingsAPI:
     _SET_LANGUAGE_PATH = (2, 4, 0)  # result[2][4][0]
     _GET_SETTINGS_PATH = (0, 2, 4, 0)  # result[0][2][4][0]
 
-    def __init__(self, core: ClientCore) -> None:
+    def __init__(self, core: _SettingsCore) -> None:
         """Initialize the settings API.
 
         Args:
