@@ -1,8 +1,4 @@
-"""Tests for notebooklm._logging — credential redaction and configuration.
-
-Phase 0 of the gap remediation plan. See .sisyphus/plans/phase-0-implementation.md
-for design rationale.
-"""
+"""Tests for notebooklm._logging — credential redaction and configuration."""
 
 from __future__ import annotations
 
@@ -517,3 +513,171 @@ def test_install_redaction_no_root_mutation(saved_external_logger, saved_root_lo
     # Target logger now has our marked handler.
     target = logging.getLogger("httpx_alt_test")
     assert any(getattr(h, "_notebooklm_redacting", False) for h in target.handlers)
+
+
+# ---------------------------------------------------------------------------
+# Fast-path gate (SECRET_FAST_PATH_TOKENS) — correctness + perf
+# ---------------------------------------------------------------------------
+
+
+def test_fast_path_tokens_are_lowercase():
+    """Tokens must be lowercase because the gate lowercases input.
+
+    Mixed-case tokens would never match (``"SID" in "...sid..."`` is False).
+    """
+    from notebooklm import _logging
+    from notebooklm._logging import SECRET_FAST_PATH_TOKENS
+
+    assert "SECRET_FAST_PATH_TOKENS" in _logging.__all__
+
+    for token in SECRET_FAST_PATH_TOKENS:
+        assert token == token.lower(), f"token {token!r} must be lowercase"
+
+
+def test_fast_path_tokens_cover_every_redaction_pattern():
+    """Every pattern in _REDACT_PATTERNS has at least one literal substring
+    present in SECRET_FAST_PATH_TOKENS (compared case-insensitively).
+
+    This is the load-bearing invariant of the fast-path: if a pattern's
+    anchor isn't covered, the gate would skip strings the regex would have
+    redacted, silently shrinking the redaction surface.
+    """
+    from notebooklm import _logging
+    from notebooklm._logging import SECRET_FAST_PATH_TOKENS
+
+    # Sample inputs known to trigger each pattern, paired with the lowercase
+    # token that covers them. Each entry MUST contain at least one fast-path
+    # token (case-insensitively) AND get rewritten by scrub_secrets.
+    samples = [
+        ("at=", "posted body at=SECRET_X&hl=en"),
+        ("f.sid", "url ?f.sid=ABC_DEF"),
+        ("_token=", "oauth body refresh_token=RT&access_token=AT&id_token=IT"),
+        ("code=", "oauth callback code=AUTH_X"),
+        ("sid", "cookie SID=v1; SAPISID=v2; HSID=v3"),
+        ("authorization", "Authorization: Bearer SECRET"),
+        ("cookie", "Cookie: jar=foo"),
+        ("set-cookie", "Set-Cookie: SID=fresh"),
+    ]
+    for required_token, text in samples:
+        assert required_token in SECRET_FAST_PATH_TOKENS, (
+            f"sample {text!r} requires token {required_token!r} in SECRET_FAST_PATH_TOKENS"
+        )
+        # Sanity: at least one token from the set appears in the lowercased input.
+        lowered = text.lower()
+        assert any(t in lowered for t in SECRET_FAST_PATH_TOKENS), (
+            f"sample {text!r} would be skipped by fast-path"
+        )
+        # And scrub_secrets actually redacts it.
+        scrubbed = _logging.scrub_secrets(text)
+        assert scrubbed != text, f"scrub_secrets did not change {text!r}"
+
+
+def test_fast_path_handles_case_insensitive_patterns():
+    """OAuth and Authorization patterns are IGNORECASE; the fast-path must
+    still trigger redaction when those anchors appear in non-canonical casing.
+
+    Regression for the Gemini-flagged case-sensitivity bug: a log line with
+    ``AUTHORIZATION: Bearer ...`` or ``Refresh_Token=...`` must NOT bypass.
+    """
+    from notebooklm._logging import scrub_secrets
+
+    cases = [
+        ("AUTHORIZATION: Bearer SECRET_A", "SECRET_A", "Bearer ***"),
+        ("authorization: bearer SECRET_B", "SECRET_B", "bearer ***"),
+        ("oauth Refresh_Token=RT_X&Code=CODE_X", "RT_X", "Refresh_Token=***"),
+        ("oauth Refresh_Token=RT_X&Code=CODE_X", "CODE_X", "Code=***"),
+        ("COOKIE: SID=alpha", "alpha", "COOKIE: ***"),
+        ("set-COOKIE: SID=beta", "beta", "set-COOKIE: ***"),
+    ]
+    for text, secret, must_contain in cases:
+        out = scrub_secrets(text)
+        assert secret not in out, f"{secret!r} leaked from {text!r}: got {out!r}"
+        assert must_contain in out, f"expected {must_contain!r} in scrubbed {text!r}: got {out!r}"
+
+
+def test_fast_path_skips_innocuous_messages_unchanged():
+    """A string with no fast-path token must round-trip through scrub_secrets."""
+    from notebooklm._logging import scrub_secrets
+
+    benign = "RPC LIST_NOTEBOOKS finished in 0.42s for nb_id=abc123 with 12 sources"
+    assert scrub_secrets(benign) is benign or scrub_secrets(benign) == benign
+
+
+def test_fast_path_bypass_skips_regex_patterns(monkeypatch):
+    """Fast-path must skip the expensive regex sweep for innocuous redactions.
+
+    This used to benchmark the speedup ratio, but timing assertions flap on
+    loaded CI. The deterministic invariant is the important part: no fast-path
+    token means no regex pattern is consulted; a token hit runs the full sweep.
+    """
+    from notebooklm import _logging
+
+    innocuous = (
+        "RPC finished in 0.42s for nb_id=abc123 with 12 sources; method=fetch req=ok latency_ms=420"
+    )
+    # Confirm the sample really has no fast-path token (otherwise the no-call
+    # assertion proves nothing). The gate compares lowercase to lowercase.
+    lowered = innocuous.lower()
+    assert not any(t in lowered for t in _logging.SECRET_FAST_PATH_TOKENS), (
+        "benchmark input must not contain any fast-path token"
+    )
+
+    class CountingPattern:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __repr__(self) -> str:
+            return f"CountingPattern(calls={self.calls})"
+
+        def sub(self, _replacement: str, text: str) -> str:
+            self.calls += 1
+            return text
+
+    counting_patterns = tuple(
+        (CountingPattern(), replacement) for _pattern, replacement in _logging._REDACT_PATTERNS
+    )
+    assert counting_patterns, "benchmark must install at least one counting pattern"
+    monkeypatch.setattr(_logging, "_REDACT_PATTERNS", counting_patterns)
+
+    assert _logging.scrub_secrets(innocuous) == innocuous
+    assert all(pattern.calls == 0 for pattern, _replacement in counting_patterns)
+
+    # Replace the gate predicate with one that reports a hit, forcing the full
+    # _REDACT_PATTERNS sweep. This proves the call-count check would catch a
+    # regression that accidentally removes the fast-path bypass.
+    # Use a token guaranteed to appear in the input.
+    monkeypatch.setattr(_logging, "SECRET_FAST_PATH_TOKENS", ("nb_id",))
+    assert any(t in innocuous for t in _logging.SECRET_FAST_PATH_TOKENS)
+    assert _logging.scrub_secrets(innocuous) == innocuous
+    assert all(pattern.calls == 1 for pattern, _replacement in counting_patterns)
+
+
+def test_fast_path_still_redacts_when_token_present():
+    """Belt-and-suspenders: a string containing a fast-path token must still
+    flow through the full regex sweep and get scrubbed."""
+    from notebooklm._logging import scrub_secrets
+
+    out = scrub_secrets("posting body at=SUPER_SECRET&hl=en")
+    assert "SUPER_SECRET" not in out
+    assert "at=***" in out
+
+
+def test_oauth_bundle_redacts_via_extended_token_set():
+    """The plan's literal token list omits OAuth anchors; we extend it.
+
+    This regression test pins the extension: an OAuth-only string (no other
+    secret markers) must STILL be redacted after the fast-path gate.
+    """
+    from notebooklm._logging import scrub_secrets
+
+    body = "refresh_token=RT_X&access_token=AT_X&id_token=IT_X&code=AUTH_X"
+    out = scrub_secrets(body)
+    for leaked in ("RT_X", "AT_X", "IT_X", "AUTH_X"):
+        assert leaked not in out, f"{leaked} leaked through fast-path"
+    for redacted in (
+        "refresh_token=***",
+        "access_token=***",
+        "id_token=***",
+        "code=***",
+    ):
+        assert redacted in out

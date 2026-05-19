@@ -1,4 +1,4 @@
-"""Regression test for T7.C3 — shield upload finalize + Scotty cancel cleanup.
+"""Regression test for the shield upload finalize + Scotty cancel cleanup.
 
 Audit item §9: pre-fix, a `CancelledError` arriving mid-`_upload_file_streaming`
 abandoned the in-flight `"upload, finalize"` POST without waiting for the
@@ -10,7 +10,7 @@ either:
   - Remained half-finalized, the resumable URL still alive, holding
     quota until Scotty's GC timeout expired.
 
-Post-fix (T7.C3):
+Post-fix:
   - The finalize POST is wrapped in ``asyncio.shield`` so a cancel
     mid-POST lets the request complete; the cancel then propagates after
     the response is received (or after the inner Task wins the race).
@@ -45,6 +45,10 @@ import pytest
 from notebooklm import NotebookLMClient
 
 from .helpers import with_simulated_cancel
+
+# mock-transport cancellation tests; no HTTP, no cassette. Opt out
+# of the tier-enforcement hook in tests/integration/conftest.py.
+pytestmark = pytest.mark.allow_no_vcr
 
 UPLOAD_URL = "https://example.test/scotty/upload-session-abc123"
 
@@ -106,19 +110,22 @@ async def test_cancel_after_finalize_started_shield_completes_request(
         await asyncio.wait_for(finalize_arrived.wait(), timeout=2.0)
 
         # Cancel the outer task. With the shield in place, the inner POST
-        # keeps running; without the shield, the request is abandoned.
+        # keeps running and the outer helper stays suspended until that
+        # finalize task reaches a terminal state.
         upload_task.cancel()
+        await asyncio.sleep(0)
+        assert not upload_task.done(), (
+            "post-finalize cancel returned before finalize completed; "
+            "add_file would release upload concurrency and transport accounting too early"
+        )
 
         # Release the handler so the inner request can finish.
         # Give the cancel a beat to propagate first, mirroring the real
         # Ctrl-C interleave.
-        await asyncio.sleep(0)
         release.set()
 
-        # The outer task will see CancelledError (shield re-raises after
-        # the inner POST completes — or immediately, with the inner Task
-        # still scheduled). Either way, the captured POST must include
-        # the finalize command.
+        # The outer task sees CancelledError only after the inner POST
+        # completes. The captured POST must include the finalize command.
         with pytest.raises(asyncio.CancelledError):
             await upload_task
 

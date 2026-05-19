@@ -36,6 +36,7 @@
 | `KmcKPe` | REVISE_SLIDE | Revise an individual slide via prompt | `_artifacts.py` |
 | `hPTbtc` | GET_LAST_CONVERSATION_ID | Get most recent conversation ID | `_chat.py` |
 | `khqZz` | GET_CONVERSATION_TURNS | Get Q&A turns for a conversation | `_chat.py` |
+| `J7Gthc` | DELETE_CONVERSATION | Delete a conversation (web UI's "Delete history") | `_chat.py` |
 | `CYK0Xb` | CREATE_NOTE | Create a note (placeholder) | `_notes.py` |
 | `cYAfTb` | UPDATE_NOTE | Update note content/title | `_notes.py` |
 | `AH0mwd` | DELETE_NOTE | Delete a note | `_notes.py` |
@@ -467,6 +468,29 @@ params = [
 
 ---
 
+### RPC: DELETE_CONVERSATION (J7Gthc)
+
+**Source:** `_chat.py::delete_conversation()`
+
+Deletes a conversation server-side. Mirrors the NotebookLM web UI's "Delete
+history" button. After the call, the next `ask()` with no `conversation_id`
+starts a brand-new conversation instead of extending the deleted one.
+
+```python
+params = [
+    [],              # 0: Empty / reserved
+    conversation_id, # 1: Conversation to delete
+    None,            # 2
+    1,               # 3: Always observed as 1; meaning unconfirmed
+]
+# source_path = f"/notebook/{notebook_id}"  — notebook scope rides on the URL
+```
+
+**Response:** empty `[]` body inside the standard `wrb.fr` envelope. Success
+is signaled by the absence of an error — there is no return payload.
+
+---
+
 ## Studio Panel - Artifact Generation
 
 ### UI Selectors
@@ -848,6 +872,79 @@ params = [
 ]
 # Then call UPDATE_NOTE to set real title/content
 ```
+
+### RPC: CREATE_NOTE (saved-from-chat variant) (CYK0Xb)
+
+**Source:** `_mind_map.py::save_chat_answer_as_note()` / `_notes.py::create_from_chat()`
+
+**Note:** This is the same RPC method ID as plain CREATE_NOTE above, but uses a **7-element** params array (vs the 5-element blank-note form) and **mode flag `[2]`** to tell the server the note carries a saved chat answer. The server stores per-citation source-passage metadata so `[N]` markers in the answer render as hover-anchored links in the NotebookLM web UI. No follow-up UPDATE_NOTE is needed — this is a single round-trip.
+
+Reverse-engineered from a captured web-UI "Save to note" request (issue #660). Pinned by fixture and golden unit test at `tests/unit/fixtures/save_chat_as_note_create_note_request.json` and `tests/unit/test_save_chat_as_note_encoder.py::test_golden_single_citation`.
+
+```python
+params = [
+    notebook_id,           # [0]
+    answer_with_markers,   # [1] str — full answer text INCLUDING [N] markers
+    [2],                   # [2] mode flag — [2] = saved-from-chat (vs [1] = blank-note)
+    source_passages,       # [3] list — one descriptor per UNIQUE cited chunk_id
+    title,                 # [4] str — requested title; server may auto-generate a smart one
+    rich_content,          # [5] list — cleaned answer + per-marker anchors (see below)
+    [2],                   # [6] trailer flag
+]
+```
+
+`source_passages` (slot `[3]`) — one entry per unique cited chunk:
+
+```python
+[
+    None, None, None,
+    [[None, source_start, source_end]],   # passage span in source document
+    [passage_text_wrapper],                # cited text wrapped with offsets + render flags
+    [[[passage_id], source_id]],           # passage_id + source_id pair
+    [chunk_id],                             # standalone chunk_id
+]
+```
+
+`rich_content` (slot `[5]`) — five sub-slots:
+
+```python
+[
+    [
+        cleaned_answer_passage_group,      # answer text WITHOUT [N] markers, with offsets
+        [                                   # per-marker anchors
+            [[chunk_id], [None, 0, position_of_marker_in_clean_text]],
+            # ...one entry per [N] in the answer
+        ],
+    ],
+    None,                                   # always-null slot
+    None,                                   # always-null slot
+    [                                       # source_passages keyed by chunk_id
+        [[chunk_id], <same descriptor shape as one entry of slot [3]>],
+    ],
+    1,                                      # trailer flag
+]
+```
+
+**Response shape** (6 elements — same shape as a stored note row):
+
+```python
+[
+    note_id,                                # [0] server-assigned UUID
+    answer_with_markers,                    # [1] echoed
+    [2, user_id, [ts_sec, ts_nanos]],       # [2] metadata: type=2 (saved-from-chat)
+    source_passages,                        # [3] echoed
+    server_title,                           # [4] may differ from request (smart title)
+    rich_content,                           # [5] echoed
+]
+```
+
+**Encoding quirks**:
+- Rendering-flag arrays use the integer `0`, not the boolean `false` — `json.dumps(False)` emits `false`, which the server *normalizes* but the wire-channel match is strict. The encoder uses integer `0` to stay byte-exact with the captured request.
+- The server appears to apply a "smart title" pass for `[2]`-mode notes — the captured response title differed from the captured request title (the request sent `"New Saved Note"`; the response stored `"Le Verger de la Connaissance : Le Cas de la Pomme"`). `NotesAPI.create_from_chat()` surfaces the server-stored title in the returned `Note`.
+
+**Known gaps**:
+- The `passage_id` UUID at slot `[3][0][5][0][0]` does NOT appear in the streaming chat response shape we currently parse. `_build_source_passage_descriptor` falls back to `chunk_id` as a placeholder when `ChatReference.passage_id` is unset (which is always, in production today). Empirically the server accepts this and the web UI still renders hover anchors. If a future capture reveals where this UUID comes from, populate `ChatReference.passage_id` in `_chat_protocol.py::parse_single_citation()` and the encoder will use it automatically.
+- Multi-citation segmentation uses a *cumulative-span* heuristic (each `[N]` anchors `clean_text[0..position]` rather than a per-segment span). This matches the captured single-citation payload exactly but is unverified against multi-citation captures. See issue #660 PR description.
 
 ### RPC: UPDATE_NOTE (cYAfTb)
 
@@ -1731,7 +1828,6 @@ These RPC method IDs exist in `rpc/types.py` but are either legacy (superseded b
 | RPC ID | Method | Status | Notes |
 |--------|--------|--------|-------|
 | `hizoJc` | GET_SOURCE | Broken | Code comments indicate this doesn't work; `get()` uses GET_NOTEBOOK instead |
-| `qXyaNe` | DISCOVER_SOURCES | Reserved | Not fully rolled out by Google yet |
 
 **Why keep these?** These IDs are preserved in the codebase in case:
 1. Google re-enables or changes their functionality

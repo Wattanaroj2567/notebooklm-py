@@ -1,4 +1,4 @@
-"""Regression tests for T7.B4 — `__aexit__` exception arbitration + close-leak repair.
+"""Regression tests for the `__aexit__` exception arbitration + close-leak repair.
 
 Audit items:
 - §25: `NotebookLMClient.__aexit__` lacked try/except, so a `close()` exception
@@ -10,7 +10,7 @@ Coverage:
 1. Body raises + close raises → body exception propagates, close logged at
    WARNING, transport closed.
 2. Body succeeds + close raises → close exception propagates.
-3. Cancel mid-close (audit §7) → transport still closed.
+3. Cancel mid-close → transport still closed.
 """
 
 from __future__ import annotations
@@ -22,6 +22,10 @@ from unittest.mock import patch
 import pytest
 
 from notebooklm import NotebookLMClient
+
+# mock-based __aexit__ arbitration tests; no HTTP, no cassette.
+# Opt out of the tier-enforcement hook in tests/integration/conftest.py.
+pytestmark = pytest.mark.allow_no_vcr
 
 
 @pytest.fixture(autouse=True)

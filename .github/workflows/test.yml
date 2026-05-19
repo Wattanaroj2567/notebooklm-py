@@ -27,7 +27,7 @@ jobs:
         cache: 'pip'
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v7
       with:
         enable-cache: true
 
@@ -40,17 +40,41 @@ jobs:
     - name: Run type checking
       run: uv run mypy src/notebooklm --ignore-missing-imports
 
-    - name: Assert workflow permissions are scoped (Phase 1 T4)
+    - name: Assert workflow permissions are scoped
       run: uv run python scripts/check_workflow_permissions.py
 
-    - name: Assert coverage thresholds match (Phase 1 T5)
+    - name: Assert workflow secret-bearing jobs are gated
+      # Companion to the permissions check: prevents a new
+      # ``${{ secrets.NAME }}`` reference from landing without picking up
+      # a job-level ``environment:`` declaration or a step-level
+      # ``is_standard`` guard. See docs/development.md →
+      # "Workflow secret gates".
+      run: uv run python scripts/check_workflow_secret_gates.py
+
+    - name: Assert third-party actions in privileged workflows are SHA-pinned
+      # Supply-chain gate: every third-party action (non ``actions/*``) in
+      # publish / testpypi-publish / claude / rpc-health / nightly /
+      # verify-package must use a 40-char commit SHA, not a floating
+      # ``@v1`` / ``@release/v1`` / branch ref. Dependabot bumps the
+      # SHAs weekly via the grouped ``actions`` updates in
+      # ``.github/dependabot.yml``.
+      run: uv run python scripts/check_action_pinning.py
+
+    - name: Assert coverage thresholds match
       run: uv run python scripts/check_coverage_thresholds.py
 
-    - name: Assert CI install matches CONTRIBUTING.md (Phase 6 P6.4)
+    - name: Assert CI install matches CONTRIBUTING.md
       run: uv run python scripts/check_ci_install_parity.py
 
-    - name: Assert CLAUDE.md paths are fresh (Phase 6 P6.6)
+    - name: Assert CLAUDE.md paths are fresh
       run: uv run python scripts/check_claude_md_freshness.py
+
+    - name: Assert per-method RPC coverage
+      # Static check: each RPCMethod member must have at least one test
+      # reference AND at least one cassette body containing its RPC id.
+      # Pre-existing gaps are grandfathered via PREEXISTING_GAPS inside the
+      # script — that set is a one-way ratchet and must not grow.
+      run: uv run python tests/scripts/check_method_coverage.py
 
     - name: Verify e2e test fixtures
       run: uv run pytest tests/e2e --collect-only -q
@@ -64,6 +88,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      # Pin Playwright's browser install dir to a single workspace-relative
+      # path on every OS. The previous dual-path cache stanza (``~/.cache``
+      # + ``~/AppData/Local``) intermittently failed the cache restore on
+      # Windows with ``actions/cache@v5`` — the missing Linux path tripped
+      # the post-restore validation on a cache hit. Pinning the path here
+      # lets the cache stanza below carry exactly one entry on every OS.
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
 
     steps:
     - uses: actions/checkout@v6
@@ -75,7 +107,7 @@ jobs:
         cache: 'pip'
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v7
       with:
         enable-cache: true
 
@@ -90,11 +122,16 @@ jobs:
 
     - name: Cache Playwright browsers
       uses: actions/cache@v5
+      # Tolerate transient cache-backend failures: a miss already falls
+      # through to the install step below, and a backend hiccup should be
+      # treated the same. Without this, a 29s backend flake on a single
+      # matrix entry hard-fails the job and skips the entire test run.
+      continue-on-error: true
       with:
-        path: |
-          ~/.cache/ms-playwright
-          ~/AppData/Local/ms-playwright
-        key: playwright-${{ matrix.os }}-${{ steps.playwright-version.outputs.version }}
+        path: ${{ github.workspace }}/.playwright-browsers
+        # ``-ws`` suffix invalidates archives keyed to the prior dual-path
+        # stanza so first restores after this change land on the new path.
+        key: playwright-${{ matrix.os }}-${{ steps.playwright-version.outputs.version }}-ws
 
     - name: Install Playwright browsers
       run: uv run playwright install chromium
@@ -108,11 +145,18 @@ jobs:
           echo "::warning::Continuing so the non-browser test matrix can run."
         fi
 
-    - name: Assert cassettes are sanitized (T5.E, T8.A5a, T8.A5b)
+    - name: Assert cassettes are sanitized
       # Runs on all matrix entries (ubuntu, macos, windows × 5 Python versions).
-      # The legacy bash gate was lifted in T8.A5b after T8.A5a replaced the
-      # shell script with a portable Python invocation.
-      run: uv run python tests/scripts/check_cassettes_clean.py
+      # An earlier bash-only gate was replaced by a portable Python invocation
+      # so the check runs uniformly across the cross-platform test matrix.
+      #
+      # ``--strict`` flips the repair-allowlist from "best-effort suppressor"
+      # to "must be empty" — the phase-2 cassette cleanup is done, so any
+      # entry sneaking back in is a CI failure (P1-5).
+      # ``--recursive`` extends the scan from ``tests/cassettes/*.yaml`` to
+      # ``tests/cassettes/**/*.yaml`` so a recorder can't smuggle a leak
+      # into a nested folder like ``tests/cassettes/gzip_coverage/`` (P1-5).
+      run: uv run python tests/scripts/check_cassettes_clean.py --strict --recursive
 
     - name: Run tests with coverage
       # Emit coverage.json so the per-file floor check below can read it
@@ -120,7 +164,7 @@ jobs:
       # still show the missing-lines summary.
       run: uv run pytest --cov=src/notebooklm --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=90
 
-    - name: Assert per-file coverage floors (T6.C)
+    - name: Assert per-file coverage floors
       # Linux-only because ``coverage.json`` on Windows records backslash
       # paths (e.g. ``src\notebooklm\cli\doctor.py``) that won't match the
       # forward-slash keys in ``[tool.notebooklm.per_file_coverage_floors]``

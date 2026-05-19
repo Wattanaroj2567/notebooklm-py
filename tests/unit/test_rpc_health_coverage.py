@@ -1,4 +1,4 @@
-"""Coverage assertion for the RPC-health canary (PR-T6.B).
+"""Coverage assertion for the RPC-health canary.
 
 ``scripts/check_rpc_health.py`` already enumerates every ``RPCMethod`` and
 prints a per-method row, but until now there was no CI guard that *every*
@@ -85,6 +85,10 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
         "CREATE_NOTE",
         # Permanently deletes a note — write op, --full only.
         "DELETE_NOTE",
+        # Permanently deletes a server-side conversation (web UI's "Delete
+        # history") — destructive write op, needs a real conversation to
+        # delete and is exercised via the e2e suite, not the canary.
+        "DELETE_CONVERSATION",
         # Kicks off a fast-research task on the server — long-running write
         # op. Tested via --full setup to verify the RPC ID still echoes.
         "START_FAST_RESEARCH",
@@ -96,25 +100,19 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
 )
 
 
-PATH_NOT_METHOD_SKIP: frozenset[str] = frozenset(
-    {
-        # QUERY_ENDPOINT holds a streamed-chat URL path, not a batchexecute
-        # RPC ID. The chat endpoint lives outside the /batchexecute RPC
-        # pipeline, so the canary cannot probe it via the same plumbing.
-        "QUERY_ENDPOINT",
-    }
-)
+# Reserved for ``RPCMethod`` members that hold a URL-path string rather than
+# a batchexecute RPC ID. None currently exist — the streamed-chat path was
+# relocated to a module-level constant in ``rpc/types.py`` — but
+# this category remains so a future path-shaped entry can be classified
+# without re-introducing the whole skip-list scaffolding.
+PATH_NOT_METHOD_SKIP: frozenset[str] = frozenset()
 
 
-UNAVAILABLE_SKIP_LIST: frozenset[str] = frozenset(
-    {
-        # Not fully rolled out by Google — the canary's call fails for any
-        # input IDs, so the script lists it in ALWAYS_SKIP_METHODS rather
-        # than risking a false MISMATCH. Move back into get_test_params
-        # once Google ships the feature widely.
-        "DISCOVER_SOURCES",
-    }
-)
+UNAVAILABLE_SKIP_LIST: frozenset[str] = frozenset()
+"""Reserved for ``RPCMethod`` members that exist but aren't currently
+exercisable by the canary (e.g. unreleased / rolled-back Google features).
+Empty for now; the scaffolding is preserved so a future "exists but cannot
+probe" entry can be classified without re-introducing the constant."""
 
 
 def _probed_method_names() -> frozenset[str]:

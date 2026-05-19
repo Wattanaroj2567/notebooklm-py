@@ -15,8 +15,10 @@ Priority order when multiple statuses are present:
     MISMATCH (1) > AUTH (2) > non-transient ERROR (3) > OK (0)
 
 Transient errors that still exit 0 are limited to rate-limit signals
-(HTTP 429 and gRPC ``RESOURCE_EXHAUSTED``). Everything else is treated
-as a real failure so the nightly canary can flag silent breakage.
+(HTTP 429, gRPC ``RESOURCE_EXHAUSTED``, and the decoder's user-displayable
+``API rate limit`` / quota messages raised as ``RateLimitError``).
+Everything else is treated as a real failure so the nightly canary can
+flag silent breakage.
 
 Environment variables:
     NOTEBOOKLM_AUTH_JSON - Playwright storage state JSON (required)
@@ -47,6 +49,7 @@ from uuid import uuid4
 import httpx
 
 from notebooklm._env import get_default_language
+from notebooklm._logging import scrub_secrets
 from notebooklm._notebooks import build_create_notebook_params
 from notebooklm.auth import (
     AuthTokens,
@@ -127,16 +130,13 @@ FULL_MODE_ONLY_METHODS = {
     RPCMethod.DELETE_SOURCE,
     RPCMethod.DELETE_ARTIFACT,  # Main RPC for artifact deletion
     RPCMethod.DELETE_NOTEBOOK,
+    RPCMethod.DELETE_CONVERSATION,  # Destructive; needs a real conversation to delete
 }
 
 # Methods always skipped (even in full mode)
 ALWAYS_SKIP_METHODS = {
-    # Not a batchexecute RPC
-    RPCMethod.QUERY_ENDPOINT,
     # Takes too long
     RPCMethod.START_DEEP_RESEARCH,
-    # Not fully rolled out by Google - fails with any IDs
-    RPCMethod.DISCOVER_SOURCES,
 }
 
 
@@ -475,16 +475,21 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
     ):
         return [notebook_id]
 
-    # GET_SUGGESTED_REPORTS has special params: [[2], notebook_id]
+    # GET_SUGGESTED_REPORTS has special params: [[2], notebook_id].
+    # Suggestions only exist once a notebook has indexed sources, so the
+    # freshly-created temp notebook used in --full mode returns an empty
+    # body and trips the empty-response guard. When a stable read-only
+    # notebook is available, route this method there instead so the
+    # canary keeps drift-checking the RPC ID.
     if method == RPCMethod.GET_SUGGESTED_REPORTS:
-        return [[2], notebook_id]
+        stable_id = (
+            os.environ.get("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID")
+            or os.environ.get("NOTEBOOKLM_GENERATION_NOTEBOOK_ID")
+            or notebook_id
+        )
+        return [[2], stable_id]
 
     # Methods that take [[notebook_id]] as the only param.
-    # Note: DISCOVER_SOURCES is intentionally NOT listed here. It is in
-    # ALWAYS_SKIP_METHODS ("not fully rolled out by Google") and would be
-    # short-circuited before get_test_params runs anyway; keeping it out
-    # of get_test_params also lets the coverage assertion in
-    # tests/unit/test_rpc_health_coverage.py classify it explicitly.
     if method == RPCMethod.GET_NOTES_AND_MIND_MAPS:
         return [[notebook_id]]
 
@@ -725,7 +730,15 @@ async def setup_temp_resources(
     if result.status == CheckStatus.OK:
         temp.source_id = extract_id(data, 0, 0)
         if not temp.source_id:
-            print(f"  WARNING: ADD_SOURCE ID extraction failed. Response: {repr(data)[:200]}")
+            # Decoded response may carry residual credential-shaped substrings
+            # (cookies/CSRF tokens echoed in error payloads, etc.). Scrub the
+            # FULL repr before slicing — slicing first risks chopping a
+            # secret-shaped substring (e.g. ``cookie: SID=ab|cd``) at the
+            # 200-char boundary, leaving the prefix outside the scrub
+            # patterns. Scrub-then-truncate keeps the redaction intact even
+            # if the bytes after position 200 carried the matching anchor.
+            preview = scrub_secrets(repr(data))[:200]
+            print(f"  WARNING: ADD_SOURCE ID extraction failed. Response: {preview}")
 
     # Test ADD_SOURCE_FILE - registers file source intent (no actual upload needed)
     # Params format: [[[filename]], notebook_id, [2], [1, None, ...]]
@@ -819,9 +832,12 @@ async def setup_temp_resources(
             # Artifact ID is at response[0][0]
             temp.artifact_id = extract_id(data, 0, 0)
             if not temp.artifact_id:
-                print(
-                    f"  WARNING: CREATE_ARTIFACT ID extraction failed. Response: {repr(data)[:200]}"
-                )
+                # Same scrub-then-truncate ordering as the ADD_SOURCE
+                # failure site upstream — slicing first risks chopping a
+                # cookie / CSRF token at the 200-char boundary and
+                # missing the scrub-pattern anchor.
+                preview = scrub_secrets(repr(data))[:200]
+                print(f"  WARNING: CREATE_ARTIFACT ID extraction failed. Response: {preview}")
 
         # Poll for artifact completion
         if temp.artifact_id:
@@ -953,10 +969,15 @@ async def run_health_check(full_mode: bool = False) -> list[CheckResult]:
     try:
         csrf_token, session_id = await fetch_tokens(cookies, storage_path=storage_path)
     except ValueError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(f"ERROR: {scrub_secrets(e)}", file=sys.stderr)
         sys.exit(2)
     except httpx.HTTPError as e:
-        print(f"ERROR: Network error while fetching auth tokens: {e}", file=sys.stderr)
+        # ``httpx`` exception strings can echo full request URLs including
+        # ``f.sid=<session_id>`` query params, so scrub before logging.
+        print(
+            f"ERROR: Network error while fetching auth tokens: {scrub_secrets(e)}",
+            file=sys.stderr,
+        )
         sys.exit(2)
     auth = AuthTokens(
         cookies=cookies,
@@ -991,7 +1012,12 @@ async def run_health_check(full_mode: bool = False) -> list[CheckResult]:
                 status_icon = STATUS_ICONS[result.status]
                 line = f"{status_icon:8} {method.name} ({result.expected_id})"
                 if result.error and result.status != CheckStatus.OK:
-                    line += f" - {result.error}"
+                    # Per-method live print of the error string runs BEFORE
+                    # the summary scrub at the end of the script and BEFORE
+                    # the workflow-level scrub on health-report.txt. Scrub
+                    # at the live site too so the Actions log doesn't carry
+                    # an unredacted copy in the streamed output.
+                    line += f" - {scrub_secrets(result.error)}"
                 print(line)
 
                 if i < total and result.status != CheckStatus.SKIPPED:
@@ -1011,9 +1037,16 @@ async def run_health_check(full_mode: bool = False) -> list[CheckResult]:
 # (timeouts, parse failures, unexpected HTTP errors) is treated as a real
 # failure so the nightly canary can flag silent breakage. Keep this list
 # narrow on purpose: broadening it would mask real RPC drift.
+#
+# ``API rate limit`` catches the decoder's user-displayable messages
+# raised as ``RateLimitError`` ("API rate limit exceeded..." and
+# "API rate limit or quota exceeded..."). These reach the canary via the
+# ``except RPCError`` parse-error branch in ``test_rpc_method_with_data``
+# and were previously misclassified as non-transient.
 TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
     "HTTP 429",
     "RESOURCE_EXHAUSTED",
+    "API rate limit",
 )
 
 
@@ -1108,9 +1141,14 @@ def print_summary(results: list[CheckResult]) -> int:
         print("ERROR DETAILS:")
         print("-" * 40)
         for r in non_transient_errors:
-            print(f"  [non-transient] {r.method.name} ({r.expected_id}): {r.error}")
+            # ``r.error`` is a free-form error string produced by the RPC
+            # call paths; if the upstream library ever quotes a request
+            # URL or cookie jar in its message, the workflow's later
+            # file scrub catches it but the live Actions log would not.
+            # Belt-and-braces: scrub at the print site too.
+            print(f"  [non-transient] {r.method.name} ({r.expected_id}): {scrub_secrets(r.error)}")
         for r in transient_errors:
-            print(f"  [transient]     {r.method.name} ({r.expected_id}): {r.error}")
+            print(f"  [transient]     {r.method.name} ({r.expected_id}): {scrub_secrets(r.error)}")
         print()
 
     # Return exit code.

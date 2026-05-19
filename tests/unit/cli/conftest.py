@@ -6,6 +6,29 @@ import pytest
 from click.testing import CliRunner
 
 
+@pytest.fixture(autouse=True)
+def _disable_chromium_profile_fanout(monkeypatch):
+    """Default: Chromium multi-user-profile discovery returns nothing in tests.
+
+    The session multi-account paths (``auth inspect``, ``login --account``,
+    ``login --all-accounts``, ``auth refresh``) auto-fan-out across every
+    populated Chromium user-data profile (issue #571). On a developer machine
+    with multiple real Chrome profiles, that discovery would otherwise leak
+    into tests that mock ``rookiepy.chrome`` (and ignore the new
+    ``rookiepy.any_browser`` fan-out path), making them flaky depending on
+    whoever runs the suite.
+
+    Tests that exercise the fan-out path itself override this fixture by
+    patching ``discover_chromium_profiles`` explicitly with their own list of
+    synthetic profiles — the autouse here just guarantees deterministic
+    legacy-path behavior everywhere else.
+    """
+    monkeypatch.setattr(
+        "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+        lambda *a, **kw: [],
+    )
+
+
 @pytest.fixture
 def runner():
     """Create a Click test runner."""
@@ -296,5 +319,12 @@ def patch_main_cli_client():
 def mock_context_file(tmp_path):
     """Provide a temporary context file for testing context commands."""
     context_file = tmp_path / "context.json"
-    with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+    # Patch every current context-path seam: the helpers facade passes the
+    # resolver explicitly, while context.py and resolve.py perform call-time
+    # lookups after the helper split.
+    with (
+        patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
+    ):
         yield context_file

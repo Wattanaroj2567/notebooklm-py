@@ -26,7 +26,12 @@ __all__ = [
     "notebooklm_vcr",
     "assert_command_success",
     "parse_json_output",
+    "VCR_READONLY_NOTEBOOK_ID",
+    "VCR_READONLY_SOURCE_ID",
 ]
+
+VCR_READONLY_NOTEBOOK_ID = "c3f6285f-1709-44c4-9cd6-e95cf0ea4f5e"
+VCR_READONLY_SOURCE_ID = "fdfc8ac4-3237-4f2a-8a79-3e24297a7040"
 
 
 @pytest.fixture
@@ -40,35 +45,37 @@ def mock_context(tmp_path: Path):
     """Mock context file with a test notebook ID.
 
     CLI commands that require a notebook ID will use this context.
-    The notebook ID doesn't matter for VCR replay - cassettes have recorded responses.
+    Use a full recorded notebook UUID rather than a short placeholder. A
+    placeholder is treated as a partial ID by the CLI and triggers an extra
+    LIST_NOTEBOOKS RPC before the command under test, which breaks replay now
+    that VCR matches batchexecute calls by ``rpcids``.
     """
     context_file = tmp_path / "context.json"
-    context_file.write_text(json.dumps({"notebook_id": "test_notebook_id"}))
+    context_file.write_text(json.dumps({"notebook_id": VCR_READONLY_NOTEBOOK_ID}))
 
-    with patch("notebooklm.cli.helpers.get_context_path", return_value=context_file):
+    with (
+        patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
+    ):
         yield context_file
 
 
 @pytest.fixture
-def mock_auth_for_vcr(monkeypatch):
+def mock_auth_for_vcr():
     """Mock authentication that works with VCR cassettes.
 
-    VCR replays recorded responses regardless of auth tokens,
-    so we use mock auth to avoid requiring real credentials.
+    VCR replays recorded responses regardless of auth tokens, so we use mock
+    auth to avoid requiring real credentials.
 
-    Also disables the layer-1 ``RotateCookies`` keepalive poke
-    (``NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1``) — the documented escape hatch
-    in CHANGELOG `[0.4.1]` Fixed. Cassettes were recorded before that poke
-    was added; without disabling it here, every replay raises a cassette
-    mismatch on ``POST accounts.google.com/RotateCookies``. Previously the
-    mismatch surfaced as exit 1 via the legacy ``helpers.handle_error``
-    catch-all in ``cli/download.py``; under the typed handler (P3.T2 / I14)
-    that mismatch is correctly classified ``UNEXPECTED_ERROR`` (exit 2),
-    which is outside this helper's accepted ``(0, 1)`` range. Disabling the
-    poke aligns the test with what cassettes actually capture.
+    The layer-1 ``RotateCookies`` keepalive-poke disable that used to live
+    here (``NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1``) was globalized —
+    see the ``_disable_keepalive_poke_for_vcr`` autouse fixture in
+    ``tests/integration/conftest.py``. Every test that pulls this fixture
+    also carries ``@pytest.mark.vcr`` (either directly or via a module-level
+    ``pytestmark``), so the global autouse already disables the poke before
+    this fixture runs.
     """
-    monkeypatch.setenv("NOTEBOOKLM_DISABLE_KEEPALIVE_POKE", "1")
-
     mock_cookies = {
         "SID": "vcr_mock_sid",
         "HSID": "vcr_mock_hsid",

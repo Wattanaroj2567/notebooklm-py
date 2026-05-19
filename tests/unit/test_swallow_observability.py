@@ -1,7 +1,4 @@
-"""Tests for Phase 1 T3 — categorized observability at 12 swallowed-exception sites.
-
-See .sisyphus/plans/phase-1-implementation.md for the inventory and rationale.
-"""
+"""Tests for categorized observability at 12 swallowed-exception sites."""
 
 from __future__ import annotations
 
@@ -95,14 +92,22 @@ def test_qa_pairs_warns_on_unguarded_shape(caplog):
 
     # Got at least the question (answer is empty due to except)
     assert pairs == [("what?", "")]
-    assert any("schema drift" in r.message and r.levelno == logging.WARNING for r in caplog.records)
+    # After the fix, _chat._extract_next_turn_content delegates to safe_index,
+    # which emits its own canonical "safe_index drift" warning (rather than
+    # the older _chat-specific "schema drift" wording). Accept either so
+    # this test survives future helper renames.
+    assert any(
+        ("schema drift" in r.message or "safe_index drift" in r.message)
+        and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
 async def test_summary_warns_on_indexerror_drift(caplog, monkeypatch):
     """_notebooks.py: summary extraction warns when result[0][0][0] raises.
 
-    Tier-1 T1.B2 migrated this site to ``safe_index``; the warning message
+    This site was migrated to ``safe_index``; the warning message
     now comes from ``notebooklm.rpc._safe_index`` and carries the call-site
     label ``source='_notebooks.get_summary'`` instead of the notebook id.
     """
@@ -136,7 +141,7 @@ async def test_summary_warns_on_indexerror_drift(caplog, monkeypatch):
 
 # Removed: ``test_retry_after_non_integer_logs_debug`` was self-fulfilling — it
 # called ``core_mod.logger.debug(...)`` inline rather than exercising production
-# code. Phase 3 replaced the original "Retry-After header not an integer" log
+# code. A later refactor replaced the original "Retry-After header not an integer" log
 # site with the ``_parse_retry_after`` helper, which returns ``None`` silently
 # for unparseable input. Parse semantics are covered by
 # ``tests/unit/test_retry_after.py``.
@@ -171,7 +176,7 @@ async def test_description_partial_summary_logs_debug(caplog):
 def test_migration_config_unparseable_logs_debug(caplog, tmp_path, monkeypatch):
     """migration.py — unparseable migration config logs at DEBUG.
 
-    After T3.E the lock-protected ``atomic_update_json`` surfaces the
+    After the fix the lock-protected ``atomic_update_json`` surfaces the
     parse failure as a ``json.JSONDecodeError`` which the helper catches
     and reports as "Migration config update failed".
     """
@@ -190,14 +195,16 @@ def test_migration_config_unparseable_logs_debug(caplog, tmp_path, monkeypatch):
     )
 
 
-def test_auth_context_unreadable_recovers_under_lock(tmp_path):
-    """auth.py — unreadable account context is recovered under the lock.
+def test_auth_corrupt_legacy_context_does_not_block_in_band_write(tmp_path):
+    """auth.py — corrupt legacy ``context.json`` no longer blocks account writes.
 
-    Previously the recovery path lived outside the lock and emitted a DEBUG
-    log before unlink-and-retry. After PR #465 the recovery is silent and
-    happens inside :func:`atomic_update_json` via ``recover_from_corrupt``,
-    so the structural assertion is now: the corrupt file is rewritten in
-    place with a valid payload containing only our new metadata.
+    Pre-P1-20, account metadata was written into ``context.json`` itself, so
+    a corrupt file there had to be recoverable inline. P1-20 moves the write
+    target into ``storage_state.json`` under the ``notebooklm`` namespace key,
+    so a corrupt sibling ``context.json`` is now irrelevant to the write
+    path — it's only consulted by the read fallback and skipped on
+    JSONDecodeError. This test pins the new contract: the in-band write
+    completes successfully even when the legacy sibling is unreadable.
     """
     import json as _json
 
@@ -210,18 +217,20 @@ def test_auth_context_unreadable_recovers_under_lock(tmp_path):
 
     auth.write_account_metadata(storage, authuser=0, email=None)
 
-    # File is now valid JSON, and only contains the account-metadata key —
-    # proving recovery treated the corrupt payload as an empty dict.
-    data = _json.loads(ctx_path.read_text(encoding="utf-8"))
-    assert auth._ACCOUNT_CONTEXT_KEY in data
-    assert data[auth._ACCOUNT_CONTEXT_KEY]["authuser"] == 0
+    # The in-band record landed in storage_state.json.
+    storage_data = _json.loads(storage.read_text(encoding="utf-8"))
+    assert storage_data["notebooklm"]["account"]["authuser"] == 0
+    # The corrupt legacy file is untouched (we don't try to recover what we
+    # no longer write to) — readers' fallback path silently treats it as
+    # empty via the ``read_account_metadata`` corruption-tolerance branch.
+    assert ctx_path.read_text(encoding="utf-8") == "{ malformed "
 
 
 def test_stream_parser_debug_guarded_by_isenabledfor(caplog):
-    """_chat.py:601 — non-JSON chunk debug log fires under DEBUG; suppressed otherwise."""
+    """_chat_protocol.py — non-JSON chunk debug log is guarded before it fires."""
 
     # Direct: ensure the module has a guarded debug call (structural check).
-    src = (SRC_ROOT / "_chat.py").read_text(encoding="utf-8")
+    src = (SRC_ROOT / "_chat_protocol.py").read_text(encoding="utf-8")
     assert "logger.isEnabledFor(logging.DEBUG)" in src
     assert "Stream parser" in src
 
@@ -242,7 +251,7 @@ def _file_contains_best_effort_after_except(filepath: Path, except_line: int) ->
 # (relative-to-SRC_ROOT path, except-line). Lines refer to the `except ...:`
 # statement; the helper scans the 4 lines following it for `# best-effort:`.
 # Note: the previous ``cli/helpers.py:596`` site (``set_current_notebook``'s
-# best-effort rewrite-from-scratch) was retired in T3.E — that branch now
+# best-effort rewrite-from-scratch) was retired — that branch now
 # uses :func:`notebooklm._atomic_io.atomic_update_json` with explicit
 # JSONDecodeError handling that re-runs the mutator on an empty dict.
 _SILENT_SITES = [

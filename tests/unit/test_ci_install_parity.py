@@ -1,6 +1,6 @@
 """Tests for `scripts/check_ci_install_parity.py`.
 
-Phase 6 / P6.4 — drift catcher between ``.github/workflows/test.yml`` and
+Drift catcher between ``.github/workflows/test.yml`` and
 ``CONTRIBUTING.md`` install commands.
 """
 
@@ -121,7 +121,7 @@ def test_missing_contributing_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# T6.D — block-mirror policy
+# block-mirror policy
 # ---------------------------------------------------------------------------
 
 

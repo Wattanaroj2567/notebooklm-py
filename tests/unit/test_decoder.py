@@ -1,6 +1,7 @@
 """Unit tests for RPC response decoder."""
 
 import json
+import logging
 
 import pytest
 
@@ -10,10 +11,12 @@ from notebooklm.rpc.decoder import (
     ClientError,
     RateLimitError,
     RPCError,
+    RPCErrorCode,
     UnknownRPCMethodError,
     collect_rpc_ids,
     decode_response,
     extract_rpc_result,
+    get_error_message_for_code,
     parse_chunked_response,
     strip_anti_xssi,
 )
@@ -112,17 +115,29 @@ class TestParseChunkedResponse:
         assert chunks[0] == ["valid0"]
         assert chunks[9] == ["valid9"]
 
-    def test_warns_but_parses_mismatched_byte_count_with_valid_json(self, caplog):
-        """Mismatched byte counts are tolerated when the payload is valid JSON."""
+    def test_logs_debug_but_parses_mismatched_byte_count_with_valid_json(self, caplog):
+        """Mismatched byte counts are tolerated when the payload is valid JSON.
+
+        The mismatch is logged at DEBUG (not WARNING) because Google's
+        batchexecute declares a count in a different unit than UTF-8 bytes, so
+        every multi-chunk live response would otherwise flood CI logs.
+        """
         valid_parts = "\n".join(self._chunk_record([f"valid{i}"]) for i in range(10))
         payload = json.dumps(["wrong-size"])
         response = f"{valid_parts}\n{len(payload) + 1}\n{payload}\n"
 
-        chunks = parse_chunked_response(response)
+        with caplog.at_level(logging.DEBUG, logger="notebooklm.rpc.decoder"):
+            chunks = parse_chunked_response(response)
 
         assert chunks == [[f"valid{i}"] for i in range(10)] + [["wrong-size"]]
-        assert "declares" in caplog.text
-        assert "payload is" in caplog.text
+        mismatch_records = [
+            r
+            for r in caplog.records
+            if r.name == "notebooklm.rpc.decoder" and "declares" in r.message
+        ]
+        assert len(mismatch_records) == 1
+        assert mismatch_records[0].levelno == logging.DEBUG
+        assert "payload is" in mismatch_records[0].message
 
     def test_skips_byte_count_without_payload_below_threshold(self, caplog):
         """A trailing byte-count line without a payload is malformed and skipped."""
@@ -806,3 +821,307 @@ class TestUnknownRPCMethodErrorRouting:
         # raw_response preview cap (80 chars + "..." = 83) preserved by the
         # base RPCError contract (NOTEBOOKLM_DEBUG=1 opts into full body).
         assert len(err.raw_response) <= 83
+
+
+class TestMalformedChunkResilience:
+    """safe_index hot-path traversal must tolerate malformed chunks.
+
+    None of these inputs should raise; the decoder API surface (collect_rpc_ids,
+    extract_rpc_result) must degrade gracefully when Google's response shape
+    drifts. This pins the soft-mode contract from rpc._safe_index: drift returns
+    None / empty rather than IndexError / TypeError bubbling up.
+    """
+
+    RPC_ID = RPCMethod.LIST_NOTEBOOKS.value
+
+    def test_collect_rpc_ids_handles_empty_chunk(self):
+        """Empty list chunk is skipped without indexing into it."""
+        assert collect_rpc_ids([[]]) == []
+
+    def test_collect_rpc_ids_handles_non_list_chunk(self):
+        """Non-list chunks (str / int / dict / None) are skipped silently."""
+        assert collect_rpc_ids(["nope", 123, None, {"k": "v"}]) == []
+
+    def test_collect_rpc_ids_handles_short_item(self):
+        """Items shorter than 2 elements are skipped before indexing item[1]."""
+        chunks: list = [["wrb.fr"]]  # missing rpc_id at index 1
+        assert collect_rpc_ids(chunks) == []
+
+    def test_collect_rpc_ids_handles_non_list_inner_item(self):
+        """Non-list items inside a nested chunk are skipped."""
+        chunks: list = [["string-item", 42, None]]
+        # First element is a string, so items becomes [chunk] (the outer list),
+        # which has len=3 and item[0]="string-item" doesn't match tags. No raise.
+        assert collect_rpc_ids(chunks) == []
+
+    def test_collect_rpc_ids_handles_deeply_nested_malformed(self):
+        """Deeply nested malformed structures do not crash the traversal."""
+        chunks: list = [[[None]], [[1, 2]], [[]], [[[]]], [["wrb.fr"]]]
+        # None of these have a (tag, rpc_id) pair with a valid string rpc_id.
+        assert collect_rpc_ids(chunks) == []
+
+    def test_extract_rpc_result_handles_empty_chunk(self):
+        """Empty chunks are skipped in extract_rpc_result."""
+        assert extract_rpc_result([[]], self.RPC_ID) is None
+
+    def test_extract_rpc_result_handles_non_list_chunk(self):
+        """Non-list chunks are skipped in extract_rpc_result."""
+        assert extract_rpc_result(["nope", 123, None], self.RPC_ID) is None
+
+    def test_extract_rpc_result_handles_missing_index_5(self):
+        """wrb.fr items with len < 6 don't trigger UserDisplayableError lookup."""
+        # Item has exactly 3 elements: tag, rpc_id, null result. No index 5.
+        chunks: list = [["wrb.fr", self.RPC_ID, None]]
+        # Should return None (the null result) without raising IndexError.
+        assert extract_rpc_result(chunks, self.RPC_ID) is None
+
+    def test_extract_rpc_result_handles_short_item(self):
+        """Items with len < 3 are skipped before any indexing."""
+        # Items shorter than 3 elements should be skipped — no IndexError.
+        chunks: list = [["wrb.fr", self.RPC_ID]]
+        assert extract_rpc_result(chunks, self.RPC_ID) is None
+
+    def test_extract_rpc_result_handles_deeply_nested_malformed(self):
+        """Pathological nesting must not raise in extract_rpc_result."""
+        chunks: list = [
+            [],
+            [[]],
+            [None, None, None],
+            [["wrb.fr"]],
+            [["wrb.fr", self.RPC_ID]],  # len < 3 — skipped
+        ]
+        assert extract_rpc_result(chunks, self.RPC_ID) is None
+
+    def test_decode_response_handles_malformed_chunk_for_status_lookup(self):
+        """_find_wrb_status (via decode_response) must not crash on malformed.
+
+        When decode_response hits the "null result data, look up status"
+        branch, the chunk list it scans may include malformed entries. None
+        of these should raise.
+        """
+        # First a malformed chunk, then the legitimate null-result entry that
+        # decode_response will report on. Use GET_NOTEBOOK to trigger the
+        # status-lookup branch.
+        rpc_id = RPCMethod.GET_NOTEBOOK.value
+        good = json.dumps(["wrb.fr", rpc_id, None, None, None, None])
+        bad_short = json.dumps(["wrb.fr"])  # malformed, len < 6
+        bad_empty = json.dumps([])
+        body = (
+            f"{len(bad_short)}\n{bad_short}\n{len(bad_empty)}\n{bad_empty}\n{len(good)}\n{good}\n"
+        )
+        raw = f")]}}'\n{body}"
+        # decode_response will still raise RPCError for the null result, but
+        # the malformed-chunk traversal must not raise IndexError on its way
+        # there.
+        with pytest.raises(RPCError, match="returned null result data"):
+            decode_response(raw, rpc_id)
+
+
+class TestGetErrorMessageForCode:
+    """Parametrized coverage for ``get_error_message_for_code``.
+
+    Covers every known code in ``_ERROR_CODE_MESSAGES``, the ``None``
+    sentinel, the 4xx/5xx fallback ranges, and out-of-range codes.
+    """
+
+    @pytest.mark.parametrize(
+        ("code", "expected_substring", "expected_retryable"),
+        [
+            pytest.param(
+                RPCErrorCode.INVALID_REQUEST,
+                "Invalid request parameters",
+                False,
+                id="invalid_request_400",
+            ),
+            pytest.param(
+                RPCErrorCode.UNAUTHORIZED,
+                "Authentication required",
+                False,
+                id="unauthorized_401",
+            ),
+            pytest.param(
+                RPCErrorCode.FORBIDDEN,
+                "Insufficient permissions",
+                False,
+                id="forbidden_403",
+            ),
+            pytest.param(
+                RPCErrorCode.NOT_FOUND,
+                "Requested resource not found",
+                False,
+                id="not_found_404",
+            ),
+            pytest.param(
+                RPCErrorCode.RATE_LIMITED,
+                "rate limit exceeded",
+                True,
+                id="rate_limited_429",
+            ),
+            pytest.param(
+                RPCErrorCode.SERVER_ERROR,
+                "Server error occurred",
+                True,
+                id="server_error_500",
+            ),
+        ],
+    )
+    def test_error_code_known_returns_mapped_message(
+        self, code: int, expected_substring: str, expected_retryable: bool
+    ) -> None:
+        """Every known mapped code returns its tailored message + retry flag."""
+        message, is_retryable = get_error_message_for_code(int(code))
+        assert expected_substring in message
+        assert is_retryable is expected_retryable
+
+    def test_error_code_400_invalid_request(self) -> None:
+        """400 maps to the INVALID_REQUEST table entry, not the 4xx fallback."""
+        message, is_retryable = get_error_message_for_code(400)
+        assert message == "Invalid request parameters. Check your input and try again."
+        assert is_retryable is False
+
+    def test_error_code_401_unauthorized(self) -> None:
+        message, is_retryable = get_error_message_for_code(401)
+        assert "notebooklm login" in message
+        assert is_retryable is False
+
+    def test_error_code_403_forbidden(self) -> None:
+        message, is_retryable = get_error_message_for_code(403)
+        assert message == "Insufficient permissions for this operation."
+        assert is_retryable is False
+
+    def test_error_code_404_not_found(self) -> None:
+        message, is_retryable = get_error_message_for_code(404)
+        assert message == "Requested resource not found."
+        assert is_retryable is False
+
+    def test_error_code_429_rate_limit(self) -> None:
+        message, is_retryable = get_error_message_for_code(429)
+        assert "rate limit" in message.lower()
+        assert is_retryable is True
+
+    def test_error_code_500_server_error(self) -> None:
+        message, is_retryable = get_error_message_for_code(500)
+        assert "Server error" in message
+        assert is_retryable is True
+
+    def test_error_code_none_returns_generic_unknown(self) -> None:
+        """``None`` sentinel returns the generic non-retryable message."""
+        message, is_retryable = get_error_message_for_code(None)
+        assert message == "Unknown error occurred."
+        assert is_retryable is False
+
+    @pytest.mark.parametrize(
+        ("code", "expected_message", "expected_retryable"),
+        [
+            pytest.param(
+                402,
+                "Client error 402. Check your request parameters.",
+                False,
+                id="unmapped_4xx_402",
+            ),
+            pytest.param(
+                418,
+                "Client error 418. Check your request parameters.",
+                False,
+                id="unmapped_4xx_418_teapot",
+            ),
+            pytest.param(
+                422,
+                "Client error 422. Check your request parameters.",
+                False,
+                id="unmapped_4xx_422",
+            ),
+            pytest.param(
+                499,
+                "Client error 499. Check your request parameters.",
+                False,
+                id="unmapped_4xx_499_upper_edge",
+            ),
+        ],
+    )
+    def test_error_code_unmapped_4xx_generic_client_error(
+        self, code: int, expected_message: str, expected_retryable: bool
+    ) -> None:
+        """Unknown 400-499 codes get the generic client-error fallback."""
+        message, is_retryable = get_error_message_for_code(code)
+        assert message == expected_message
+        assert is_retryable is expected_retryable
+
+    @pytest.mark.parametrize(
+        ("code", "expected_message", "expected_retryable"),
+        [
+            pytest.param(
+                501,
+                "Server error 501. This is usually temporary - try again later.",
+                True,
+                id="unmapped_5xx_501",
+            ),
+            pytest.param(
+                502,
+                "Server error 502. This is usually temporary - try again later.",
+                True,
+                id="unmapped_5xx_502_bad_gateway",
+            ),
+            pytest.param(
+                503,
+                "Server error 503. This is usually temporary - try again later.",
+                True,
+                id="unmapped_5xx_503",
+            ),
+            pytest.param(
+                599,
+                "Server error 599. This is usually temporary - try again later.",
+                True,
+                id="unmapped_5xx_599_upper_edge",
+            ),
+        ],
+    )
+    def test_error_code_unmapped_5xx_generic_server_error(
+        self, code: int, expected_message: str, expected_retryable: bool
+    ) -> None:
+        """Unknown 500-599 codes get the generic retryable server-error fallback."""
+        message, is_retryable = get_error_message_for_code(code)
+        assert message == expected_message
+        assert is_retryable is expected_retryable
+
+    @pytest.mark.parametrize(
+        ("code", "expected_message"),
+        [
+            pytest.param(0, "Error code: 0", id="zero_edge_case"),
+            pytest.param(1, "Error code: 1", id="positive_below_4xx_grpc_cancelled"),
+            pytest.param(13, "Error code: 13", id="grpc_internal_13"),
+            pytest.param(200, "Error code: 200", id="success_range_200"),
+            pytest.param(399, "Error code: 399", id="just_below_4xx_399"),
+            pytest.param(600, "Error code: 600", id="just_above_5xx_600"),
+            pytest.param(999, "Error code: 999", id="three_digit_999"),
+            pytest.param(123456, "Error code: 123456", id="very_large_code"),
+            pytest.param(-1, "Error code: -1", id="negative_code"),
+        ],
+    )
+    def test_error_code_out_of_range_generic_fallback(
+        self, code: int, expected_message: str
+    ) -> None:
+        """Codes outside 400-599 get the bare ``Error code: <n>`` fallback (non-retryable)."""
+        message, is_retryable = get_error_message_for_code(code)
+        assert message == expected_message
+        assert is_retryable is False
+
+    def test_returns_tuple_of_str_and_bool(self) -> None:
+        """Return contract: always ``tuple[str, bool]`` regardless of input."""
+        for code in (None, 0, 400, 429, 500, 502, 999, -1):
+            message, is_retryable = get_error_message_for_code(code)
+            assert isinstance(message, str)
+            assert isinstance(is_retryable, bool)
+
+    def test_every_rpc_error_code_enum_value_covered_or_fallback(self) -> None:
+        """Each ``RPCErrorCode`` enum value resolves to a non-empty message.
+
+        Belt-and-suspenders: future additions to ``RPCErrorCode`` either land
+        in ``_ERROR_CODE_MESSAGES`` or fall through to the range-based
+        fallback. Either way ``get_error_message_for_code`` must produce a
+        non-empty human-readable message.
+        """
+        for code in RPCErrorCode:
+            message, is_retryable = get_error_message_for_code(int(code))
+            assert isinstance(message, str) and message
+            assert isinstance(is_retryable, bool)

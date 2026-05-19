@@ -4,40 +4,42 @@ This module is the single source of truth for what counts as sensitive in a
 recorded HTTP cassette and for cassette-byte-count surgery. It exports two
 complementary halves:
 
-1. **Sanitization registry (T8.A4 — audit findings I6, I7).** A canonical
+1. **Sanitization registry.** A canonical
    list of regex (pattern, replacement) pairs covering Google session
    cookies, ``__Secure-*`` / ``__Host-*`` cookies, WIZ_global_data token
    fields, email addresses, and Playwright ``storage_state`` cookie objects;
    a single ``scrub_string`` entry point that applies them; and an
    ``is_clean`` validator that judges cookie-value cleanliness via exact-
-   match membership in ``SCRUB_PLACEHOLDERS`` (closing I7's "starts with S"
-   character-class hole). Before this consolidation the same patterns lived
-   as an inline ``SENSITIVE_PATTERNS`` list in :mod:`tests.vcr_config` and
-   were duplicated piecemeal in ``tests/check_cassettes_clean.sh`` — that
-   drift risk is what audit finding I6 named.
+   match membership in ``SCRUB_PLACEHOLDERS`` (closing a previous
+   "starts with S" character-class hole). Before this consolidation the
+   same patterns lived as an inline ``SENSITIVE_PATTERNS`` list in
+   :mod:`tests.vcr_config` and were duplicated piecemeal in
+   ``tests/check_cassettes_clean.sh`` — that drift risk is what motivated
+   the consolidation.
 
-2. **Chunked-response byte-count re-derivation (T8.D7).** The
+2. **Chunked-response byte-count re-derivation.** The
    :func:`recompute_chunk_prefix` helper walks an XSSI-framed batchexecute
    body and rewrites every digit-only ``<count>`` header to match the actual
    byte-length of the immediately-following payload line. After scrubbing
    replaces a 21-char user ID with the 17-char ``SCRUBBED_USER_ID``
    placeholder the advertised count no longer matches the payload, so this
    helper runs as a second pass inside :func:`tests.vcr_config.scrub_response`
-   to keep cassettes self-consistent and silence the decoder's tolerance
-   warning during replay.
+   to keep cassettes self-consistent and avoid tripping the decoder's
+   byte-count-mismatch DEBUG log during replay.
 
 Why both halves live here, not split into two modules:
 
 - ``vcr_config.py`` is loaded for every VCR-decorated test, but its public
   surface is intentionally narrow (the VCR object + matchers). Scrub-time
   string surgery is a separate concern and benefits from being importable
-  on its own (the T8.B6 bulk re-scrub script in ``scripts/`` imports both
+  on its own (the bulk re-scrub script in ``scripts/`` imports both
   ``scrub_string`` AND ``recompute_chunk_prefix`` directly).
-- Decoder tolerance behavior in ``src/notebooklm/rpc/decoder.py`` (warning
-  on byte-count mismatch but still parsing the JSON) is intentionally
-  UNCHANGED — these helpers exist so cassettes don't trigger that warning
-  during replay, not to harden the decoder against drift in production
-  responses.
+- Decoder tolerance behavior in ``src/notebooklm/rpc/decoder.py`` (still
+  parses the JSON on byte-count mismatch, now logging at DEBUG rather
+  than WARNING — see #669) is what makes the recompute pass optional for
+  correctness; these helpers exist so cassettes stay self-consistent for
+  shape-lint and don't add log noise during replay, not to harden the
+  decoder against drift in production responses.
 
 Exports
 -------
@@ -51,10 +53,10 @@ Exports
 - :data:`SENSITIVE_PATTERNS`  ordered (regex, replacement) registry
 - :func:`scrub_string`        single sanitization entry point
 - :func:`is_clean`            validator returning ``(ok, leaks)``
-- :func:`recompute_chunk_prefix`  XSSI byte-count re-derivation (T8.D7)
+- :func:`recompute_chunk_prefix`  XSSI byte-count re-derivation
 
-Upload + Drive token coverage (T8.A6b — audit finding I17)
-----------------------------------------------------------
+Upload + Drive token coverage
+-----------------------------
 The registry below extends the canonical cookie/CSRF/email coverage with
 scrubbers for Google's resumable-upload and Drive integration paths:
 
@@ -70,22 +72,23 @@ scrubbers for Google's resumable-upload and Drive integration paths:
   are NotebookLM-internal identifiers and matching them would corrupt
   cassette replay.
 
-Display-name + avatar coverage (T8.A6a — audit finding C4 + /ogw/ group)
-------------------------------------------------------------------------
+Display-name + avatar coverage
+------------------------------
 The registry below also covers two display/identity leak shapes that the
-A4 structured scrubbers miss because the data is double-encoded inside a
+core structured scrubbers miss because the data is double-encoded inside a
 WRB-payload JSON string:
 
 * **Escaped JSON display-name literals.** Google's sharing RPCs emit owner
   metadata as positional list elements inside a stringified WRB payload —
   the display name surfaces as ``\\"First Last\\"`` rather than a
-  structured ``"displayName": "..."`` key. The A4 patterns key-anchor on
-  the outer JSON key, so they never fire on the inner double-encoded form.
-  The A6a pattern anchors on the escape-quote shape ``\\"...\\"`` and
-  carries an explicit false-positive allowlist (font families, UI titles,
-  artifact/notebook names produced by the test corpus) so that legitimate
-  two-Capitalized-word fixture content is preserved. This false-positive
-  list is the load-bearing safety net — a broad
+  structured ``"displayName": "..."`` key. The core structured patterns
+  key-anchor on the outer JSON key, so they never fire on the inner
+  double-encoded form. The display-name pattern anchors on the
+  escape-quote shape ``\\"...\\"`` and carries an explicit false-positive
+  allowlist (font families, UI titles, artifact/notebook names produced
+  by the test corpus) so that legitimate two-Capitalized-word fixture
+  content is preserved. This false-positive list is the load-bearing
+  safety net — a broad
   ``>[A-Z][a-z]+\\s[A-Z][a-z]+<`` regex without it would corrupt source-
   rename and artifact-list cassettes during replay.
 * **lh3.googleusercontent.com avatar URLs.** Both the ``/a/`` and ``/ogw/``
@@ -99,7 +102,7 @@ from __future__ import annotations
 import re
 
 # =============================================================================
-# Chunked-response byte-count re-derivation (T8.D7)
+# Chunked-response byte-count re-derivation
 # =============================================================================
 
 # XSSI anti-hijack prefix used by Google batchexecute responses.
@@ -126,15 +129,18 @@ def recompute_chunk_prefix(body: str) -> str:
 
     1. ``test_cassette_shapes.py`` byte-count assertion failures.
     2. ``decoder.py`` to emit ``Chunk at line N declares X bytes but payload is
-       Y bytes`` warnings during replay (the JSON is still parsed — see the
-       tolerance block at decoder.py:217-237 — but the warning is noise).
+       Y bytes`` DEBUG logs during replay (the JSON is still parsed — see the
+       tolerance block at decoder.py:217-237 — but well-formed cassettes
+       shouldn't trip the log at all).
 
     This helper walks the body, identifies every digit-only "header" line that
     is immediately followed by a non-header line, and replaces the header with
     the correct count for that payload. Byte count uses ``len(payload.encode(
-    "utf-8"))`` — matching the on-wire protocol AND the
-    ``len(json_str.encode("utf-8"))`` calculation the decoder uses. For
-    ASCII-only payloads (the common case for batchexecute JSON), this is
+    "utf-8"))`` — matching the ``len(json_str.encode("utf-8"))`` calculation
+    the decoder uses (which is what the cassette shape lint validates, even
+    though Google's live framing appears to use a different unit; see the
+    Note: block on :func:`notebooklm.rpc.decoder.parse_chunked_response`).
+    For ASCII-only payloads (the common case for batchexecute JSON), this is
     identical to ``len(payload)``, so the shape-lint character-length
     assertion in ``test_cassette_shapes.py`` still passes.
 
@@ -281,7 +287,7 @@ EMAIL_PROVIDERS: list[str] = [
 # inside a committed cassette. ``is_clean`` uses this set as an exact-match
 # allowlist when deciding whether a residual cookie value is a real leak — this
 # replaces the legacy ``[^S"]`` character-class heuristic that missed any real
-# secret starting with the letter ``S`` (audit finding I7).
+# secret starting with the letter ``S``.
 SCRUB_PLACEHOLDERS: frozenset[str] = frozenset(
     {
         "SCRUBBED",
@@ -296,22 +302,26 @@ SCRUB_PLACEHOLDERS: frozenset[str] = frozenset(
         # ``SCRUBBED_EMAIL@example.com`` is the rendered form of the email
         # replacement; ``is_clean`` checks the full token, so we list it too.
         "SCRUBBED_EMAIL@example.com",
-        # T8.A6b — upload + Drive token placeholders (audit I17).
+        # URL-encoded form for ``?authuser=`` query params. The provider-
+        # agnostic URL detector would otherwise re-flag the canonical
+        # placeholder as a leak (idempotency).
+        "authuser=SCRUBBED_EMAIL%40example.com",
+        # upload + Drive token placeholders.
         "SCRUBBED_UPLOAD_ID",
         "SCRUBBED_UPLOAD_URL",
         "SCRUBBED_AONS",
         "SCRUBBED_DRIVE_FILE_ID",
-        # T8.A6a — avatar URL placeholder (audit C4 + /ogw/ group). The
-        # display-name escaped-literal scrubber reuses the existing
-        # ``SCRUBBED_NAME`` sentinel from A4 (section 6) so a cassette can
-        # carry just one canonical replacement string for human names.
+        # avatar URL placeholder (display-name + avatar scrub group).
+        # The display-name escaped-literal scrubber reuses the existing
+        # ``SCRUBBED_NAME`` sentinel so a cassette can carry just one
+        # canonical replacement string for human names.
         "SCRUBBED_AVATAR_URL",
     }
 )
 
 
 # =============================================================================
-# Display-name false-positive allowlist (T8.A6a)
+# Display-name false-positive allowlist
 # =============================================================================
 # Two-Capitalized-word strings that LOOK like human display names but are
 # legitimate UI / font-family / artifact / notebook titles produced during
@@ -321,7 +331,7 @@ SCRUB_PLACEHOLDERS: frozenset[str] = frozenset(
 # being corrupted during replay.
 #
 # This list intentionally mirrors ``DISPLAY_NAME_FALSE_POSITIVES`` in
-# ``tests/unit/test_cassette_shapes.py`` (T8.A3). The two lists are NOT
+# ``tests/unit/test_cassette_shapes.py``. The two lists are NOT
 # imported from each other to keep ``cassette_patterns.py`` a leaf module —
 # the shape-lint module already depends on this registry, and a back-edge
 # would create a cycle. New entries must be added to BOTH lists. The unit
@@ -388,9 +398,9 @@ def _cookie_header_replacer(name: str) -> tuple[str, str]:
 # =============================================================================
 # The list is order-sensitive: earlier patterns run first. Each entry is a
 # ``(regex, replacement)`` pair consumed by :func:`re.sub` in :func:`scrub_string`
-# below. All replacements are static strings today; tasks T8.A6a/T8.A6b will
-# introduce context-aware (callable) replacements when display-name and Drive-
-# file-ID scrubbers land.
+# below. Most replacements are static strings; display-name and Drive-file-ID
+# scrubbers use context-aware (callable) replacements where exact-match
+# allowlists or surrounding context need to be consulted.
 SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     # -------------------------------------------------------------------------
     # 1. Cookie-header form: "Name=Value; ..."
@@ -437,6 +447,17 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     # JSON-quoted form. The replacement embeds ``@example.com`` so a second
     # scrub pass on already-scrubbed content is a no-op (idempotent).
     (f'"{_EMAIL_PATTERN_BASE}"', '"SCRUBBED_EMAIL@example.com"'),
+    # ``authuser=<email>`` query-param form. The client appends this to
+    # every batchexecute URL whenever ``account_email`` is set, so request
+    # URIs would otherwise leak the maintainer's email. Anchoring on
+    # ``authuser=`` (not the email's domain) scrubs Workspace / corporate
+    # addresses the provider-list pattern misses, with no false-positive
+    # risk elsewhere. The replacement keeps the ``%40`` shape so VCR
+    # matchers still see a well-formed value on replay.
+    (
+        r"authuser=[A-Za-z0-9._%+\-]+%40[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+        "authuser=SCRUBBED_EMAIL%40example.com",
+    ),
     # Unquoted-context fallback (mailto: hrefs, raw HTML/JS chunks).
     (_EMAIL_PATTERN_BASE, "SCRUBBED_EMAIL@example.com"),
     # -------------------------------------------------------------------------
@@ -488,7 +509,7 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
         r"\1SCRUBBED\2",
     ),
     # -------------------------------------------------------------------------
-    # 9. Upload tokens (T8.A6b — audit I17)
+    # 9. Upload tokens
     # -------------------------------------------------------------------------
     # X-GUploader-UploadID response header line. The token is a long random
     # string that uniquely identifies a resumable-upload session.
@@ -510,14 +531,14 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     # full upload URL above).
     (r"upload_id=[A-Za-z0-9_\-]+", "upload_id=SCRUBBED_UPLOAD_ID"),
     # -------------------------------------------------------------------------
-    # 10. Drive AONS tokens (T8.A6b — audit I17)
+    # 10. Drive AONS tokens
     # -------------------------------------------------------------------------
     # AONS-prefixed strings are Drive permission/ACL tokens. The 20-char tail
     # threshold avoids matching short literal "AONS" mentions in code or
     # documentation while catching real tokens (which are typically 50+ chars).
     (r"AONS[A-Za-z0-9_\-]{20,}", "SCRUBBED_AONS"),
     # -------------------------------------------------------------------------
-    # 11. Drive file IDs (T8.A6b — audit I17) — context-aware ONLY
+    # 11. Drive file IDs — context-aware ONLY
     # -------------------------------------------------------------------------
     # Match ONLY inside Drive contexts: a ``"file_id": "..."`` JSON key or a
     # ``/drive/v3/files/<id>`` URL path. Bare 33-44 char strings elsewhere
@@ -532,7 +553,7 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
         r"\1SCRUBBED_DRIVE_FILE_ID",
     ),
     # -------------------------------------------------------------------------
-    # 12. Escaped JSON display-name literals (T8.A6a — audit C4)
+    # 12. Escaped JSON display-name literals
     # -------------------------------------------------------------------------
     # Owner display names surface inside Google's sharing RPCs as positional
     # list elements inside a stringified WRB payload, e.g.
@@ -556,7 +577,7 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
         r'\\"SCRUBBED_NAME\\"',
     ),
     # -------------------------------------------------------------------------
-    # 13. lh3.googleusercontent.com avatar URLs (T8.A6a — audit /ogw/ group)
+    # 13. lh3.googleusercontent.com avatar URLs (both /a/ and /ogw/ paths)
     # -------------------------------------------------------------------------
     # Both the ``/a/`` and ``/ogw/`` path forms embed per-user avatar
     # tokens. The character class includes ``=`` and ``-`` because the URL
@@ -635,9 +656,17 @@ _DETECT_TOKEN_FIELDS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 # Compiled detection-only pattern for emails (no replacement string baked in).
-_DETECT_EMAIL = re.compile(_EMAIL_PATTERN_BASE)
+# Two-shape detector — mirrors the two scrubber patterns in section 5 above:
+#   1. Literal ``@`` form on the provider allowlist (JSON, mailto: hrefs).
+#   2. URL-encoded ``authuser=<email>`` query-param form for *any* domain.
+_DETECT_EMAIL = re.compile(
+    r"[A-Za-z0-9._%+\-]+@(?:"
+    + "|".join(EMAIL_PROVIDERS)
+    + r")\.com"
+    + r"|authuser=[A-Za-z0-9._%+\-]+%40[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+)
 
-# T8.A6b — upload + Drive token detectors (audit I17).
+# upload + Drive token detectors.
 #
 # Each entry is (label, regex) where the regex's group(1) captures the value
 # that must match a known scrub placeholder. The regexes deliberately accept
@@ -668,7 +697,7 @@ _DETECT_UPLOAD_DRIVE_FIELDS: list[tuple[str, re.Pattern[str]]] = [
 # NOT match — so any match here is a leak).
 _DETECT_UPLOAD_URL = re.compile(r"https://notebooklm\.google\.com/upload/_/\?[^\"\s]*upload_id=")
 
-# T8.A6a — escaped JSON display-name literal detector (audit C4).
+# escaped JSON display-name literal detector.
 #
 # Matches ``\"First Last\"`` inside a double-encoded JSON string. The
 # false-positive allowlist is consulted at the call site in ``is_clean``
@@ -678,7 +707,7 @@ _DETECT_UPLOAD_URL = re.compile(r"https://notebooklm\.google\.com/upload/_/\?[^\
 # directly.
 _DETECT_DISPLAY_NAME_ESCAPED = re.compile(r'\\"([A-Z][a-z]+(?: [A-Z][a-z]+)+)\\"')
 
-# T8.A6a — avatar URL detector (audit /ogw/ group). The pattern matches
+# avatar URL detector (/ogw/ group). The pattern matches
 # both ``/a/`` and ``/ogw/`` path forms. The scrubber collapses the entire
 # URL to ``SCRUBBED_AVATAR_URL``, so any match here is by definition a
 # leak (the placeholder string doesn't itself contain ``lh3.``).
@@ -688,7 +717,7 @@ _DETECT_AVATAR_URL = re.compile(r"https?://lh3\.googleusercontent\.com/(?:a|ogw)
 def is_clean(text: str) -> tuple[bool, list[str]]:
     """Validate that ``text`` contains no unredacted sensitive data.
 
-    Closes audit finding I7: cookie-value cleanliness is judged by exact
+    Closes the cookie-value leak heuristic: cleanliness is judged by exact
     membership in :data:`SCRUB_PLACEHOLDERS`, NOT by the legacy "starts with
     S" character-class heuristic that allowed any real secret beginning with
     ``S`` (and there are plenty — SID values, SAPISID values, OAuth ``state``
@@ -704,7 +733,7 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
     ``(ok, leaks)`` where ``ok`` is ``True`` iff ``leaks`` is empty. Each leak
     string is a human-readable description suitable for printing in CI output.
 
-    Display-name + avatar coverage (T8.A6a)
+    Display-name + avatar coverage
     ---------------------------------------
     Escaped display-name literals (``\\"First Last\\"`` inside double-
     encoded WRB payloads) and ``lh3.googleusercontent.com/(a|ogw)/`` avatar
@@ -741,8 +770,14 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
                 )
 
     # --- 2. Real email addresses (any provider we redact) -------------------
+    # Skip canonical placeholders so the provider-agnostic ``authuser=``
+    # branch of ``_DETECT_EMAIL`` (which matches any TLD) doesn't re-flag
+    # the scrubbed replacement on a second pass.
     for match in _DETECT_EMAIL.finditer(text):
-        leaks.append(f"Leak (email): {match.group(0)!r}")
+        matched = match.group(0)
+        if matched in SCRUB_PLACEHOLDERS:
+            continue
+        leaks.append(f"Leak (email): {matched!r}")
 
     # --- 3. Token / ID fields that should be redacted ----------------------
     for label, regex in _DETECT_TOKEN_FIELDS:
@@ -751,20 +786,20 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
             if value not in SCRUB_PLACEHOLDERS:
                 leaks.append(f"Leak ({label}): {value!r}")
 
-    # --- 4. T8.A6b — upload + Drive token fields ---------------------------
+    # --- 4. Upload + Drive token fields ------------------------------------
     for label, regex in _DETECT_UPLOAD_DRIVE_FIELDS:
         for match in regex.finditer(text):
             value = match.group(1)
             if value not in SCRUB_PLACEHOLDERS:
                 leaks.append(f"Leak ({label}): {value!r}")
 
-    # --- 5. T8.A6b — full upload URL --------------------------------------
+    # --- 5. Full upload URL -----------------------------------------------
     # The scrubber collapses the entire URL to ``SCRUBBED_UPLOAD_URL``, so any
     # match of the raw URL form here is by definition a leak.
     for match in _DETECT_UPLOAD_URL.finditer(text):
         leaks.append(f"Leak (upload URL): {match.group(0)!r}")
 
-    # --- 6. T8.A6a — escaped display-name literals -------------------------
+    # --- 6. Escaped display-name literals ----------------------------------
     # The false-positive allowlist (font families, UI titles, artifact /
     # notebook names) is consulted here rather than baked into the regex so
     # the detector stays simple and the allowlist remains observable.
@@ -774,10 +809,116 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
             continue
         leaks.append(f"Leak (escaped display name): {match.group(0)!r}")
 
-    # --- 7. T8.A6a — avatar URLs ------------------------------------------
+    # --- 7. Avatar URLs ---------------------------------------------------
     # The scrubber collapses the whole URL to ``SCRUBBED_AVATAR_URL``, so any
     # match of the raw URL form here is by definition a leak.
     for match in _DETECT_AVATAR_URL.finditer(text):
         leaks.append(f"Leak (avatar URL): {match.group(0)!r}")
 
     return (not leaks, leaks)
+
+
+# =============================================================================
+# Synthetic error-response builders for VCR recording
+# =============================================================================
+#
+# These helpers exist so error-shape cassettes can be generated whose
+# responses match the shapes our client's exception mapping in
+# ``src/notebooklm/_core.py`` keys on:
+#
+#   - HTTP 429  -> ``_TransportRateLimited`` -> ``RateLimitError``
+#   - HTTP 5xx  -> ``_TransportServerError`` -> ``ServerError``
+#   - HTTP 400  -> ``is_auth_error()``       -> refresh path + ``AuthError`` on
+#                                               second failure
+#
+# The synthetic bodies are **not** captured from Google. They are deliberately
+# minimal and exist purely to validate client-side exception mapping. Documented
+# warning lives in ``docs/development.md`` under "Synthetic error cassettes".
+
+ERROR_MODE_RATE_LIMIT = "429"
+ERROR_MODE_SERVER = "5xx"
+ERROR_MODE_EXPIRED_CSRF = "expired_csrf"
+
+VALID_ERROR_MODES: frozenset[str] = frozenset(
+    {ERROR_MODE_RATE_LIMIT, ERROR_MODE_SERVER, ERROR_MODE_EXPIRED_CSRF}
+)
+
+# Filename prefix that error-cassette generators MUST apply to cassettes
+# produced through this plumbing. The prefix is mechanical: it lets a
+# reader of ``tests/cassettes/`` distinguish synthetic error shapes from real
+# recordings at a glance, without having to open the YAML.
+SYNTHETIC_ERROR_CASSETTE_PREFIX = "error_synthetic_"
+
+
+def synthetic_error_cassette_name(mode: str, slug: str) -> str:
+    """Build the canonical ``error_synthetic_<mode>_<slug>.yaml`` filename.
+
+    Args:
+        mode: One of ``VALID_ERROR_MODES``.
+        slug: A short identifier for the RPC being recorded (e.g. ``"list_notebooks"``).
+
+    Raises:
+        ValueError: If ``mode`` is not a recognized synthetic-error mode.
+    """
+    if mode not in VALID_ERROR_MODES:
+        raise ValueError(
+            f"Unknown synthetic error mode {mode!r}. Valid modes: {sorted(VALID_ERROR_MODES)}"
+        )
+    return f"{SYNTHETIC_ERROR_CASSETTE_PREFIX}{mode}_{slug}.yaml"
+
+
+def build_synthetic_error_response(
+    mode: str,
+) -> tuple[int, bytes, dict[str, str]]:
+    """Return a ``(status_code, body, headers)`` triple for a synthetic error.
+
+    The shape is intentionally minimal; the client's exception mapping keys on
+    the HTTP status code (see ``_core.py:is_auth_error`` and the 429 / 5xx
+    branches in ``_perform_authed_post``), so a syntactically-valid Google
+    error-shaped body is sufficient.
+
+    For the ``expired_csrf`` mode we return HTTP 400 — not 401 — because that
+    matches the documented Google contract: NotebookLM returns 400 (not 401/403)
+    when the embedded CSRF token has expired, which is why ``is_auth_error``
+    treats 400 as an auth-refresh trigger. See ``is_auth_error`` in
+    ``src/notebooklm/_core.py``.
+
+    Args:
+        mode: One of ``VALID_ERROR_MODES``.
+
+    Returns:
+        A tuple of ``(status_code, body_bytes, headers_dict)`` suitable for
+        constructing an ``httpx.Response``.
+
+    Raises:
+        ValueError: If ``mode`` is not a recognized synthetic-error mode.
+    """
+    if mode == ERROR_MODE_RATE_LIMIT:
+        body = (
+            b'{"error": {"code": 429, "message": "Rate limited", "status": "RESOURCE_EXHAUSTED"}}'
+        )
+        # Retry-After is honored by the 429 retry loop in ``_perform_authed_post``.
+        # Setting a small value keeps the recording-time loop short.
+        headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "Retry-After": "1",
+        }
+        return (429, body, headers)
+    if mode == ERROR_MODE_SERVER:
+        body = b'{"error": {"code": 500, "message": "Internal error"}}'
+        headers = {"Content-Type": "application/json; charset=UTF-8"}
+        return (500, body, headers)
+    if mode == ERROR_MODE_EXPIRED_CSRF:
+        # NotebookLM returns 400 (not 401/403) for expired CSRF — this matches
+        # the ``is_auth_error`` branch that treats 400/401/403 as auth-refresh
+        # triggers. The body shape echoes Google's typical "invalid request"
+        # response; the client keys on status code, not body, for this path.
+        body = (
+            b'{"error": {"code": 400, "message": "Invalid request token", '
+            b'"status": "INVALID_ARGUMENT"}}'
+        )
+        headers = {"Content-Type": "application/json; charset=UTF-8"}
+        return (400, body, headers)
+    raise ValueError(
+        f"Unknown synthetic error mode {mode!r}. Valid modes: {sorted(VALID_ERROR_MODES)}"
+    )

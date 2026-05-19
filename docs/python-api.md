@@ -53,13 +53,7 @@ notebooks, sources = await asyncio.gather(
 )
 ```
 
-The client is **not thread-safe**. Do not share a `NotebookLMClient` across threads or across multiple event loops. Create one client per loop.
-
-#### Behavior under concurrent token refresh
-
-The current implementation does not snapshot auth state at the start of each RPC. If a token refresh completes while an RPC is in flight, the in-flight call may observe a mix of pre-refresh and post-refresh credentials between its URL build (`_build_url`), body build (`build_request_body`), and HTTP send (`_http_client.post`). The typical visible symptom is a 401 that triggers a retry — which the client handles transparently.
-
-A consistent `(csrf_token, session_id, cookies)` snapshot per `rpc_call` is planned for a later phase of the remediation work; the snapshot will eliminate the mixed-credential window. Until then, treat the auth-refresh path as best-effort: concurrent RPCs across a refresh boundary may individually fail and retry, but state will not become silently corrupted.
+The client is **not thread-safe**. Do not share a `NotebookLMClient` across threads or across multiple event loops. Create one client per loop. A loop-affinity guard raises a clear `RuntimeError` on the authed POST hot path if you do — see the [Concurrency contract](#concurrency-contract) section below for the full guarantees, non-guarantees, and production patterns.
 
 If we ever provide thread-safety, it will be a versioned, opt-in API change. Do not assume it.
 
@@ -257,6 +251,338 @@ except NonIdempotentRetryError:
 
 ---
 
+## Concurrency contract
+
+This section is the canonical answer to "is `NotebookLMClient` safe to use from
+multiple coroutines / threads / processes / event loops?" The concurrency model
+documented here has been hardened to support high-concurrency programmatic
+clients (long-running agents, parallel `asyncio.gather` over many notebooks,
+multi-process fleets).
+
+If you only read one subsection, read **[Non-guarantees](#non-guarantees)** —
+the guard rails are narrow.
+
+### Guarantees
+
+**Per-loop async safety.** A `NotebookLMClient` instance is bound to the
+event loop on which it was opened. A loop-affinity guard checks
+the active loop on the authed POST hot path — `rpc_call()` →
+`query_post()` → `_perform_authed_post()` — and raises a clear `RuntimeError`
+when the instance is re-used from a different loop. **Scope limitation:** the
+guard fires on the hot path only. Two cold paths reach asyncio primitives
+before the guard runs:
+
+- `ChatAPI.ask` calls `next_reqid()` before its `query_post() →
+  _perform_authed_post` chain. The first cross-loop call's `_reqid_lock` will
+  raise a deep asyncio `RuntimeError` (not the friendly loop-affinity message).
+- `close()` awaits `save_cookies` + `aclose` and never routes through
+  `_perform_authed_post`; cross-loop close gets a deep asyncio error.
+
+In both cases you still get a `RuntimeError` — just an opaque one. **Best
+practice:** one client per loop, full stop.
+
+**Refresh deduplication**. Concurrent RPCs that all
+trigger a token refresh share a single underlying refresh attempt via
+`_refresh_lock` + `asyncio.shield`. Waiter cancellation does not kill the
+shared refresh task; the next caller in line picks up the finished tokens.
+
+**Request-ID monotonicity**. `next_reqid()` returns a monotonic
+sequence across concurrent coroutines on the same client. Guarded by
+`_reqid_lock`.
+
+**Per-attempt and across-attempt auth snapshot atomicity**.
+`_auth_snapshot_lock` serializes `_AuthSnapshot` reads against the
+refresh-side mutation block — without this, a token refresh that
+completed between the URL-build step and the POST step could produce a
+URL stitched together from a mix of pre- and post-refresh credentials
+(stale `session_id`, fresh `authuser`, etc.), which Google rejects with
+an opaque auth error. `_build_url` consumes the snapshot rather than
+reading live `session_id` / `authuser` / `account_email` fields, so the
+URL and the headers come from a single consistent auth tuple. (This
+obsoletes the warning in the older "Concurrency model" subsection
+above.)
+
+**Idempotent create RPCs**. The following calls are
+idempotent under retry via probe-then-create (when `idempotent=True`,
+which is the default):
+
+- `client.notebooks.create(title)`
+- `client.sources.add_url(notebook_id, url)` (YouTube URLs are auto-detected
+  and routed through the YouTube source pathway internally)
+
+`client.sources.add_text(notebook_id, title, content)` is **declared
+non-idempotent**: text sources lack a reliable server-side dedupe key
+(Google permits duplicate titles, and content is not exposed in source
+listings). With `idempotent=True` it raises `NonIdempotentRetryError`. If
+you set `disable_internal_retries=True` on the client, the probe-then-retry
+wrapper is skipped entirely and the caller is responsible for retry
+semantics.
+
+**Cancellation safety.** Several paths are now shielded against
+cancellation:
+
+- **`close()`** is shielded; Ctrl-C during shutdown will not leak the
+  underlying `httpx.AsyncClient`.
+- **`refresh_auth()`** runs the shared refresh task under `asyncio.shield`;
+  cancelling a waiter does not kill the shared refresh.
+- **Upload finalize** is shielded; on cancel signal we issue a best-effort
+  Scotty (Google's internal resumable upload service) cancel to release the
+  server-side upload slot.
+- **`notes.create`** shields the `UPDATE_NOTE` finalize step and cleans up
+  the partial note on cancel.
+- **`wait_for_sources`** cancels sibling pollers on the first poller's
+  failure rather than letting them race to emit error messages.
+- **`wait_for_completion`** uses a leader/follower polling-dedupe registry
+  with a shielded leader task — follower cancellation does not kill the
+  leader's poll.
+
+**Idempotent file uploads.** `SourcesAPI.add_file` closes its file handle
+under a TOCTOU-safe path and gates concurrent uploads via the
+`max_concurrent_uploads` semaphore so a large fan-out can't exhaust the
+per-process file descriptor limit.
+
+### Non-guarantees
+
+**NOT thread-safe.** A `NotebookLMClient` instance must not be shared
+across OS threads. The internal locks (`_refresh_lock`, `_reqid_lock`,
+`_auth_snapshot_lock`) are `asyncio.Lock` instances and do not protect
+against concurrent OS-thread access. If you need a client per thread,
+construct one per thread.
+
+**NOT reusable across event loops.** Per the loop-affinity guard above,
+the hot path raises `RuntimeError` when an instance is re-used on a
+different loop. Cold paths (`next_reqid()`, `close()`) raise an opaque
+asyncio `RuntimeError` instead — same outcome, less helpful message.
+
+**`ChatAPI._cache` is per-instance.** Chat-conversation IDs cached
+inside a `NotebookLMClient` (on the `client.chat` sub-client) are not
+shared across clients in the same process and never persisted across
+processes. Two clients pointed at the same notebook will not share
+follow-up context.
+
+**Cookies in storage are eventually-consistent across processes.** When
+multiple processes share a storage path, an OS-level file lock plus a
+snapshot/delta merge (see `docs/auth-keepalive.md` §3.4) keep concurrent
+writers from corrupting the file. They may, however, observe brief
+staleness — a write committed by process A may not be visible to a
+sibling read in process B until the next refresh cycle. Within a single
+process, in-process dedupe ensures only one keepalive task runs per
+canonicalized storage path.
+
+### Production patterns
+
+**One client per app, dependency-injected.** A `NotebookLMClient` is
+designed to be a long-lived process resource. In FastAPI, attach it to
+the app lifespan:
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Depends, Request
+from notebooklm import NotebookLMClient
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with await NotebookLMClient.from_storage() as client:
+        app.state.notebooklm = client
+        yield
+    # client.close() happens via __aexit__
+
+def get_client(request: Request) -> NotebookLMClient:
+    return request.app.state.notebooklm
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/notebooks")
+async def list_notebooks(client: NotebookLMClient = Depends(get_client)):
+    return await client.notebooks.list()
+```
+
+Constraint: FastAPI runs on a single event loop per worker, so one client
+per worker is correct. If you run multiple Uvicorn workers, each worker
+owns its own client. **Do not** stash a `NotebookLMClient` on a
+process-global outside the lifespan — multi-worker servers fork the
+process and you will end up with the same client object referencing
+different event loops.
+
+**`ConnectionLimits` tuning**. The HTTP pool defaults
+(`max_connections=100`, `max_keepalive_connections=50`,
+`keepalive_expiry=30.0`) are sized for typical batchexecute fan-out: a
+few dozen concurrent RPCs against a single host with keep-alives held
+for an interactive session. Tune via `notebooklm.types.ConnectionLimits`:
+
+```python
+from notebooklm import NotebookLMClient
+from notebooklm.types import ConnectionLimits
+
+limits = ConnectionLimits(
+    max_connections=200,         # widen the pool for a heavy worker
+    max_keepalive_connections=100,
+    keepalive_expiry=60.0,
+)
+client = NotebookLMClient(auth, limits=limits, max_concurrent_rpcs=64)
+```
+
+For single-request CLI workloads the defaults are wasteful but harmless.
+
+**`max_concurrent_rpcs` knob**. A semaphore at
+`_perform_authed_post` caps simultaneous in-flight RPC POSTs. Default
+`16` — well below the default pool size so short-lived helper requests
+(refresh GETs, upload preflights) still have pool headroom. Pass `None`
+to opt out entirely (e.g. when an external rate-limiter handles
+back-pressure). The backoff for 429 / 5xx retries is held **inside** the
+semaphore for a circuit-breaker effect: a slow request keeps its slot
+while it waits, so the gate naturally throttles fan-out when the server
+is unhappy.
+
+Worst-case slot hold time:
+
+| Path | Bound | Default |
+|---|---|---|
+| 429 retry loop | `rate_limit_max_retries × MAX_RETRY_AFTER_SECONDS` | 3 × 300 = 900s |
+| 5xx / network retry loop | `server_error_max_retries × 30s` (capped backoff) | 3 × 30 = 90s |
+
+If your workload's tail latency is sensitive, lower
+`rate_limit_max_retries` or tighten the semaphore — slot hold time on
+the 429 path is the load-bearing variable.
+
+**Constraint** (enforced at construction): `max_concurrent_rpcs ≤
+ConnectionLimits.max_connections`. A higher RPC ceiling than the pool
+capacity would let the semaphore admit requests the pool can't fulfill,
+producing opaque `httpx.PoolTimeout` errors instead of clean
+back-pressure. The `NotebookLMClient.__init__` / `from_storage()`
+constructor raises `ValueError` if this constraint is violated. The
+semaphore floor (`max_concurrent_rpcs ≥ 1` when not `None`) is enforced
+inside `ClientCore`.
+
+**`max_concurrent_uploads` knob**. Default `4`. Gates
+file-upload streaming independently from the RPC throttle because
+uploads use their own `httpx.AsyncClient` (Scotty endpoint) and do not
+share the RPC connection pool. The motivation is FD exhaustion: each
+in-flight upload holds one open file descriptor for the duration of the
+upload, so an unbounded fan-out blows the per-process FD limit. `None`
+resolves to the default (4); truly unbounded uploads are intentionally
+not supported. Must be `≥ 1` when set explicitly.
+
+**Rate-limit retry defaults**. `rate_limit_max_retries=3`,
+`server_error_max_retries=3`. The 429 path honors the `Retry-After`
+header when parseable (clamped at `MAX_RETRY_AFTER_SECONDS = 300s`);
+when the header is absent or unparseable, the loop falls back to
+exponential backoff `min(2^attempt, 30)` seconds with ±20% jitter
+(where `attempt` starts at `0`, so the first retry sleeps ~1 s ± 20%
+before doubling), matching the 5xx path. Set either to `0` to restore
+the pre-retry-loop behavior of raising `RateLimitError` / `ServerError`
+immediately.
+
+**Observability hooks.** The client exposes stdlib-only observability so
+applications can choose their own metrics backend:
+
+```python
+from notebooklm import NotebookLMClient, correlation_id
+
+events = []
+
+async with await NotebookLMClient.from_storage(on_rpc_event=events.append) as client:
+    with correlation_id("batch-import-42"):
+        await client.notebooks.list()
+
+    snapshot = client.metrics_snapshot()
+    print(snapshot.rpc_calls_succeeded, snapshot.rpc_queue_wait_seconds_max)
+```
+
+`on_rpc_event` receives a `RpcTelemetryEvent` for each logical RPC
+completion. `metrics_snapshot()` returns cumulative counters for RPC
+success/failure, retry counts, semaphore queue waits, upload queue waits,
+and internal lock wait time. The package does not depend on Prometheus or
+OpenTelemetry; forward these values to whichever backend your service uses.
+
+**Graceful shutdown.** Long-lived services can stop admitting new client
+operations and wait for in-flight operations before closing:
+
+```python
+await client.close(drain=True, drain_timeout=30.0)
+```
+
+`client.drain(timeout=...)` is also available when your framework owns
+transport shutdown separately. Once drain starts, new operations raise
+`RuntimeError`; if the timeout expires, the client remains in draining mode.
+`close(drain=True, ...)` still closes the transport after a drain timeout and
+then re-raises the timeout.
+
+**Upload-timeout configuration**. `client.sources.add_file(...)`
+and the related upload entry points accept an `upload_timeout` argument
+that is decoupled from the global `timeout`. A long-running upload of
+a large file should not have to widen the global HTTP timeout to
+succeed; pass `upload_timeout=600.0` (or larger) to the relevant call
+sites instead.
+
+### Single-process multi-tenant guidance
+
+For a service that handles multiple NotebookLM tenants (different
+`AuthTokens`, typically one per user), spin up **one
+`NotebookLMClient` per tenant**. There is no cross-tenant
+`ChatAPI._cache` bleed (the cache is per-instance), and the
+loop-affinity guard plus the per-instance refresh state means tenants
+cannot accidentally observe each other's auth.
+
+Cookie storage paths must be canonicalized so two clients pointing at
+the same logical storage file don't run racing keepalive loops; the
+keepalive code path handles this automatically.
+
+### Constraints enforced at construction
+
+These validations run in `NotebookLMClient.__init__` /
+`NotebookLMClient.from_storage()` (and `ClientCore.__init__` for the
+floor checks). All raise `ValueError`:
+
+- `max_concurrent_rpcs ≤ ConnectionLimits.max_connections` when both are
+  set (skipped when either is `None`).
+- `max_concurrent_rpcs ≥ 1` when not `None`.
+- `max_concurrent_uploads ≥ 1` when not `None`.
+- `rate_limit_max_retries ≥ 0`.
+- `server_error_max_retries ≥ 0`.
+- `keepalive` must be `None` or a positive finite number; values below
+  `keepalive_min_interval` (default `60s`) are clamped up to that floor.
+
+---
+
+## Internal module map
+
+`ClientCore` (in `src/notebooklm/_core.py`) is the orchestrator that owns
+the `httpx.AsyncClient`, glues the authed transport to RPC dispatch, and
+holds the `AuthTokens` for the running session. The supporting state
+(metrics, drain bookkeeping, request-id counter, transport plumbing,
+conversation cache, etc.) is split across single-responsibility seam
+modules under `notebooklm._core_*`. The split is internal — first-party
+callers continue to import `ClientCore` and the documented constants
+from `notebooklm._core` — but it matters when reading the source, when
+writing unit tests against a stub host, or when tracing where a
+particular ivar lives.
+
+| Module | Owns | Notes |
+|---|---|---|
+| `_core` | `ClientCore` orchestrator; HTTP client lifecycle; module-level constants (`MAX_CONVERSATION_CACHE_SIZE`, `MAX_RETRY_AFTER_SECONDS`, `DEFAULT_TIMEOUT`, etc.); `is_auth_error`, `save_cookies_to_storage`; error-injection seam `_SyntheticErrorTransport` + `_get_error_injection_mode` consumed by `_core_transport`'s retry loops. | Public/internal contract — names imported from `notebooklm._core` stay stable. |
+| `_core_auth` (Phase 2 in progress) | `AuthRefreshCoordinator`: refresh-task lifecycle, refresh lock, `_AuthSnapshot` rotation. | Lazy `asyncio.Lock` construction; never instantiated outside a running loop. |
+| `_core_cache` | Per-instance LRU `_conversation_cache` for `ChatAPI` continuity. | Pure in-process state; not shared across `ClientCore` instances. |
+| `_core_cookie_persistence` | Cookie-jar → storage-state serialization, `__Secure-1PSIDTS` rotation. | Exposes a `SaveCookiesToStorage` Protocol host. |
+| `_core_drain` | `TransportDrainTracker`: in-flight transport counters, `_TransportOperationToken`, lazy `asyncio.Condition` powering `client.drain(...)`. | Construction is event-loop-agnostic; the `Condition` is allocated on first use. |
+| `_core_lifecycle` (Phase 2 in progress) | `ClientLifecycle`: loop-affinity guard, `aclose` plumbing, keepalive task wiring. | Currently inlined in `_core.py`; extraction tracked in the core-decomposition mini-phase. |
+| `_core_metrics` | `ClientMetrics`: `ClientMetricsSnapshot` counters, `_metrics_lock`, `on_rpc_event` callback, queue-wait recorders. | `__init__` is event-loop-agnostic; `emit_rpc_event` is `async` and intentionally awaits the user callback (back-pressure). |
+| `_core_polling` | Pending-poll registry shared by long-running artifact generations. | Tracked via `PollRegistryProvider` in `_capabilities.py`. |
+| `_core_reqid` | `ReqidCounter`: monotonic `_reqid` for the chat backend, lazy `asyncio.Lock` for concurrent `ChatAPI.ask` callers. | Baseline `_value=100000`, default `step=100000` — both are chat-API contract values; do not change. |
+| `_core_rpc` | RPC dispatch executor; exposes `DecodeResponse` and `RpcOwner` Protocols so callers can be unit-tested against a stub. | Phase 3 (in progress) collapses the `_core.py`-side `rpc_call` body into this module. |
+| `_core_transport` | Authed HTTP POST path, retry loops (429 + 5xx), `_AuthedTransportHost` Protocol. | Owns `_TransportAuthExpired` / `_TransportRateLimited` / `_TransportServerError` transport-level exceptions. |
+
+The capability surface that sub-clients depend on is pinned in
+`notebooklm._capabilities` via 9 narrow Protocols (`CoreRPCProvider`,
+`SourceListProvider`, `CoreReqIdProvider`, `ChatStreamingProvider`,
+`PollRegistryProvider`, `AuthRouteProvider`, `CookieJarProvider`,
+`TransportOperationProvider`, `UploadConcurrencyProvider`), composed into
+the concrete `ClientCoreCapabilities` adapter. Adding or removing a
+method on `ClientCore` is a Protocol change — review `_capabilities.py`
+alongside any change to the orchestrator's public method surface.
+
+---
+
 ## API Reference
 
 ### NotebookLMClient
@@ -282,7 +608,7 @@ class NotebookLMClient:
         profile: str | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = 60.0,
-        rate_limit_max_retries: int = 0,
+        rate_limit_max_retries: int = 3,
         server_error_max_retries: int = 3,
         limits: ConnectionLimits | None = None,
     ) -> "NotebookLMClient"
@@ -292,13 +618,28 @@ class NotebookLMClient:
         storage_path: Path | None = None,
         keepalive: float | None = None,
         keepalive_min_interval: float = 60.0,
-        rate_limit_max_retries: int = 0,
+        rate_limit_max_retries: int = 3,
         server_error_max_retries: int = 3,
         limits: ConnectionLimits | None = None,
     )
 
     async def refresh_auth(self) -> AuthTokens
+
+    async def rpc_call(
+        self,
+        method: RPCMethod,
+        params: list[Any],
+        source_path: str = "/",
+        allow_null: bool = False,
+        _is_retry: bool = False,
+        *,
+        disable_internal_retries: bool = False,
+    ) -> Any
 ```
+
+`RPCMethod` is imported from `notebooklm.rpc` for raw-RPC calls; `Any` is
+`typing.Any`. `_is_retry` is present only to preserve parity with the core
+delegator and should normally be left as `False`.
 
 **Long-lived clients:** pass `keepalive=<seconds>` to spawn a background task
 that periodically pokes `accounts.google.com` and persists any rotated
@@ -315,11 +656,17 @@ for the full layered story.
   `httpx.RequestError` (timeouts, connect errors) with exponential backoff
   capped at 30 seconds (`min(2 ** attempt, 30)`, plus ±20% jitter to
   desynchronize concurrent retries). Set to `0` to disable.
-- `rate_limit_max_retries` (default `0`) retries HTTP 429 responses when the
-  `Retry-After` header is parseable. The default of `0` preserves the
-  pre-Phase-3 contract of raising `RateLimitError` immediately so callers
-  can implement their own back-off policy; bump to a positive value to opt
-  into automatic retry.
+- `rate_limit_max_retries` (default `3`) retries HTTP 429 responses.
+  Each retry sleeps for the server's `Retry-After` value when parseable;
+  otherwise the loop falls back to the same capped-exponential-backoff
+  schedule used for 5xx (`min(2 ** attempt, 30)` seconds with ±20%
+  jitter) so the positive default is still useful when Google omits the
+  hint. Set to `0` to raise `RateLimitError` immediately (e.g. when the
+  calling code implements its own bespoke back-off policy). Mutating
+  create RPCs (`notebooks.create`, `sources.add_url`) opt out of this
+  loop via `disable_internal_retries` so the API-layer
+  `idempotent_create` probe-then-retry wrapper can own recovery for
+  mutating calls.
 - `limits` accepts a `ConnectionLimits` dataclass to tune the underlying
   `httpx` connection pool. The default (`ConnectionLimits()`) sets
   `max_connections=100`, `max_keepalive_connections=50`,
@@ -330,11 +677,14 @@ for the full layered story.
 ```python
 from notebooklm import ConnectionLimits, NotebookLMClient
 
-# Allow up to 3 retries on rate limits, widen the pool for a heavy worker
+# Default ``rate_limit_max_retries=3`` is on; widen the pool for a heavy worker
 async with await NotebookLMClient.from_storage(
-    rate_limit_max_retries=3,
     limits=ConnectionLimits(max_connections=200, max_keepalive_connections=100),
 ) as client:
+    ...
+
+# Opt out of automatic 429 retries (e.g. for a bespoke back-off layer)
+async with await NotebookLMClient.from_storage(rate_limit_max_retries=0) as client:
     ...
 ```
 
@@ -408,7 +758,7 @@ print(url)
 | `get_guide(notebook_id, source_id)` | `str, str` | `dict` | Get AI-generated summary and keywords |
 | `add_url(notebook_id, url, wait=False, wait_timeout=120.0)` | `str, str, bool, float` | `Source` | Add URL source (autodetects YouTube URLs and routes them appropriately) |
 | `add_text(notebook_id, title, content, wait=False, wait_timeout=120.0)` | `str, str, str, bool, float` | `Source` | Add text content |
-| `add_file(notebook_id, file_path, mime_type=None, wait=False, wait_timeout=120.0, *, title=None)` | `str, str \| Path, str \| None, bool, float, *, str \| None` | `Source` | Upload file. `mime_type` is **deprecated** and ignored (server infers from filename); passing non-`None` raises `DeprecationWarning`. `title` (keyword-only) sets the display name via a post-upload `UPDATE_SOURCE` and forces a brief registration wait even when `wait=False`. |
+| `add_file(notebook_id, file_path, mime_type=None, wait=False, wait_timeout=120.0, *, title=None, on_progress=None)` | `str, str \| Path, str \| None, bool, float, *, str \| None, Callable \| None` | `Source` | Upload file. `mime_type` is **deprecated** and ignored (server infers from filename); passing non-`None` raises `DeprecationWarning`. `title` (keyword-only) sets the display name via a post-upload `UPDATE_SOURCE` and forces a brief registration wait even when `wait=False`. `on_progress(bytes_sent, total_bytes)` may be sync or async. |
 | `add_drive(notebook_id, file_id, title, mime_type)` | `str, str, str, str` | `Source` | Add Google Drive doc |
 | `rename(notebook_id, source_id, new_title)` | `str, str, str` | `Source` | Rename source |
 | `refresh(notebook_id, source_id)` | `str, str` | `bool` | Refresh URL/Drive source |
@@ -483,7 +833,7 @@ print(f"Keywords: {guide['keywords']}")
 | `delete(notebook_id, artifact_id)` | `str, str` | `bool` | Delete artifact |
 | `rename(notebook_id, artifact_id, new_title)` | `str, str, str` | `None` | Rename artifact |
 | `poll_status(notebook_id, task_id)` | `str, str` | `GenerationStatus` | Check generation status |
-| `wait_for_completion(notebook_id, task_id, ...)` | `str, str, ...` | `GenerationStatus` | Wait for generation |
+| `wait_for_completion(notebook_id, task_id, ...)` | `str, str, ...` | `GenerationStatus` | Wait for generation. Pass `on_status_change(status)` for sync or async progress callbacks. |
 
 #### Type-Specific List Methods
 
@@ -721,6 +1071,7 @@ else:
 | `configure(notebook_id, ...)` | `str, ...` | `None` | Set chat persona |
 | `get_history(notebook_id, limit=100, conversation_id=None)` | `str, int, str` | `list[tuple[str, str]]` | Get Q&A pairs from most recent conversation |
 | `get_conversation_id(notebook_id)` | `str` | `str \| None` | Get most recent conversation ID from server |
+| `delete_conversation(notebook_id, conversation_id)` | `str, str` | `bool` | **DESTRUCTIVE.** Permanently delete a server-side conversation (web UI's "Delete history" action). The next `ask()` with no `conversation_id` then starts a brand-new conversation. |
 
 **ask() Parameters:**
 ```python
@@ -732,6 +1083,25 @@ async def ask(
 ) -> AskResult
 ```
 
+**Conversation semantics (issue #659):**
+
+- `conversation_id=None` matches the web UI's default: the server attaches the
+  question to your current conversation on this notebook (or creates one if
+  none exists). Repeated `ask()` calls without `conversation_id` extend the
+  same conversation; they do not start fresh ones. The SDK fetches the
+  server-recorded conversation_id via `hPTbtc` after each new-conversation
+  ask and surfaces it on `AskResult.conversation_id`, so passing it back as
+  `conversation_id=` for follow-ups works as expected.
+- `conversation_id=<existing-id>` is a follow-up: the question is appended
+  to the named conversation.
+- To force a brand-new conversation, call
+  `client.chat.delete_conversation(notebook_id, last_conversation_id)`
+  first — the server then has nothing to extend and the next null-conv
+  `ask()` starts a fresh thread. **This is destructive: deleted turns
+  are not recoverable.** The method mirrors the web UI's "Delete
+  history" button (`J7Gthc` RPC) and is the same primitive the CLI's
+  `notebooklm ask --new` is built on.
+
 **Example:**
 ```python
 from notebooklm import ChatGoal, ChatResponseLength
@@ -739,6 +1109,7 @@ from notebooklm import ChatGoal, ChatResponseLength
 # Ask questions (uses all sources)
 result = await client.chat.ask(nb_id, "What are the main themes?")
 print(result.answer)
+print(result.conversation_id)  # server-recorded id, fetched via hPTbtc
 
 # Access source references (cited in answer as [1], [2], etc.)
 for ref in result.references:
@@ -751,12 +1122,21 @@ result = await client.chat.ask(
     source_ids=["src_001", "src_002"]
 )
 
-# Continue conversation
+# Continue conversation explicitly (or omit conversation_id — same effect
+# while the most-recent conversation on the notebook stays unchanged).
 result = await client.chat.ask(
     nb_id,
     "Can you elaborate on the first point?",
     conversation_id=result.conversation_id
 )
+
+# Force a fresh conversation (destructive — turns are not recoverable).
+# Mirrors the web UI's "Delete history" button.
+last_conv_id = await client.chat.get_conversation_id(nb_id)
+if last_conv_id:
+    await client.chat.delete_conversation(nb_id, last_conv_id)
+result = await client.chat.ask(nb_id, "Start fresh — what are the themes?")
+assert result.turn_number == 1
 
 # Configure persona
 await client.chat.configure(
@@ -875,7 +1255,8 @@ print(f"Imported {len(imported)} sources")
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `list(notebook_id)` | `str` | `list[Note]` | List text notes (excludes mind maps) |
-| `create(notebook_id, title="New Note", content="")` | `str, str, str` | `Note` | Create note |
+| `create(notebook_id, title="New Note", content="")` | `str, str, str` | `Note` | Create plain-text note (no citation anchors) |
+| `create_from_chat(notebook_id, ask_result, *, title=None)` | `str, AskResult, str \| None` | `Note` | Save a chat answer as a citation-rich note ([issue #660](https://github.com/teng-lin/notebooklm-py/issues/660)) — the resulting note's `[N]` markers remain interactive hover-anchored citations in the NotebookLM web UI. Raises `ValueError` if `ask_result.references` is empty. |
 | `get(notebook_id, note_id)` | `str, str` | `Optional[Note]` | Get note by ID |
 | `update(notebook_id, note_id, content, title)` | `str, str, str, str` | `None` | Update note content and title |
 | `delete(notebook_id, note_id)` | `str, str` | `bool` | Delete note |
@@ -884,7 +1265,7 @@ print(f"Imported {len(imported)} sources")
 
 **Example:**
 ```python
-# Create and manage notes
+# Create and manage plain-text notes
 note = await client.notes.create(nb_id, title="Meeting Notes", content="Discussion points...")
 notes = await client.notes.list(nb_id)
 
@@ -893,6 +1274,13 @@ await client.notes.update(nb_id, note.id, "Updated content", "New Title")
 
 # Delete a note
 await client.notes.delete(nb_id, note.id)
+
+# Save a chat answer as a citation-rich note (preserves [N] hover links)
+result = await client.chat.ask(nb_id, "What fruits are mentioned?")
+if result.references:
+    note = await client.notes.create_from_chat(nb_id, result, title="Fruit Citations")
+    # Note: the NotebookLM server may auto-generate a "smart" title for
+    # citation-rich notes; note.title reflects what the server stored.
 ```
 
 **Mind Maps:**
@@ -1554,10 +1942,9 @@ For undocumented features, you can make raw RPC calls:
 from notebooklm.rpc import RPCMethod
 
 async with await NotebookLMClient.from_storage() as client:
-    # Access the core client for raw RPC. Each RPCMethod member has its own
-    # params shape (a nested list) and `source_path`; mirror the call sites in
-    # the higher-level APIs (e.g. _notebooks.py for CREATE_NOTEBOOK) when in doubt.
-    result = await client._core.rpc_call(
+    # Each RPCMethod member has its own params shape (a nested list) and
+    # source_path; mirror the higher-level APIs when in doubt.
+    result = await client.rpc_call(
         RPCMethod.CREATE_NOTEBOOK,
         params=["My Notebook", None, None, [2], [1]],
     )

@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """Bulk re-scrub VCR cassettes for ``lh3.googleusercontent.com/(a|ogw)/`` avatar URLs.
 
-T8.B6 — collapses every ``lh3.googleusercontent.com/(?:a|ogw)/<token>`` avatar
-URL to the canonical ``SCRUBBED_AVATAR_URL`` placeholder and re-derives the
-chunked ``<count>\\n<payload>\\n`` byte-count prefixes inside every recorded
-response body. Writes back only if anything changed; idempotent on a clean
-tree.
+Collapses every ``lh3.googleusercontent.com/(?:a|ogw)/<token>`` avatar URL to
+the canonical ``SCRUBBED_AVATAR_URL`` placeholder and re-derives the chunked
+``<count>\\n<payload>\\n`` byte-count prefixes inside every recorded response
+body. Writes back only if anything changed; idempotent on a clean tree.
 
 Why this script exists
 ----------------------
-The T8.A6a avatar-URL scrubber (PR #565) added
+The avatar-URL scrubber (PR #565) added
 ``lh3.googleusercontent.com/(?:a|ogw)/<token>`` → ``SCRUBBED_AVATAR_URL`` to
 the canonical pattern registry, but the ~67 cassettes recorded BEFORE that
-pattern landed still embed the raw avatar URLs. The phase-1 audit listed
-them in ``tests/scripts/cassette_repair_allowlist.txt`` under the "/ogw/
-avatar URL group" header; this script is the one-off tool that walks each
-of those cassettes, re-scrubs them in place, and reports a byte-level diff
-so reviewers can verify the change set.
+pattern landed still embed the raw avatar URLs. They are listed in
+``tests/scripts/cassette_repair_allowlist.txt`` under the "/ogw/ avatar URL
+group" header; this script is the one-off tool that walks each of those
+cassettes, re-scrubs them in place, and reports a byte-level diff so reviewers
+can verify the change set.
 
 Why we DON'T call ``scrub_string`` here
 ---------------------------------------
 ``cassette_patterns.scrub_string`` applies every pattern in
-:data:`SENSITIVE_PATTERNS` — including the T8.A6a escaped-display-name
+:data:`SENSITIVE_PATTERNS` — including the escaped-display-name
 scrubber that anchors on ``\\"First Last\\"`` inside double-encoded WRB
 payloads. That pattern carries a small false-positive allowlist
 (``DISPLAY_NAME_FALSE_POSITIVES``) covering font families, UI titles, and
@@ -47,12 +46,18 @@ WRB payload shifted its length.
 
 Architecture notes
 ------------------
-The script parses each cassette with PyYAML (the same loader vcrpy uses —
-``yaml.CLoader`` if libyaml is available, else ``yaml.Loader``) and applies
-the scrubbers to every ``response.body.string`` field. After scrubbing, the
-cassette is re-emitted with ``yaml.dump(data, Dumper=Dumper)`` — matching
-vcrpy's own serializer (``vcrpy/serializers/yamlserializer.py``) — so a
-clean cassette round-trips identically.
+The script parses each cassette with PyYAML's **safe** loader
+(``yaml.CSafeLoader`` if libyaml is available, else ``yaml.SafeLoader``) and
+applies the scrubbers to every ``response.body.string`` field. After
+scrubbing, the cassette is re-emitted with ``yaml.dump(data, Dumper=Dumper)``
+— matching vcrpy's own serializer (``vcrpy/serializers/yamlserializer.py``)
+— so a clean cassette round-trips identically. The safe-loader choice is
+intentional (P1-22): the previous ``CLoader`` / ``Loader`` family
+deserializes arbitrary Python via ``!!python/object`` tags and is a
+documented remote-code-execution risk on untrusted input. The dumper side
+stays on the standard ``CDumper`` / ``Dumper`` because the round-trip data
+contains only ``str`` / ``bytes`` / ``dict`` / ``list`` / ``None`` /
+``int`` — all of which the safe loader accepts without trouble.
 
 We deliberately do NOT scrub the raw YAML text: a regex applied to the
 wrapped YAML form could match across YAML line-wrap boundaries and corrupt
@@ -81,14 +86,25 @@ from pathlib import Path
 
 import yaml
 
-# Use libyaml-backed loader/dumper when available — matches vcrpy's
-# ``serializers/yamlserializer.py`` exactly so a clean cassette round-trips
-# identically through this script.
+# Use libyaml-backed SAFE loader/dumper when available (P1-22). The previous
+# implementation imported the unsafe ``CLoader`` / ``Loader`` family, which
+# can deserialize arbitrary Python objects via tags like ``!!python/object``
+# and is documented as a remote-code-execution risk on untrusted YAML.
+# Cassettes are committed to the repo so the input is not adversarial today,
+# but the rescrub tool runs on any path the operator passes — including
+# downloaded cassettes from third-party debugging — so the safe loader is
+# the right default.
+#
+# The dumper side stays on the standard (non-safe) ``CDumper`` / ``Dumper``
+# because cassettes legitimately serialize ``str`` and ``bytes`` (vcrpy's
+# YAML serializer does the same), neither of which the safe loader rejects
+# on round-trip. The risk vector is on the LOAD path, not the DUMP path.
 try:
     from yaml import CDumper as Dumper
-    from yaml import CLoader as Loader
+    from yaml import CSafeLoader as Loader
 except ImportError:  # pragma: no cover — libyaml is a hard dep on dev machines
-    from yaml import Dumper, Loader  # type: ignore[assignment]
+    from yaml import Dumper  # type: ignore[assignment]
+    from yaml import SafeLoader as Loader
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TESTS_DIR = _REPO_ROOT / "tests"
@@ -156,6 +172,9 @@ def _rescrub_cassette(path: Path) -> tuple[bool, int]:
     per-file diff stat the script prints at the end of a run.
     """
     raw = path.read_text(encoding="utf-8")
+    # ``Loader`` is bound to ``CSafeLoader`` / ``SafeLoader`` at import time
+    # above — no ``!!python/object`` tags will be deserialized regardless
+    # of what the cassette contains (P1-22).
     data = yaml.load(raw, Loader=Loader)
     if not isinstance(data, dict):
         return False, 0

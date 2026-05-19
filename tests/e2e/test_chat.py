@@ -95,21 +95,29 @@ class TestChatE2E:
         assert result2.turn_number > result1.turn_number
 
     @pytest.mark.asyncio
-    async def test_ask_new_conversation_flag(self, client, multi_source_notebook_id):
-        """Test that --new flag starts a fresh conversation."""
-        # Ask first question
+    async def test_delete_conversation_forces_fresh_next_ask(
+        self, client, multi_source_notebook_id
+    ):
+        """``delete_conversation`` is the supported way to force a fresh conversation.
+
+        Without an explicit delete, a null-``conversation_id`` ``ask()`` extends
+        the most-recent server conversation (see ``ChatAPI.ask`` Note). After
+        deleting, the next null-conv ask must start a brand-new turn-1
+        conversation with a different ``conversation_id``.
+        """
         result1 = await client.chat.ask(
             multi_source_notebook_id,
             "What is covered in these sources?",
         )
+        assert result1.conversation_id
 
-        # Ask with new conversation (no conversation_id)
+        await client.chat.delete_conversation(multi_source_notebook_id, result1.conversation_id)
+
         result2 = await client.chat.ask(
             multi_source_notebook_id,
             "Start fresh - what are the main themes?",
         )
 
-        # Should be a new conversation
         assert result2.conversation_id != result1.conversation_id
         assert result2.is_follow_up is False
         assert result2.turn_number == 1

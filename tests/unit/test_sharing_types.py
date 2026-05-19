@@ -53,6 +53,13 @@ class TestSharedUser:
 
         assert user.permission == SharePermission.VIEWER
 
+    def test_from_api_response_malformed_permission(self):
+        """Test parsing with malformed permission value defaults to VIEWER."""
+        data = ["user@example.com", {"permission": 3}, []]
+        user = SharedUser.from_api_response(data)
+
+        assert user.permission == SharePermission.VIEWER
+
     def test_from_api_response_empty(self):
         """Test parsing with empty data."""
         data = []
@@ -274,6 +281,14 @@ class TestShareStatusDefaultValues:
         data = [[], [True], 1000]
         status = ShareStatus.from_api_response(data, "abc-123-xyz")
         assert status.share_url == "https://notebooklm.google.com/notebook/abc-123-xyz"
+
+    def test_share_url_quotes_notebook_id(self):
+        """Reserved characters in notebook IDs must be percent-encoded."""
+        data = [[], [True], 1000]
+        status = ShareStatus.from_api_response(data, "foo bar/baz?x")
+
+        assert status.share_url == "https://notebooklm.google.com/notebook/foo%20bar%2Fbaz%3Fx"
+        assert "foo bar/baz?x" not in status.share_url
 
     def test_share_url_none_when_private(self):
         """Test share URL is None when notebook is private."""

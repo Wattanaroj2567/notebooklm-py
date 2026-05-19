@@ -396,6 +396,42 @@ async def retry_with_backoff(coro, max_retries=3):
     raise Exception("Max retries exceeded")
 ```
 
+### Starting a brand-new conversation (resolves the older issue #659 workaround)
+
+`client.chat.ask(notebook_id, question)` with `conversation_id=None`
+attaches the question to the user's **current** conversation on the
+notebook — by design. The SDK still fetches the server-recorded
+conversation_id via `hPTbtc` after the ask and returns it on
+`AskResult.conversation_id`, so follow-ups using that id work
+correctly.
+
+To force a brand-new server-side conversation, delete the existing
+one first — this mirrors the web UI's "Delete history" button:
+
+```python
+last_conv_id = await client.chat.get_conversation_id(nb_id)
+if last_conv_id:
+    await client.chat.delete_conversation(nb_id, last_conv_id)
+result = await client.chat.ask(nb_id, "Start fresh")
+```
+
+Or via the CLI (prompts for confirmation; `-y` skips):
+
+```bash
+notebooklm ask --new -y "Start fresh"
+```
+
+**This is destructive: deleted turns are not recoverable.** The CLI
+shows the conversation's short id in the prompt and defaults to "No".
+`--json` implies `--yes` so scripted callers don't hang on stdin.
+
+**History:** Before the SDK gained `delete_conversation` it had no way
+to honor the "fresh conversation" intent — both the SDK and the CLI's
+`--new` flag would silently extend the most-recent conversation, so
+users worked around it by creating a new notebook for each thread.
+The `J7Gthc` RPC was reverse-engineered from the web UI's "Delete
+history" button and removes the need for that workaround.
+
 ### Quota Restrictions
 
 Some features have daily/hourly quotas:

@@ -8,6 +8,7 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+from conftest import install_post_as_stream
 from notebooklm._core import ClientCore, is_auth_error
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
@@ -206,6 +207,39 @@ class TestRefreshAuth:
             assert refreshed_auth.session_id == "new_session_id_456"
             assert client.auth.csrf_token == "new_csrf_token_123"
             assert client.auth.session_id == "new_session_id_456"
+
+    @pytest.mark.asyncio
+    async def test_refresh_auth_delegates_token_update(
+        self,
+        mock_auth,
+        httpx_mock: HTTPXMock,
+        monkeypatch,
+    ):
+        """refresh_auth delegates token mutation through ClientCore."""
+        client = NotebookLMClient(mock_auth)
+        html = '"SNlM0e":"new_csrf_token_123" "FdrFJe":"new_session_id_456"'
+        httpx_mock.add_response(
+            url="https://notebooklm.google.com/",
+            content=html.encode(),
+        )
+        calls: list[tuple[str, str]] = []
+
+        async def fake_update(csrf: str, session_id: str) -> None:
+            calls.append((csrf, session_id))
+            client._core.auth.csrf_token = csrf
+            client._core.auth.session_id = session_id
+
+        monkeypatch.setattr(client._core, "update_auth_tokens", fake_update)
+
+        async with client:
+            refreshed_auth = await client.refresh_auth()
+
+        assert calls == [("new_csrf_token_123", "new_session_id_456")]
+        assert refreshed_auth.csrf_token == "new_csrf_token_123"
+        assert refreshed_auth.session_id == "new_session_id_456"
+        assert client._core.auth is refreshed_auth
+        assert client._core.auth.csrf_token == "new_csrf_token_123"
+        assert client._core.auth.session_id == "new_session_id_456"
 
     @pytest.mark.asyncio
     async def test_refresh_auth_routes_to_account_email(self, httpx_mock: HTTPXMock):
@@ -453,8 +487,15 @@ class TestClientCoreRefreshCallback:
         core = ClientCore(auth)
         assert core._refresh_callback is None
 
-    def test_refresh_lock_created_when_callback_provided(self):
-        """ClientCore should create refresh lock when callback provided."""
+    def test_refresh_lock_lazy_at_construction(self):
+        """Refresh lock is ``None`` at construction regardless of callback.
+
+        Lazy-init mirrors ``_reqid_lock`` / ``_auth_snapshot_lock`` so the
+        client can be constructed outside a running event loop. The lock
+        is allocated on first ``_await_refresh`` call. See
+        ``test_refresh_state_machine_lazy_lock.py`` for the construction-
+        outside-loop and first-refresh-creates-lock guarantees.
+        """
         auth = AuthTokens(
             cookies={"SID": "test", "__Secure-1PSIDTS": "test_1psidts"},
             csrf_token="csrf",
@@ -464,21 +505,15 @@ class TestClientCoreRefreshCallback:
         async def mock_refresh():
             pass
 
-        core = ClientCore(auth, refresh_callback=mock_refresh)
-        assert core._refresh_lock is not None
-        assert isinstance(core._refresh_lock, asyncio.Lock)
+        # With callback: lazy — lock is None until first refresh attempt.
+        core_with_cb = ClientCore(auth, refresh_callback=mock_refresh)
+        assert core_with_cb._refresh_lock is None
+        assert core_with_cb._refresh_callback is mock_refresh
 
-    def test_no_refresh_lock_when_no_callback(self):
-        """ClientCore should NOT create refresh lock when no callback."""
-
-        auth = AuthTokens(
-            cookies={"SID": "test", "__Secure-1PSIDTS": "test_1psidts"},
-            csrf_token="csrf",
-            session_id="sid",
-        )
-
-        core = ClientCore(auth)
-        assert core._refresh_lock is None
+        # Without callback: also None (unchanged behavior on this axis).
+        core_without_cb = ClientCore(auth)
+        assert core_without_cb._refresh_lock is None
+        assert core_without_cb._refresh_callback is None
 
 
 # =============================================================================
@@ -521,6 +556,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
         core._http_client.headers = {"Cookie": "old"}
 
         with patch("notebooklm._core.decode_response", return_value=["result"]):
@@ -556,6 +592,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
         core._http_client.headers = {"Cookie": "old"}
 
         decode_call_count = [0]
@@ -595,6 +632,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
 
         with pytest.raises(RPCError, match="HTTP 401"):
             await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
@@ -629,6 +667,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
         core._http_client.headers = {"Cookie": "old"}
 
         with pytest.raises(RPCError, match="HTTP 401"):
@@ -641,7 +680,7 @@ class TestRpcCallAutoRetry:
     async def test_no_auth_refresh_on_non_auth_error(self):
         """rpc_call should NOT trigger auth refresh on non-auth errors (HTTP 500).
 
-        Note: ``server_error_max_retries=0`` opts out of the T3.A 5xx retry
+        Note: ``server_error_max_retries=0`` opts out of the 5xx retry
         path so this test stays focused on the original assertion — that 500
         does not trigger an auth refresh, regardless of the retry policy.
         """
@@ -674,6 +713,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
 
         with pytest.raises(RPCError, match="Server error 500"):
             await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
@@ -702,6 +742,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
 
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
@@ -745,6 +786,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
         core._http_client.headers = {"Cookie": "old"}
 
         with patch("notebooklm._core.decode_response", return_value=["result"]):
@@ -800,6 +842,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
         core._http_client.headers = {"Cookie": "old"}
 
         with patch("notebooklm._core.decode_response", return_value=["result"]):
@@ -835,6 +878,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
 
         # ClientError is the 4xx (non-401/403) mapping in rpc_call
         from notebooklm.rpc import ClientError
@@ -870,6 +914,7 @@ class TestRpcCallAutoRetry:
 
         core._http_client = MagicMock()
         core._http_client.post = mock_post
+        install_post_as_stream(None, core._http_client, mock_post)
 
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
@@ -881,7 +926,23 @@ class TestRpcCallAutoRetry:
 
 
 class TestBuildUrlAuthuser:
-    """Regression for #359: batchexecute URL routes non-default profiles."""
+    """Regression for #359: batchexecute URL routes non-default profiles.
+
+    ``_build_url`` consumes an ``_AuthSnapshot`` rather than reading
+    ``self.auth`` live, so each test constructs the snapshot
+    inline from its ``AuthTokens`` fixture.
+    """
+
+    @staticmethod
+    def _snapshot_for(core):
+        from notebooklm._core import _AuthSnapshot
+
+        return _AuthSnapshot(
+            csrf_token=core.auth.csrf_token,
+            session_id=core.auth.session_id,
+            authuser=core.auth.authuser,
+            account_email=core.auth.account_email,
+        )
 
     def test_default_authuser_omits_param(self):
         auth = AuthTokens(
@@ -890,7 +951,7 @@ class TestBuildUrlAuthuser:
             session_id="sess",
         )
         core = ClientCore(auth=auth)
-        url = core._build_url(RPCMethod.LIST_NOTEBOOKS)
+        url = core._build_url(RPCMethod.LIST_NOTEBOOKS, self._snapshot_for(core))
         assert "authuser" not in url
 
     def test_non_default_authuser_added(self):
@@ -901,7 +962,7 @@ class TestBuildUrlAuthuser:
             authuser=2,
         )
         core = ClientCore(auth=auth)
-        url = core._build_url(RPCMethod.LIST_NOTEBOOKS)
+        url = core._build_url(RPCMethod.LIST_NOTEBOOKS, self._snapshot_for(core))
         assert "authuser=2" in url
 
     def test_account_email_preferred_over_authuser_index(self):
@@ -913,6 +974,6 @@ class TestBuildUrlAuthuser:
             account_email="bob@example.com",
         )
         core = ClientCore(auth=auth)
-        url = core._build_url(RPCMethod.LIST_NOTEBOOKS)
+        url = core._build_url(RPCMethod.LIST_NOTEBOOKS, self._snapshot_for(core))
         assert "authuser=bob%40example.com" in url
         assert "authuser=2" not in url

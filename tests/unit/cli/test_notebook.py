@@ -114,7 +114,7 @@ class TestNotebookList:
             assert data["notebooks"][0]["id"] == "nb_1"
 
     def test_notebook_list_limit_caps_rows(self, runner, mock_auth):
-        """`--limit N` returns at most N data rows in text output (P6.T1 / I16)."""
+        """`--limit N` returns at most N data rows in text output."""
         many = [
             Notebook(
                 id=f"nb_{i:02d}",
@@ -143,7 +143,7 @@ class TestNotebookList:
                 assert f"nb_{i:02d}" not in result.output
 
     def test_notebook_list_limit_json_caps_rows(self, runner, mock_auth):
-        """`--limit N` also caps the JSON `notebooks` array (P6.T1 / I16)."""
+        """`--limit N` also caps the JSON `notebooks` array."""
         many = [
             Notebook(
                 id=f"nb_{i:02d}",
@@ -171,7 +171,7 @@ class TestNotebookList:
             assert [n["id"] for n in data["notebooks"]] == ["nb_00", "nb_01", "nb_02"]
 
     def test_notebook_list_no_truncate_disables_ellipsis(self, runner, mock_auth):
-        """`--no-truncate` renders the full title without an ellipsis (P6.T1 / I16).
+        """`--no-truncate` renders the full title without an ellipsis.
 
         The default Title column uses Rich's ``overflow="ellipsis"`` so a
         title that exceeds the auto-detected terminal width is truncated
@@ -207,7 +207,7 @@ class TestNotebookList:
             assert "…" not in result.output
 
     def test_notebook_list_default_truncates_long_title(self, runner, mock_auth):
-        """Default rendering inserts an ellipsis for over-wide titles (P6.T1 / I16).
+        """Default rendering inserts an ellipsis for over-wide titles.
 
         Pins the existing default behavior so --no-truncate doesn't change
         rendering when the flag is not passed.
@@ -361,7 +361,7 @@ class TestNotebookCreate:
     def test_notebook_create_with_use_json(self, runner, mock_auth, mock_context_file):
         """`create --use --json` switches context AND emits JSON (consistent with text mode).
 
-        Per audit row I12 (P4.T5), the JSON envelope MUST surface the
+        the JSON envelope MUST surface the
         `active_notebook_id` alongside the create result so script callers
         can pick up the new context without scraping any "Context set to ..."
         text or shelling out to `notebooklm status --json`.
@@ -384,7 +384,7 @@ class TestNotebookCreate:
             assert result.exit_code == 0
             data = json.loads(result.output)
             assert data["notebook"]["id"] == "new_nb_id"
-            # I12: when --use is set, the JSON envelope surfaces the new
+            # When --use is set, the JSON envelope surfaces the new
             # active notebook id so callers don't have to round-trip via
             # `notebooklm status --json`.
             assert data["active_notebook_id"] == "new_nb_id"
@@ -521,6 +521,8 @@ class TestNotebookDelete:
 
             with (
                 patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
+                patch("notebooklm.cli.context.get_context_path", return_value=context_file),
+                patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
                 patch("notebooklm.cli.notebook.get_current_notebook", return_value="nb_to_delete"),
                 patch("notebooklm.cli.notebook.clear_context"),
                 patch(
@@ -777,6 +779,10 @@ class TestNotebookAsk:
                     return_value=Path("/nonexistent/context.json"),
                 ),
                 patch(
+                    "notebooklm.cli.context.get_context_path",
+                    return_value=Path("/nonexistent/context.json"),
+                ),
+                patch(
                     "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
                 ) as mock_fetch,
             ):
@@ -1020,7 +1026,10 @@ class TestNotebookMetadata:
             mock_client_cls.return_value = mock_client
 
             with (
-                patch("notebooklm.cli.helpers.get_current_notebook", return_value="nb_1"),
+                patch(
+                    "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+                    return_value="nb_1",
+                ),
                 patch(
                     "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
                 ) as mock_fetch,
@@ -1058,7 +1067,10 @@ class TestNotebookMetadata:
             mock_client_cls.return_value = mock_client
 
             with (
-                patch("notebooklm.cli.helpers.get_current_notebook", return_value="nb_1"),
+                patch(
+                    "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+                    return_value="nb_1",
+                ),
                 patch(
                     "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
                 ) as mock_fetch,
@@ -1089,7 +1101,10 @@ class TestNotebookMetadata:
             mock_client_cls.return_value = mock_client
 
             with (
-                patch("notebooklm.cli.helpers.get_current_notebook", return_value="nb_empty"),
+                patch(
+                    "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+                    return_value="nb_empty",
+                ),
                 patch(
                     "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
                 ) as mock_fetch,
@@ -1125,7 +1140,10 @@ class TestNotebookMetadata:
             mock_client_cls.return_value = mock_client
 
             with (
-                patch("notebooklm.cli.helpers.get_current_notebook", return_value="nb_url"),
+                patch(
+                    "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+                    return_value="nb_url",
+                ),
                 patch(
                     "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
                 ) as mock_fetch,

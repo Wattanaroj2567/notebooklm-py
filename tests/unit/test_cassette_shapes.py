@@ -1,8 +1,8 @@
-"""Cassette-shape regression lint (T8.A3).
+"""Cassette-shape regression lint.
 
 This module walks every VCR cassette under ``tests/cassettes`` and asserts a
-small set of structural invariants that the audit's regression classes
-(C2/C3/C4/I9) violate. The intent is to catch reintroductions of those defect
+small set of structural invariants that the known cassette-shape regression
+classes violate. The intent is to catch reintroductions of those defect
 classes before they reach ``main``.
 
 Assertions per batchexecute interaction (URL carries ``?rpcids=``):
@@ -14,25 +14,25 @@ Assertions per batchexecute interaction (URL carries ``?rpcids=``):
   Envelope ids ``"di"``, ``"af.httprm"``, ``"e"`` are housekeeping and ignored.
 
 * **B. f.req decodes.** ``f.req`` extracted from the urlencoded body must
-  URL-decode and ``json.loads`` to a list. ``f.req=SCRUBBED`` (C2) trips this.
+  URL-decode and ``json.loads`` to a list. ``f.req=SCRUBBED`` trips this.
 
 * **C. Chunked byte-counts are accurate.** Each integer prefix in the
   ``)]}'``-stripped response body must equal the UTF-8 byte length of the
-  single JSON line that follows it (I9).
+  single JSON line that follows it.
 
 * **D. No leaked patterns** (applies to ALL interactions): escaped display-
-  name JSON literals like ``\\"Capitalized Two Words\\"`` (C4),
+  name JSON literals like ``\\"Capitalized Two Words\\"``,
   ``lh3.googleusercontent.com/(a|ogw)/`` avatar URLs, and the literal IP
   ``108.5.149.175``.
 
 In addition, for the specific RPC ID ``otS69`` (chat ask) the lint enforces
 the new 9-param outer shape ``[null, "<inner-json-string>"]`` whose inner
-JSON-decoded list carries at least 9 params (C3).
+JSON-decoded list carries at least 9 params.
 
 Cassettes flagged by the audit's "needs re-recording" set are marked xfail
-with explicit reasons referencing the phase-2 follow-up tasks (T8.B1..B5).
-When the corresponding phase-2 PR lands and re-records the cassette, the
-xfail marker MUST be removed in that PR.
+with explicit reasons referencing their follow-up repair work. When the
+corresponding follow-up PR lands and re-records the cassette, the xfail
+marker MUST be removed in that PR.
 
 Non-batchexecute interactions (e.g. the streaming-query endpoint
 ``GenerateFreeFormStreamed``, GETs against the SPA shell, the legacy
@@ -65,35 +65,34 @@ def _real_cassettes() -> list[Path]:
     return sorted(CASSETTE_DIR.glob("*.yaml"))
 
 
-# Cassettes that the Tier-8 audit flagged for re-recording or re-scrubbing in
-# phase 2. Each entry carries the follow-up task ID and the regression class
-# so the xfail message points reviewers at the eventual fix.
+# Cassettes that the cassette-hardening audit flagged for re-recording or
+# re-scrubbing. Each entry carries the regression class so the xfail
+# message points reviewers at the eventual fix.
 #
-# This is the audit's explicit "needs re-recording" set (see phase-1 plan,
-# T8.A5a acceptance line 254). The "67 cassettes with /ogw/" dynamic set
-# that used to surface here was cleared in T8.B6: the bulk re-scrub script
-# in ``scripts/rescrub-cassettes.py`` collapsed every remaining avatar URL
+# The "67 cassettes with /ogw/" dynamic set that used to surface here was
+# cleared by a bulk re-scrub pass: the script in
+# ``scripts/rescrub-cassettes.py`` collapsed every remaining avatar URL
 # to ``SCRUBBED_AVATAR_URL`` and re-derived the chunked byte-counts in the
 # same pass, so the dynamic ``/ogw/`` detector and its accompanying xfail
 # branch are now dead code — both were removed.
 AUDIT_REPAIR_LIST: dict[str, str] = {
-    # artifacts_revise_slide.yaml was repaired in T8.B1 (this PR) — the
-    # cassette was re-recorded against the live REVISE_SLIDE RPC so f.req
-    # carries the real urlencoded JSON payload again (only sensitive scalars
-    # scrubbed inside, not the whole body collapsed to ``"SCRUBBED"``).
-    # chat_ask.yaml + chat_ask_with_references.yaml were repaired in T8.B2 —
-    # re-recorded against the current 9-param streaming-chat builder
+    # artifacts_revise_slide.yaml was re-recorded against the live
+    # REVISE_SLIDE RPC so f.req carries the real urlencoded JSON payload
+    # again (only sensitive scalars scrubbed inside, not the whole body
+    # collapsed to ``"SCRUBBED"``).
+    # chat_ask.yaml + chat_ask_with_references.yaml were re-recorded
+    # against the current 9-param streaming-chat builder
     # (src/notebooklm/_chat.py:459-469) with the ``freq`` body matcher
     # opted in per-cassette in tests/integration/test_vcr_comprehensive.py.
-    # sources_add_file.yaml was repaired in T8.B4 — upload tokens (I17)
-    # scrubbed in place. sources_add_drive.yaml +
-    # sources_check_freshness_drive.yaml were repaired in T8.B5 — Drive AONS
-    # tokens scrubbed in place. example_httpbin_{get,post}.yaml were deleted
-    # in T8.B7 — the I-misc origin-IP leak was in illustrative VCR examples,
-    # not real NotebookLM cassettes. The example tests in test_vcr_example.py
-    # that used them were also removed in the same PR.
-    # The 61 ``/ogw/`` avatar URL cassettes were bulk re-scrubbed in T8.B6 —
-    # the dynamic detector / xfail branch that used to live here was removed
+    # sources_add_file.yaml was repaired — upload tokens scrubbed in
+    # place. sources_add_drive.yaml + sources_check_freshness_drive.yaml
+    # were repaired — Drive AONS tokens scrubbed in place.
+    # example_httpbin_{get,post}.yaml were deleted — the origin-IP leak
+    # was in illustrative VCR examples, not real NotebookLM cassettes.
+    # The example tests in test_vcr_example.py that used them were
+    # removed in the same PR.
+    # The 61 ``/ogw/`` avatar URL cassettes were bulk re-scrubbed — the
+    # dynamic detector / xfail branch that used to live here was removed
     # in the same PR.
 }
 
@@ -101,13 +100,13 @@ AUDIT_REPAIR_LIST: dict[str, str] = {
 def _has_bytecount_drift(cassette: Path) -> bool:
     """Return True if the cassette has stale chunked byte-count prefixes.
 
-    This is the audit's I9 class: when the original network response used
+    This is the chunked byte-count drift class: when the original network response used
     ``\\r\\n`` line endings, the byte-count was computed against the
     pre-strip bytes but the cassette stores the ``\\r``-stripped form, so
     every chunk prefix overshoots by exactly the number of stripped
-    carriage returns. T8.D7 (byte-count re-derivation) plus T8.B6 (bulk
-    re-scrub) fix this; until then we xfail affected cassettes so the
-    rest of the lint stays enforceable.
+    carriage returns. Byte-count re-derivation plus the bulk re-scrub
+    fix this; until then we xfail affected cassettes so the rest of the
+    lint stays enforceable.
     """
     try:
         data, _ = _load_cassette(cassette)
@@ -122,15 +121,15 @@ def _has_bytecount_drift(cassette: Path) -> bool:
 
 # ---------------------------------------------------------------------------
 # Leak patterns (assertion D — applies to ALL interactions, including
-# non-batchexecute). Kept minimal here; the canonical scrub registry is
-# T8.A4's tests/cassette_patterns.py (not yet landed in origin/main).
+# non-batchexecute). Kept minimal here; the canonical scrub registry
+# lives in tests/cassette_patterns.py.
 # ---------------------------------------------------------------------------
 
 # Escaped JSON display name: \"Two Capitalized Words\" inside a quoted JSON
 # string. Anchored on the escape `\"` so we don't fire on legitimate
 # capitalized prose appearing in plain text. Hyphenated tokens are *not*
 # matched (to skip HTTP header names like `Content-Type` and font families
-# like `Google-Sans-Text`). The broader T8.A6a registry will tighten this
+# like `Google-Sans-Text`). The broader scrub registry tightens this
 # further by requiring an adjacent JSON-key context.
 LEAK_DISPLAY_NAME = re.compile(r'\\"(?:[A-Z][a-z]+)(?: [A-Z][a-z]+)+\\"')
 # Two-capitalized-word strings that are legitimate UI / artifact / notebook
@@ -364,6 +363,17 @@ def _lint_cassette(path: Path) -> list[str]:
     # and response bodies, before YAML re-quoting strips escapes).
     failures.extend(f"leak: {leak}" for leak in _find_leaks(raw_text))
 
+    # synthetic-error cassettes (``error_synthetic_*.yaml``) carry
+    # canonical error bodies from
+    # ``tests.cassette_patterns.build_synthetic_error_response``: JSON
+    # ``{"error": {...}}`` shapes whose ONLY purpose is to drive the client's
+    # exception-mapping branches. They never contain a WRB envelope (real
+    # Google error responses don't either) and they don't carry a chunked
+    # XSSI body, so assertion A (rpcids ↔ WRB id alignment) and assertion C
+    # (chunked byte-count accuracy) are not applicable. The B (f.req decode)
+    # and D (leak patterns) checks still run.
+    is_synthetic_error = path.name.startswith("error_synthetic_")
+
     interactions = data.get("interactions") or []
     for idx, interaction in enumerate(interactions):
         req = interaction.get("request") or {}
@@ -388,12 +398,17 @@ def _lint_cassette(path: Path) -> list[str]:
             failures.append(f"interaction[{idx}] f.req decode failed: {exc}")
             freq = None
 
-        # C3 — chat-ask shape guard (per-RPC). Only fires when the chat-ask
+        # chat-ask shape guard (per-RPC). Only fires when the chat-ask
         # RPC ID is present in rpcids AND the f.req decoded.
         if CHAT_ASK_RPC_ID in rpcids and freq is not None:
             shape_err = _check_chat_ask_shape(freq)
             if shape_err:
                 failures.append(f"interaction[{idx}] {shape_err}")
+
+        if is_synthetic_error:
+            # Synthetic error cassettes carry a JSON error body, not a WRB
+            # envelope or chunked XSSI body — assertions A and C don't apply.
+            continue
 
         # A — rpcids in URL must match WRB ids in response
         wrb_ids = _wrb_ids_from_response(resp_body)
@@ -420,7 +435,7 @@ def _check_chat_ask_shape(freq: Any) -> str | None:
         isinstance(freq, list) and len(freq) == 2 and freq[0] is None and isinstance(freq[1], str)
     ):
         return (
-            "chat-ask shape regression (C3): expected outer "
+            "chat-ask shape regression: expected outer "
             f"[null, '<inner-json>'], got {type(freq).__name__} {freq!r:.120}"
         )
     try:
@@ -430,7 +445,7 @@ def _check_chat_ask_shape(freq: Any) -> str | None:
     if not isinstance(inner, list) or len(inner) < CHAT_ASK_MIN_INNER_PARAMS:
         n = len(inner) if isinstance(inner, list) else "non-list"
         return (
-            "chat-ask shape regression (C3): inner f.req has "
+            "chat-ask shape regression: inner f.req has "
             f"{n} params, need >= {CHAT_ASK_MIN_INNER_PARAMS}"
         )
     return None
@@ -446,13 +461,14 @@ def _xfail_reason(cassette: Path) -> str | None:
 
     Resolution order (most specific first):
       1. Explicit AUDIT_REPAIR_LIST — the cassettes the audit named.
-      2. Byte-count drift present — audit class I9, fixed by T8.D7.
+      2. Byte-count drift present — chunked byte-count prefix drifted
+         from payload length after sanitization.
 
-    Each branch returns a different reason so phase-2 PRs can identify
-    which xfail markers their work should clear.
+    Each branch returns a different reason so future repair PRs can
+    identify which xfail markers their work should clear.
 
     The ``/ogw/`` avatar URL branch that used to sit between (1) and (2)
-    was removed in T8.B6 — the bulk re-scrub script in
+    was removed — the bulk re-scrub script in
     ``scripts/rescrub-cassettes.py`` collapsed every remaining avatar URL
     and re-derived the affected chunk byte-counts in a single pass, so
     no real cassette can satisfy the old detector anymore.
@@ -461,8 +477,8 @@ def _xfail_reason(cassette: Path) -> str | None:
         return AUDIT_REPAIR_LIST[cassette.name]
     if _has_bytecount_drift(cassette):
         return (
-            "Phase 2 T8.D7 will fix (audit I9: chunked byte-count "
-            "prefix drifted from payload length after sanitization)"
+            "Byte-count re-derivation will fix: chunked byte-count "
+            "prefix drifted from payload length after sanitization"
         )
     return None
 
@@ -491,7 +507,7 @@ def test_cassette_shape(cassette: Path, request: pytest.FixtureRequest) -> None:
 
 
 def test_bad_revise_slide_trips_freq_decode() -> None:
-    """C2 regression: f.req=SCRUBBED must fail the f.req-decode assertion."""
+    """Regression: ``f.req=SCRUBBED`` must fail the f.req-decode assertion."""
     failures = _lint_cassette(BAD_FIXTURE_DIR / "bad_revise_slide.yaml")
     assert any("f.req decode failed" in f for f in failures), (
         f"Expected f.req decode failure, got: {failures}"
@@ -499,7 +515,7 @@ def test_bad_revise_slide_trips_freq_decode() -> None:
 
 
 def test_bad_chat_ask_trips_shape_guard() -> None:
-    """C3 regression: stale 5-param chat shape must trip the otS69 shape guard."""
+    """Regression: a stale 5-param chat shape must trip the otS69 shape guard."""
     failures = _lint_cassette(BAD_FIXTURE_DIR / "bad_chat_ask.yaml")
     assert any("chat-ask shape regression" in f for f in failures), (
         f"Expected chat-ask shape regression, got: {failures}"
@@ -507,7 +523,7 @@ def test_bad_chat_ask_trips_shape_guard() -> None:
 
 
 def test_bad_sharing_trips_leak_check() -> None:
-    """C4 regression: escaped display-name JSON literal must trip the leak check."""
+    """Regression: an escaped display-name JSON literal must trip the leak check."""
     failures = _lint_cassette(BAD_FIXTURE_DIR / "bad_sharing.yaml")
     assert any("escaped display-name" in f for f in failures), (
         f"Expected escaped display-name leak, got: {failures}"
@@ -515,7 +531,7 @@ def test_bad_sharing_trips_leak_check() -> None:
 
 
 def test_bad_byte_count_trips_byte_count_check() -> None:
-    """I9 regression: chunk prefix must equal payload UTF-8 byte length."""
+    """Regression: the chunk prefix must equal the payload's UTF-8 byte length."""
     failures = _lint_cassette(BAD_FIXTURE_DIR / "bad_byte_count.yaml")
     assert any("prefix declares" in f for f in failures), (
         f"Expected byte-count mismatch, got: {failures}"
@@ -530,3 +546,136 @@ def test_audit_repair_list_entries_exist() -> None:
     """
     missing = [name for name in AUDIT_REPAIR_LIST if not (CASSETTE_DIR / name).exists()]
     assert not missing, f"AUDIT_REPAIR_LIST references cassettes that no longer exist: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Encoding-header coverage (issue #773 follow-up to #769 / #771)
+# ---------------------------------------------------------------------------
+# ``decode_compressed_response=True`` in :mod:`tests.vcr_config` strips
+# ``Content-Encoding`` from every recorded response. Pre-#751 that was fine
+# because the response went through ``client.post`` once and decoded
+# exactly once; #751 introduced the streaming rebuild path in
+# :func:`notebooklm._core_transport._stream_post_with_size_cap`, and the
+# combination of an upstream gzip header re-applied to already-decoded
+# bytes is what bit #769 in production. The existing cassette suite
+# couldn't surface that regression because no cassette carried the
+# header. This lint pins a floor on the encoding-header coverage so a
+# future cassette wipe (or a regression in the gzip-injection workflow
+# under ``tests/scripts/inject_gzip_into_cassette.py``) trips CI loudly.
+
+
+def _all_cassettes_recursive() -> list[Path]:
+    """Every cassette under ``tests/cassettes``, including subdirectories
+    like ``gzip_coverage/``.
+
+    Kept separate from :func:`_real_cassettes` (which is non-recursive on
+    purpose — the existing shape lint targets the canonical recorded
+    cassettes only, not derived sibling cassettes that may carry binary
+    bodies or other non-canonical shapes).
+    """
+    return sorted(CASSETTE_DIR.rglob("*.yaml"))
+
+
+# Cassette header lines for ``Content-Encoding: gzip`` follow the vcrpy
+# YAML serialization shape: the case-insensitive header name on one line
+# followed by ``- gzip`` (with optional surrounding whitespace) on the
+# next. Anchored to ``^`` so the pattern does not match `gzip` mentioned
+# in a request URL or response body. Compiled at module scope so the
+# walk-the-cassette test stays cheap on Windows runners where libyaml
+# isn't available and structural ``yaml.safe_load`` is ~10× slower —
+# the original load-every-cassette implementation timed out at 60s on
+# Windows Python 3.11 / 3.12.
+_CONTENT_ENCODING_GZIP_RE = re.compile(
+    r"^[ \t]*[Cc]ontent-[Ee]ncoding:\s*\n[ \t]*-\s*gzip\b",
+    re.MULTILINE,
+)
+
+
+def test_at_least_one_cassette_advertises_content_encoding_gzip() -> None:
+    """At least one cassette must carry ``Content-Encoding: gzip`` in a
+    response header.
+
+    Closes the test-coverage gap that hid #769. The fix lives in
+    ``tests/cassettes/gzip_coverage/`` plus the helper in
+    ``tests/scripts/inject_gzip_into_cassette.py`` that re-derives those
+    cassettes from canonical recordings. If this assertion ever fails
+    again, regenerate the gzip-coverage cassettes — do not silence the
+    test.
+
+    Scans raw cassette text rather than ``yaml.safe_load``-ing every
+    cassette — see ``_CONTENT_ENCODING_GZIP_RE`` for why.
+    """
+    matches = [
+        c
+        for c in _all_cassettes_recursive()
+        if _CONTENT_ENCODING_GZIP_RE.search(c.read_text(encoding="utf-8"))
+    ]
+    assert matches, (
+        "No cassette under tests/cassettes/ advertises Content-Encoding: gzip "
+        "on any response. The streaming rebuild path in "
+        "notebooklm._core_transport._stream_post_with_size_cap is invisible to "
+        "VCR replay without it (see #769/#771). Regenerate the gzip-coverage "
+        "cassette(s) via:\n"
+        "    uv run python tests/scripts/inject_gzip_into_cassette.py "
+        "tests/cassettes/<source>.yaml "
+        "tests/cassettes/gzip_coverage/<source>_gzipped.yaml"
+    )
+
+
+def test_gzip_coverage_cassettes_round_trip_through_helper() -> None:
+    """Every cassette under ``gzip_coverage/`` must be a fixed point of
+    the gzip-injection helper.
+
+    Catches drift between the committed cassettes and the helper's
+    current encoding choices (compression level, header casing,
+    stripped headers). Re-running the helper on a fixed cassette must
+    produce a byte-identical file; otherwise the helper changed shape
+    and the cassettes need regenerating in the same PR.
+    """
+    import importlib.util
+
+    # Safe loader + dumper — cassettes are arbitrary YAML on disk and we
+    # never need to serialize Python-specific tags here, so the safe
+    # schema is the symmetric and audit-friendly choice. ``!!binary``
+    # (the encoding gzipped bodies rely on) is part of the core YAML
+    # schema and round-trips through ``CSafeLoader`` / ``CSafeDumper``.
+    try:
+        from yaml import CSafeDumper as Dumper
+        from yaml import CSafeLoader as Loader
+    except ImportError:  # pragma: no cover — libyaml ships with PyYAML wheels
+        from yaml import SafeDumper as Dumper  # type: ignore[assignment]
+        from yaml import SafeLoader as Loader
+
+    # ``tests/`` is not a Python package, so import the helper by file path —
+    # same pattern :mod:`tests.vcr_config` uses for sibling modules.
+    helper_path = REPO_ROOT / "tests" / "scripts" / "inject_gzip_into_cassette.py"
+    spec = importlib.util.spec_from_file_location(
+        "tests_scripts_inject_gzip_into_cassette", helper_path
+    )
+    assert spec is not None and spec.loader is not None
+    helper_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper_module)
+    inject_gzip_into_cassette = helper_module.inject_gzip_into_cassette
+
+    coverage_dir = CASSETTE_DIR / "gzip_coverage"
+    cassettes = sorted(coverage_dir.glob("*.yaml")) if coverage_dir.is_dir() else []
+    assert cassettes, (
+        "No gzip-coverage cassettes found under tests/cassettes/gzip_coverage/. "
+        "test_at_least_one_cassette_advertises_content_encoding_gzip should "
+        "have failed first — investigate that failure before this one."
+    )
+    drifted: list[str] = []
+    for cassette in cassettes:
+        original = cassette.read_text(encoding="utf-8")
+        data = yaml.load(original, Loader=Loader)
+        rewritten = inject_gzip_into_cassette(data)
+        if rewritten == 0:
+            drifted.append(f"{cassette.name}: helper did not match any response")
+            continue
+        regen = yaml.dump(data, Dumper=Dumper)
+        if regen != original:
+            drifted.append(
+                f"{cassette.name}: not a fixed point of inject_gzip_into_cassette. "
+                "Regenerate via the helper and commit."
+            )
+    assert not drifted, "\n  - ".join(["gzip-coverage cassette drift:"] + drifted)

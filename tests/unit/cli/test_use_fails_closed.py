@@ -1,6 +1,6 @@
-"""Tests for ``notebooklm use`` fail-closed verification (PR T3.D).
+"""Tests for ``notebooklm use`` fail-closed verification (PR).
 
-Before PR T3.D, ``notebooklm use <id>`` persisted the supplied notebook ID to
+Before PR, ``notebooklm use <id>`` persisted the supplied notebook ID to
 ``context.json`` *even when the existence check failed* — either because the
 RPC errored, or because the server returned a degenerate "empty notebook"
 payload for an unknown ID. The result was poisoned saved state that broke
@@ -58,6 +58,8 @@ def mock_context_file(tmp_path):
     context_file = tmp_path / "context.json"
     with (
         patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
         patch("notebooklm.cli.session.get_context_path", return_value=context_file),
     ):
         yield context_file
@@ -77,7 +79,7 @@ class TestNotebookNotFoundIsRPCError:
 
     def test_inherits_from_rpc_error(self):
         # ``except RPCError`` at higher layers must still match — this is the
-        # whole point of widening the base class in T3.D.
+        # whole point of widening the base class in the fail-closed fix.
         assert issubclass(NotebookNotFoundError, RPCError)
 
     def test_carries_notebook_id(self):

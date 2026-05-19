@@ -1,5 +1,6 @@
 """Unit tests for types module dataclasses and parsing."""
 
+import pickle
 import warnings
 from unittest.mock import patch
 
@@ -72,6 +73,186 @@ class TestTimestampParsing:
         from notebooklm.types import _datetime_from_timestamp
 
         assert _datetime_from_timestamp(value) is None
+
+
+_PUBLIC_MOVABLE_CLASSES = [
+    "AccountLimits",
+    "AccountTier",
+    "Artifact",
+    "ArtifactType",
+    "AskResult",
+    "ChatMode",
+    "ChatReference",
+    "CitedSourceSelection",
+    "ClientMetricsSnapshot",
+    "ConnectionLimits",
+    "ConversationTurn",
+    "GenerationStatus",
+    "Note",
+    "Notebook",
+    "NotebookDescription",
+    "NotebookMetadata",
+    "ReportSuggestion",
+    "RpcTelemetryEvent",
+    "SharedUser",
+    "ShareStatus",
+    "Source",
+    "SourceFulltext",
+    "SourceSummary",
+    "SourceType",
+    "SuggestedTopic",
+]
+
+
+@pytest.mark.parametrize("name", _PUBLIC_MOVABLE_CLASSES)
+def test_public_movable_types_keep_notebooklm_types_module(name):
+    """Moved public dataclasses/enums must preserve inspection and pickle identity."""
+    import notebooklm.types as public_types
+
+    assert getattr(public_types, name).__module__ == "notebooklm.types"
+
+
+def test_artifact_note_chat_and_sharing_types_are_facade_reexports():
+    """T13.3 domain types live in private modules while notebooklm.types stays public."""
+    import notebooklm.types as public_types
+    from notebooklm._types import artifacts, chat, notes, sharing
+
+    assert public_types.Artifact is artifacts.Artifact
+    assert public_types.ArtifactType is artifacts.ArtifactType
+    assert public_types.GenerationStatus is artifacts.GenerationStatus
+    assert public_types.ReportSuggestion is artifacts.ReportSuggestion
+    assert public_types.Note is notes.Note
+    assert public_types.ConversationTurn is chat.ConversationTurn
+    assert public_types.ChatReference is chat.ChatReference
+    assert public_types.AskResult is chat.AskResult
+    assert public_types.ChatMode is chat.ChatMode
+    assert public_types.SharedUser is sharing.SharedUser
+    assert public_types.ShareStatus is sharing.ShareStatus
+
+
+def test_artifact_private_helper_seams_are_facade_reexports():
+    """Artifact helper functions and warning state remain live notebooklm.types aliases."""
+    import notebooklm.types as public_types
+    from notebooklm._types import artifacts
+
+    assert public_types._ARTIFACT_TYPE_CODE_MAP is artifacts._ARTIFACT_TYPE_CODE_MAP
+    assert public_types._warned_artifact_types is artifacts._warned_artifact_types
+    assert public_types._map_artifact_kind is artifacts._map_artifact_kind
+    assert public_types._is_valid_artifact_url is artifacts._is_valid_artifact_url
+    assert public_types._extract_artifact_url is artifacts._extract_artifact_url
+    assert public_types._extract_audio_artifact_url is artifacts._extract_audio_artifact_url
+    assert public_types._extract_video_artifact_url is artifacts._extract_video_artifact_url
+    assert public_types._extract_infographic_artifact_url is (
+        artifacts._extract_infographic_artifact_url
+    )
+    assert public_types._extract_slide_deck_artifact_url is (
+        artifacts._extract_slide_deck_artifact_url
+    )
+
+
+def test_representative_public_dataclasses_pickle_round_trip():
+    """Representative public dataclasses/enums keep pickle compatibility through T13 moves."""
+    from notebooklm.rpc.types import ArtifactStatus, ArtifactTypeCode
+    from notebooklm.types import (
+        AccountLimits,
+        AccountTier,
+        Artifact,
+        AskResult,
+        ChatReference,
+        CitedSourceSelection,
+        ClientMetricsSnapshot,
+        ConnectionLimits,
+        ConversationTurn,
+        GenerationStatus,
+        Note,
+        Notebook,
+        NotebookDescription,
+        NotebookMetadata,
+        ReportSuggestion,
+        RpcTelemetryEvent,
+        ShareAccess,
+        SharedUser,
+        SharePermission,
+        ShareStatus,
+        ShareViewLevel,
+        Source,
+        SourceFulltext,
+        SourceStatus,
+        SourceSummary,
+        SourceType,
+        SuggestedTopic,
+    )
+
+    source_summary = SourceSummary(kind=SourceType.PDF, title="doc.pdf")
+    notebook = Notebook(id="nb_1", title="Notebook")
+    chat_reference = ChatReference(source_id="src_1", citation_number=1, cited_text="quoted")
+    shared_user = SharedUser(email="reader@example.com", permission=SharePermission.VIEWER)
+    instances = [
+        AccountLimits(notebook_limit=10, source_limit=50, raw_limits=("raw",)),
+        AccountTier(tier="plus", plan_name="Plus"),
+        Artifact(
+            id="artifact_1",
+            title="Audio",
+            _artifact_type=ArtifactTypeCode.AUDIO.value,
+            status=ArtifactStatus.COMPLETED,
+            url="https://example.com/audio.mp3",
+        ),
+        AskResult(
+            answer="Answer",
+            conversation_id="conversation_1",
+            turn_number=1,
+            is_follow_up=False,
+            references=[chat_reference],
+            raw_response="raw",
+        ),
+        CitedSourceSelection(
+            sources=[{"url": "https://example.com"}],
+            cited_url_count=1,
+            matched_url_source_count=1,
+        ),
+        ClientMetricsSnapshot(rpc_calls_started=2, rpc_calls_succeeded=1),
+        ConnectionLimits(max_connections=10, max_keepalive_connections=5),
+        ConversationTurn(query="Question", answer="Answer", turn_number=1),
+        GenerationStatus(task_id="task_1", status="completed", url="https://example.com/file"),
+        Note(id="note_1", notebook_id="nb_1", title="Note", content="Body"),
+        NotebookDescription(
+            summary="Summary",
+            suggested_topics=[SuggestedTopic(question="Q?", prompt="Ask Q")],
+        ),
+        NotebookMetadata(notebook=notebook, sources=[source_summary]),
+        ReportSuggestion(title="Briefing", description="Desc", prompt="Prompt"),
+        RpcTelemetryEvent(method="GET_NOTEBOOK", status="success", elapsed_seconds=0.01),
+        ShareStatus(
+            notebook_id="nb_1",
+            is_public=True,
+            access=ShareAccess.ANYONE_WITH_LINK,
+            view_level=ShareViewLevel.FULL_NOTEBOOK,
+            shared_users=[shared_user],
+            share_url="https://notebooklm.google.com/notebook/nb_1",
+        ),
+        Source(
+            id="src_1",
+            title="Source",
+            url="https://example.com",
+            _type_code=2,
+            status=SourceStatus.READY.value,
+        ),
+        source_summary,
+        SourceFulltext(
+            source_id="src_1",
+            title="Source",
+            content="Full indexed text",
+            _type_code=2,
+            url="https://example.com",
+            char_count=17,
+        ),
+    ]
+
+    for instance in instances:
+        assert pickle.loads(pickle.dumps(instance)) == instance
+
+    for enum_member in [SourceType.PDF, ArtifactType.AUDIO, ChatMode.DEFAULT]:
+        assert pickle.loads(pickle.dumps(enum_member)) is enum_member
 
 
 class TestNotebook:
@@ -1245,6 +1426,196 @@ class TestChatReference:
         assert ref.citation_number == 1
         assert ref.start_char == 100
         assert ref.end_char == 200
+
+    def test_paired_offset_invariant_source_pair_half_populated(self):
+        """start_char set without end_char (or vice versa) must raise."""
+        with pytest.raises(ValueError, match="start_char/end_char"):
+            ChatReference(source_id="x", start_char=5)
+        with pytest.raises(ValueError, match="start_char/end_char"):
+            ChatReference(source_id="x", end_char=5)
+
+    def test_paired_offset_invariant_answer_pair_half_populated(self):
+        """answer_start_char without answer_end_char (or vice versa) must raise."""
+        with pytest.raises(ValueError, match="answer_start_char"):
+            ChatReference(source_id="x", answer_start_char=5)
+        with pytest.raises(ValueError, match="answer_start_char"):
+            ChatReference(source_id="x", answer_end_char=5)
+
+    def test_paired_offset_invariant_inverted_source_range(self):
+        """start_char > end_char must raise."""
+        with pytest.raises(ValueError, match="> end_char"):
+            ChatReference(source_id="x", start_char=10, end_char=5)
+
+    def test_paired_offset_invariant_inverted_answer_range(self):
+        """answer_start_char > answer_end_char must raise."""
+        with pytest.raises(ValueError, match="> answer_end_char"):
+            ChatReference(source_id="x", answer_start_char=10, answer_end_char=5)
+
+    def test_paired_offset_invariant_valid_constructions(self):
+        """All-None pairs, both pairs populated, and zero-width ranges all accepted."""
+        # All None pairs.
+        ChatReference(source_id="x")
+        # Source pair populated.
+        ChatReference(source_id="x", start_char=5, end_char=10)
+        # Answer pair populated.
+        ChatReference(source_id="x", answer_start_char=0, answer_end_char=3)
+        # Both pairs populated.
+        ChatReference(
+            source_id="x",
+            start_char=5,
+            end_char=10,
+            answer_start_char=0,
+            answer_end_char=3,
+        )
+        # Zero-width ranges (start == end) are valid: many citations are
+        # structural anchors that resolve to single-position ranges.
+        ChatReference(source_id="x", start_char=5, end_char=5)
+        ChatReference(source_id="x", answer_start_char=0, answer_end_char=0)
+
+
+class TestDeprecatedPropertyWarnOnce:
+    """Validate the shared dedupe set covering all 4 deprecated dataclass properties.
+
+    The four sites (``Source.source_type``, ``SourceFulltext.source_type``,
+    ``Artifact.artifact_type``, ``Artifact.variant``) all read through the
+    shared ``_warned_deprecated_properties`` set so each fires its
+    ``DeprecationWarning`` at-most-once per process regardless of how many
+    instances exist.
+    """
+
+    def _clear_state(self):
+        """Reset the dedupe set so each test starts with a clean slate."""
+        from notebooklm.types import _warned_deprecated_properties
+
+        _warned_deprecated_properties.clear()
+
+    def test_source_source_type_warns_once_across_instances(self):
+        """Two ``Source`` instances accessing ``.source_type`` produce one warning."""
+        self._clear_state()
+        s1 = Source(id="a", _type_code=5)
+        s2 = Source(id="b", _type_code=5)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = s1.source_type
+            _ = s1.source_type  # second access, same instance
+            _ = s2.source_type  # different instance
+
+        dep_warnings = [
+            x
+            for x in w
+            if issubclass(x.category, DeprecationWarning) and "Source.source_type" in str(x.message)
+        ]
+        assert len(dep_warnings) == 1
+
+    def test_source_fulltext_source_type_warns_once_across_instances(self):
+        """``SourceFulltext.source_type`` participates in the same dedupe set."""
+        self._clear_state()
+        f1 = SourceFulltext(source_id="a", title="t1", content="c1", _type_code=5)
+        f2 = SourceFulltext(source_id="b", title="t2", content="c2", _type_code=5)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = f1.source_type
+            _ = f2.source_type
+
+        dep_warnings = [
+            x
+            for x in w
+            if issubclass(x.category, DeprecationWarning)
+            and "SourceFulltext.source_type" in str(x.message)
+        ]
+        assert len(dep_warnings) == 1
+
+    def test_artifact_artifact_type_warns_once_across_instances(self):
+        """``Artifact.artifact_type`` participates in the same dedupe set."""
+        self._clear_state()
+        a1 = Artifact(id="a", title="t1", _artifact_type=1, status=3)
+        a2 = Artifact(id="b", title="t2", _artifact_type=1, status=3)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = a1.artifact_type
+            _ = a2.artifact_type
+
+        dep_warnings = [
+            x
+            for x in w
+            if issubclass(x.category, DeprecationWarning)
+            and "Artifact.artifact_type" in str(x.message)
+        ]
+        assert len(dep_warnings) == 1
+
+    def test_artifact_variant_warns_once_across_instances(self):
+        """``Artifact.variant`` participates in the same dedupe set."""
+        self._clear_state()
+        a1 = Artifact(id="a", title="t1", _artifact_type=4, status=3, _variant=2)
+        a2 = Artifact(id="b", title="t2", _artifact_type=4, status=3, _variant=1)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = a1.variant
+            _ = a2.variant
+
+        dep_warnings = [
+            x
+            for x in w
+            if issubclass(x.category, DeprecationWarning) and "Artifact.variant" in str(x.message)
+        ]
+        assert len(dep_warnings) == 1
+
+    def test_each_deprecated_property_warns_independently(self):
+        """The dedupe is per-property-tag, not global — all 4 fire on first access."""
+        self._clear_state()
+        s = Source(id="a", _type_code=5)
+        f = SourceFulltext(source_id="b", title="t", content="c", _type_code=5)
+        a = Artifact(id="c", title="t", _artifact_type=4, status=3, _variant=2)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _ = s.source_type
+            _ = f.source_type
+            _ = a.artifact_type
+            _ = a.variant
+
+        dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+        messages = {str(x.message) for x in dep_warnings}
+        # Each of the four property tags fires exactly once.
+        assert sum("Source.source_type is deprecated" in m for m in messages) == 1
+        assert sum("SourceFulltext.source_type is deprecated" in m for m in messages) == 1
+        assert sum("Artifact.artifact_type is deprecated" in m for m in messages) == 1
+        assert sum("Artifact.variant is deprecated" in m for m in messages) == 1
+
+    def test_public_facade_rebind_honored(self):
+        """Rebinding ``notebooklm.types._warned_deprecated_properties`` propagates.
+
+        The private resolver in ``_types/common.py`` reads through
+        ``sys.modules['notebooklm.types']`` so monkeypatching the public facade
+        attribute redirects the dedupe surface — same pattern as
+        ``_warned_source_types`` / ``_warned_artifact_types``.
+        """
+        import notebooklm.types as public_types
+
+        self._clear_state()
+        # Pre-populate the public surface so a fresh set bypasses any
+        # already-warned tags from prior tests.
+        original = public_types._warned_deprecated_properties
+        fresh: set[str] = set()
+        try:
+            public_types._warned_deprecated_properties = fresh
+            s = Source(id="a", _type_code=5)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                _ = s.source_type
+            # The fresh set should now contain the tag — confirms the private
+            # resolver wrote through the public-facade binding.
+            assert "Source.source_type" in fresh
+            # And the original set was NOT touched.
+            assert "Source.source_type" not in original
+            dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+            assert len(dep_warnings) == 1
+        finally:
+            public_types._warned_deprecated_properties = original
 
 
 class TestSourceFulltext:

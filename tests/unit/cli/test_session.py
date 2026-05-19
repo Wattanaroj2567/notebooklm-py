@@ -1,5 +1,6 @@
 """Tests for session CLI commands (login, use, status, clear)."""
 
+import contextlib
 import json
 import sys
 from datetime import datetime
@@ -15,6 +16,25 @@ from notebooklm.notebooklm_cli import cli
 from notebooklm.types import Notebook
 
 from .conftest import create_mock_client, patch_main_cli_client
+
+
+def _read_account(storage_path: Path) -> dict:
+    """Test-suite helper: read account metadata via the canonical reader.
+
+    Post-P1-20 the account record lives inside ``storage_state.json`` under
+    the ``notebooklm`` namespace key; ``read_account_metadata`` handles both
+    the new in-band layout and the legacy sibling ``context.json`` fallback,
+    so tests that previously read ``context.json`` directly can route through
+    this helper without caring which on-disk shape they hit.
+    """
+    from notebooklm.auth import read_account_metadata
+
+    return read_account_metadata(storage_path)
+
+
+def _account_exists(storage_path: Path) -> bool:
+    """Test-suite helper: True iff any non-empty account record is present."""
+    return bool(_read_account(storage_path))
 
 
 @pytest.fixture
@@ -42,6 +62,8 @@ def mock_context_file(tmp_path):
     context_file = tmp_path / "context.json"
     with (
         patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
+        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
         patch("notebooklm.cli.session.get_context_path", return_value=context_file),
     ):
         yield context_file
@@ -174,6 +196,13 @@ class TestLoginCommand:
         block. Yields (mock_ensure, mock_launch) for assertions on chromium
         install check and launch_persistent_context kwargs.
         """
+        # patch() below resolves the target module at setup time and raises
+        # ModuleNotFoundError if playwright is not installed. Skip cleanly
+        # so local runs without ``uv sync --extra browser`` don't crash.
+        pytest.importorskip(
+            "playwright.sync_api",
+            reason="playwright not installed; install with: uv sync --extra browser",
+        )
         with (
             patch("notebooklm.cli.session._ensure_chromium_installed") as mock_ensure,
             patch("playwright.sync_api.sync_playwright") as mock_pw,
@@ -227,6 +256,7 @@ class TestLoginCommand:
             ("chrome", "Google Chrome", "google.com/chrome"),
         ],
     )
+    @pytest.mark.requires_playwright
     def test_login_channel_browser_not_installed_shows_helpful_error(
         self, runner, tmp_path, browser, expected_label, expected_install_url_fragment
     ):
@@ -264,6 +294,11 @@ class TestLoginCommand:
         reports it is already on the NotebookLM host, so the auto-detect
         fast-path is taken.
         """
+        # See ``mock_login_browser`` above — same playwright-missing skip path.
+        pytest.importorskip(
+            "playwright.sync_api",
+            reason="playwright not installed; install with: uv sync --extra browser",
+        )
         storage_file = tmp_path / "storage.json"
         with (
             patch("notebooklm.cli.session._ensure_chromium_installed"),
@@ -298,6 +333,7 @@ class TestLoginCommand:
             ),
         ],
     )
+    @pytest.mark.requires_playwright
     def test_login_handles_navigation_interrupted_error(
         self, runner, mock_login_browser_with_storage, error_message
     ):
@@ -324,6 +360,7 @@ class TestLoginCommand:
         assert result.exit_code == 0
         assert "Authentication saved" in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_reraises_non_navigation_playwright_errors(
         self, runner, mock_login_browser_with_storage
     ):
@@ -393,6 +430,7 @@ class TestLoginCommand:
         assert mock_page.wait_for_url.call_args.kwargs.get("timeout") == 300_000
         assert "Login detected" in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_auto_detect_timeout_exits_with_helpful_message(
         self, runner, mock_login_browser_with_storage
     ):
@@ -408,6 +446,7 @@ class TestLoginCommand:
         assert result.exit_code == 1
         assert "Login not detected within 5 minutes" in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_auto_detect_browser_closed_during_wait_shows_help(
         self, runner, mock_login_browser_with_storage
     ):
@@ -450,6 +489,7 @@ class TestLoginCommand:
         assert "Unexpected URL after login" in result.output
         assert "Authentication saved" not in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_retries_on_connection_closed_error(
         self, runner, mock_login_browser_with_storage
     ):
@@ -479,6 +519,7 @@ class TestLoginCommand:
         # Verify that goto was called more than once (retried)
         assert mock_page.goto.call_count >= 2
 
+    @pytest.mark.requires_playwright
     def test_login_retries_on_connection_reset_error(self, runner, mock_login_browser_with_storage):
         """Test login retries when initial navigation fails with ERR_CONNECTION_RESET (#243)."""
         mock_page = mock_login_browser_with_storage
@@ -504,6 +545,7 @@ class TestLoginCommand:
         assert result.exit_code == 0
         assert "Authentication saved" in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_exits_after_max_retries(self, runner, mock_login_browser_with_storage):
         """Test login exits with error message after 3 failed connection attempts (#243)."""
         mock_page = mock_login_browser_with_storage
@@ -525,6 +567,7 @@ class TestLoginCommand:
         # Verify retry attempts were made
         assert mock_page.goto.call_count == 3
 
+    @pytest.mark.requires_playwright
     def test_login_fails_fast_on_non_retryable_errors(
         self, runner, mock_login_browser_with_storage
     ):
@@ -547,6 +590,7 @@ class TestLoginCommand:
         # Should fail immediately without retrying (only 1 call)
         assert mock_page.goto.call_count == 1
 
+    @pytest.mark.requires_playwright
     def test_login_displays_help_text_after_exhausting_retries(
         self, runner, mock_login_browser_with_storage
     ):
@@ -574,6 +618,7 @@ class TestLoginCommand:
         # Verify exactly 3 retry attempts
         assert mock_page.goto.call_count == 3
 
+    @pytest.mark.requires_playwright
     def test_login_fresh_deletes_browser_profile(self, runner, tmp_path):
         """Test --fresh deletes existing browser_profile directory before login."""
         browser_dir = tmp_path / "profile"
@@ -612,6 +657,7 @@ class TestLoginCommand:
         assert not (browser_dir / "Default" / "Cookies").exists()
         assert "Cleared cached browser session" in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_fresh_works_when_no_profile_exists(self, runner, tmp_path):
         """Test --fresh works when browser_profile doesn't exist yet (first login)."""
         browser_dir = tmp_path / "profile"
@@ -644,6 +690,7 @@ class TestLoginCommand:
         assert result.exit_code == 0
         assert "Authentication saved" in result.output
 
+    @pytest.mark.requires_playwright
     def test_playwright_login_clears_stale_account_metadata(self, runner, tmp_path):
         """Interactive login targets the visible account, so stale browser-cookie
         account routing metadata must not survive the new storage state."""
@@ -719,6 +766,7 @@ class TestLoginCommand:
         assert result.exit_code == 1
         assert "Cannot clear browser profile" in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_recovers_from_target_closed_on_initial_navigation(self, runner, tmp_path):
         """Test login retries with fresh page when initial goto gets TargetClosedError (#246)."""
         storage_file = tmp_path / "storage.json"
@@ -765,6 +813,7 @@ class TestLoginCommand:
         # Verify new_page was called to recover from the stale page
         mock_context.new_page.assert_called()
 
+    @pytest.mark.requires_playwright
     def test_login_recovers_from_target_closed_in_cookie_forcing(self, runner, tmp_path):
         """Test login recovers when cookie-forcing goto hits TargetClosedError (#246).
 
@@ -824,6 +873,7 @@ class TestLoginCommand:
         # Verify new_page was called to get a fresh page after the stale one died
         mock_context.new_page.assert_called()
 
+    @pytest.mark.requires_playwright
     def test_login_ignores_navigation_interrupted_after_recovering_page(self, runner, tmp_path):
         """Test recovered pages can also hit the Playwright navigation race (#317)."""
         storage_file = tmp_path / "storage.json"
@@ -877,6 +927,7 @@ class TestLoginCommand:
         assert "Authentication saved" in result.output
         mock_context.new_page.assert_called()
 
+    @pytest.mark.requires_playwright
     def test_login_shows_browser_closed_message_after_exhausting_retries(self, runner, tmp_path):
         """Test login shows browser-specific error (not network error) when TargetClosedError exhausts retries."""
         storage_file = tmp_path / "storage.json"
@@ -918,6 +969,7 @@ class TestLoginCommand:
         assert "browser" in result.output.lower() and "closed" in result.output.lower()
         assert "Network connectivity" not in result.output
 
+    @pytest.mark.requires_playwright
     def test_login_cookie_forcing_double_failure_shows_browser_closed(self, runner, tmp_path):
         """Test cookie-forcing shows BROWSER_CLOSED_HELP when recovered page also raises TargetClosedError (#246).
 
@@ -977,7 +1029,7 @@ class TestLoginCommand:
 
 class TestLoginNoTraceback:
     """Regression: ``login`` must wrap unexpected failures in handle_errors so
-    users see a friendly one-liner instead of a Python traceback (I15).
+    users see a friendly one-liner instead of a Python traceback.
 
     Without the wrap, the bare ``raise`` at the end of the Playwright
     ``except Exception`` block re-raises out of the command body, escapes
@@ -998,6 +1050,11 @@ class TestLoginNoTraceback:
         Hermetic: ``NOTEBOOKLM_HOME=tmp_path`` so the test never touches the
         real ``~/.notebooklm/`` (would fail with PermissionError in sandboxes).
         """
+        # See ``mock_login_browser`` above — same playwright-missing skip path.
+        pytest.importorskip(
+            "playwright.sync_api",
+            reason="playwright not installed; install with: uv sync --extra browser",
+        )
         monkeypatch.setenv("NOTEBOOKLM_HOME", str(tmp_path))
         with (
             patch("notebooklm.cli.session._ensure_chromium_installed"),
@@ -1121,9 +1178,9 @@ class TestUseCommand:
         assert "nb_full_id_123" in result.output or "Resolved Notebook" in result.output
 
     def test_use_without_auth_fails_closed(self, runner, mock_context_file):
-        """'use' fails closed (exit 1) when no auth is available — fix for T3.D.
+        """'use' fails closed (exit 1) when no auth is available.
 
-        Pre-T3.D behavior persisted unverified IDs after auth failure, poisoning
+        Previously, behavior persisted unverified IDs after auth failure, poisoning
         saved state for downstream commands. The new contract: refuse to write
         context.json and emit a clear "run notebooklm login" message.
         """
@@ -1188,13 +1245,13 @@ class TestUseCommand:
 
 
 # =============================================================================
-# USE COMMAND --json + auth-aware errors (P4.T5: I12, I13)
+# USE COMMAND --json + auth-aware errors
 # =============================================================================
 
 
 class TestUseJsonOutput:
     """`notebooklm use <id> --json` emits a structured envelope with the new
-    active notebook id (I12) so script and AI-agent automation does not have
+    active notebook id so script and AI-agent automation does not have
     to scrape the rendered Rich table for the next-step ID.
     """
 
@@ -1255,7 +1312,7 @@ class TestUseAuthAwareError:
     """When `notebooklm use <id>` hits an `AuthError` (e.g. expired SID
     cookies), the catch must surface the typed "run notebooklm login" UX
     from `helpers.handle_auth_error` rather than the generic "Could not
-    verify ... Pass --force" catch-all (audit row I13).
+    verify ... Pass --force" catch-all.
     """
 
     def test_use_auth_error_suggests_notebooklm_login(self, runner, mock_auth, mock_context_file):
@@ -1532,7 +1589,7 @@ class TestAuthCheckCommand:
     def test_auth_check_storage_not_found_json(self, runner, mock_storage_path):
         """Test auth check --json when storage file doesn't exist.
 
-        Per T1.F: failure paths in --json mode must exit nonzero so automation
+        Spec: failure paths in --json mode must exit nonzero so automation
         can fail-fast on `notebooklm auth check --json`.
         """
         if mock_storage_path.exists():
@@ -1559,7 +1616,7 @@ class TestAuthCheckCommand:
     def test_auth_check_invalid_json_output(self, runner, mock_storage_path):
         """Test auth check --json when storage contains invalid JSON.
 
-        Per T1.F: failure paths in --json mode must exit nonzero.
+        Spec: failure paths in --json mode must exit nonzero.
         """
         mock_storage_path.write_text("not valid json at all")
 
@@ -1635,7 +1692,7 @@ class TestAuthCheckCommand:
         in ``auth.py`` raise on absence, and ``auth check`` reports the raised
         ``ValueError`` so users see the new diagnostic.
 
-        T1.F closes the previous exit-code gap: ``auth check --json`` now exits
+        The fix closes the previous exit-code gap: ``auth check --json`` now exits
         nonzero whenever it reports ``status="error"``.
         """
         storage_data = {
@@ -1901,9 +1958,9 @@ class TestLoginLanguageSync:
 
 class TestSessionEdgeCases:
     def test_use_handles_api_error_fails_closed(self, runner, mock_auth, mock_context_file):
-        """'use' fails closed when the API errors — fix for T3.D.
+        """'use' fails closed when the API errors.
 
-        Pre-T3.D: an exception during ``client.notebooks.get`` was swallowed
+        Previously: an exception during ``client.notebooks.get`` was swallowed
         and the unverified ID was persisted with a "Warning" tag, poisoning
         downstream commands. New contract: exit 1, leave context.json untouched.
         """
@@ -2863,7 +2920,7 @@ class TestAuthRefreshCommand:
         """Token fetch failure exits non-zero with a friendly message — picked
         up by cron logs.
 
-        The command body is wrapped in ``handle_errors`` (I15 polish), so an
+        The command body is wrapped in ``handle_errors``, so an
         unexpected ``ValueError`` flows through the UNEXPECTED_ERROR branch
         (exit 2) and the user sees a friendly 'Unexpected error: <msg>' line
         rather than a Python traceback.
@@ -2882,13 +2939,13 @@ class TestAuthRefreshCommand:
         assert "Traceback (most recent call last)" not in result.output
 
     def test_auth_refresh_failure_does_not_print_exception_class(self, runner, mock_storage_path):
-        """I15 polish: ``auth refresh`` no longer leaks ``type(exc).__name__``
-        into the user-facing message. The previous code path produced
+        """``auth refresh`` no longer leaks ``type(exc).__name__`` into the
+        user-facing message. The previous code path produced
         ``Error: ConnectTimeout: `` (with class name), which is implementation
         detail leakage. ``handle_errors`` produces ``Unexpected error: <msg>``
         instead.
 
-        Regression guard for the polish item folded into P3.T3.
+        Regression guard for the error-handler polish.
         """
         with patch(
             "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
@@ -2911,7 +2968,7 @@ class TestAuthRefreshCommand:
         self, runner, mock_storage_path
     ):
         """The ``--browser-cookies`` failure path also flows through
-        ``handle_errors`` — same I15 polish guarantee as the keepalive path.
+        ``handle_errors`` — same polish guarantee as the keepalive path.
 
         Previously the browser-cookies branch had its own bespoke
         ``except Exception: click.echo(f"Error: {type(exc).__name__}: ...")``
@@ -3020,7 +3077,7 @@ class TestAuthRefreshCommand:
         assert result.exit_code == 0, result.output
         assert "bob@gmail.com" in result.output
         assert "authuser" not in result.output
-        assert json.loads((storage.parent / "context.json").read_text())["account"] == {
+        assert _read_account(storage) == {
             "authuser": 0,
             "email": "bob@gmail.com",
         }
@@ -3060,7 +3117,10 @@ class TestAuthRefreshCommand:
         assert "bob@gmail.com" in result.output
         assert "not signed in" in result.output.lower()
         assert "alice@example.com" in result.output
-        assert json.loads((storage.parent / "context.json").read_text())["account"] == {
+        # In this test the storage file was pre-seeded with a sibling
+        # context.json (legacy layout). The reader falls back to that record
+        # because no in-band write has occurred — assertion stays unchanged.
+        assert _read_account(storage) == {
             "authuser": 1,
             "email": "bob@gmail.com",
         }
@@ -3096,6 +3156,39 @@ def _multiaccount_rookiepy_mock():
 
 
 class TestAuthInspect:
+    def test_session_run_async_patch_reaches_login_service_helper(self):
+        from notebooklm.auth import Account
+        from notebooklm.cli.session import _enumerate_one_jar
+
+        raw_cookies = _multiaccount_rookiepy_mock().chrome.return_value
+        accounts = [Account(authuser=0, email="alice@example.com", is_default=True)]
+
+        with (
+            patch("notebooklm.auth.enumerate_accounts", return_value=object()),
+            patch("notebooklm.cli.session.run_async", return_value=accounts) as mock_run_async,
+        ):
+            result = _enumerate_one_jar(raw_cookies, "chrome", browser_profile=None)
+
+        assert result == accounts
+        mock_run_async.assert_called_once()
+
+    def test_select_account_without_marked_default_uses_first_account(self):
+        from notebooklm.auth import Account
+        from notebooklm.cli.session import _select_account
+
+        accounts = [
+            Account(authuser=0, email="alice@example.com", is_default=False),
+            Account(authuser=1, email="bob@gmail.com", is_default=False),
+        ]
+
+        with patch("notebooklm.cli.session.console") as mock_console:
+            selected = _select_account(accounts, account_email=None)
+
+        assert selected == accounts[0]
+        warning_text = mock_console.print.call_args[0][0]
+        assert "default account" in warning_text
+        assert "alice@example.com" in warning_text
+
     def test_inspect_lists_accounts(self, runner):
         mock_rk = _multiaccount_rookiepy_mock()
 
@@ -3180,9 +3273,9 @@ class TestLoginMultiAccount:
             )
 
         assert result.exit_code == 0, result.output
-        context_json = target_dir / "context.json"
-        assert context_json.exists()
-        assert json.loads(context_json.read_text())["account"] == {
+        storage_file = target_dir / "storage_state.json"
+        assert _account_exists(storage_file)
+        assert _read_account(storage_file) == {
             "authuser": 1,
             "email": "bob@gmail.com",
         }
@@ -3265,8 +3358,8 @@ class TestLoginMultiAccount:
             result = runner.invoke(cli, ["login", "--browser-cookies", "chrome", "--all-accounts"])
 
         assert result.exit_code == 0, result.output
-        alice_meta = json.loads((target_root / "alice" / "context.json").read_text())["account"]
-        bob_meta = json.loads((target_root / "bob" / "context.json").read_text())["account"]
+        alice_meta = _read_account(target_root / "alice" / "storage_state.json")
+        bob_meta = _read_account(target_root / "bob" / "storage_state.json")
         assert alice_meta == {"authuser": 0, "email": "alice@example.com"}
         assert bob_meta == {"authuser": 1, "email": "bob@gmail.com"}
 
@@ -3344,8 +3437,9 @@ class TestLoginMultiAccount:
             result = runner.invoke(cli, ["login", "--browser-cookies", "chrome", "--all-accounts"])
 
         assert result.exit_code == 0, result.output
-        assert (target_root / "alice-2" / "context.json").exists()
-        assert json.loads((target_root / "alice-2" / "context.json").read_text())["account"] == {
+        alice2_storage = target_root / "alice-2" / "storage_state.json"
+        assert _account_exists(alice2_storage)
+        assert _read_account(alice2_storage) == {
             "authuser": 0,
             "email": "alice@example.com",
         }
@@ -3395,7 +3489,7 @@ class TestLoginMultiAccount:
 
         assert first.exit_code == 0, first.output
         assert second.exit_code == 0, second.output
-        assert json.loads((target_root / "bob" / "context.json").read_text())["account"] == {
+        assert _read_account(target_root / "bob" / "storage_state.json") == {
             "authuser": 0,
             "email": "bob@gmail.com",
         }
@@ -3427,6 +3521,187 @@ class TestLoginMultiAccount:
         )
         assert result.exit_code != 0
         assert "all-accounts" in result.output.lower()
+
+
+class TestLoginAllAccountsUpdate:
+    """``--update`` lets ``--all-accounts`` adopt name-matching profiles in
+    place instead of allocating a suffixed ``alice-2`` when the natural name
+    is held by a hand-created profile with no account metadata."""
+
+    @staticmethod
+    def _run_all_accounts(
+        runner,
+        tmp_path,
+        *,
+        update: bool,
+        accounts: list[tuple[int, str, bool]],
+        preexisting: dict[str, dict | None] | None = None,
+    ):
+        """Run ``login --browser-cookies chrome --all-accounts [--update]``
+        against a mocked rookiepy + ``enumerate_accounts`` setup.
+
+        Args:
+            accounts: ``(authuser, email, is_default)`` tuples returned by the
+                mocked ``enumerate_accounts``.
+            preexisting: map of ``profile_dir -> context.json contents``
+                (``None`` = create the directory + an empty storage_state.json
+                with no context.json, i.e. a hand-created profile with no
+                account metadata).
+        """
+        mock_rk = _multiaccount_rookiepy_mock()
+
+        async def _enum(*args, **kwargs):
+            from notebooklm.auth import Account
+
+            return [Account(authuser=a, email=e, is_default=d) for a, e, d in accounts]
+
+        target_root = tmp_path / "profiles"
+        target_root.mkdir(parents=True)
+        for name, ctx in (preexisting or {}).items():
+            d = target_root / name
+            d.mkdir()
+            (d / "storage_state.json").write_text("{}")
+            if ctx is not None:
+                (d / "context.json").write_text(json.dumps(ctx))
+
+        def fake_get_storage_path(profile=None):
+            return target_root / (profile or "default") / "storage_state.json"
+
+        def fake_list_profiles():
+            return sorted(p.name for p in target_root.iterdir() if p.is_dir())
+
+        argv = ["login", "--browser-cookies", "chrome", "--all-accounts"]
+        if update:
+            argv.append("--update")
+        with (
+            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch("notebooklm.cli.session.get_storage_path", side_effect=fake_get_storage_path),
+            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
+            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch(
+                "notebooklm.cli.session.fetch_tokens_with_domains",
+                new_callable=AsyncMock,
+                return_value=("csrf", "sess"),
+            ),
+        ):
+            result = runner.invoke(cli, argv)
+        return result, target_root
+
+    def test_update_adopts_unsuffixed_profile_with_no_metadata(self, runner, tmp_path):
+        # Pre-existing "alice" hand-created via `notebooklm login --profile alice`
+        # — no context.json, no email metadata. With --update, it should
+        # be adopted in place instead of getting an alice-2 suffix.
+        result, root = self._run_all_accounts(
+            runner,
+            tmp_path,
+            update=True,
+            accounts=[(0, "alice@example.com", True)],
+            preexisting={"alice": None},
+        )
+        assert result.exit_code == 0, result.output
+        alice_storage = root / "alice" / "storage_state.json"
+        assert _account_exists(alice_storage)
+        assert (root / "alice-2").exists() is False
+        assert _read_account(alice_storage) == {
+            "authuser": 0,
+            "email": "alice@example.com",
+        }
+
+    def test_default_still_allocates_suffix_for_unsuffixed_no_metadata(self, runner, tmp_path):
+        # Same setup as above but WITHOUT --update — confirms the new flag is
+        # the only opt-in for the in-place adoption.
+        result, root = self._run_all_accounts(
+            runner,
+            tmp_path,
+            update=False,
+            accounts=[(0, "alice@example.com", True)],
+            preexisting={"alice": None},
+        )
+        assert result.exit_code == 0, result.output
+        # P1-20: the new profile lands in alice-2/ with an in-band account
+        # record in its storage_state.json.
+        assert _account_exists(root / "alice-2" / "storage_state.json")
+        # alice still exists but was never touched — no account record either
+        # in-band or in the (absent) sibling context.json.
+        assert not _account_exists(root / "alice" / "storage_state.json")
+        assert (root / "alice" / "context.json").exists() is False
+
+    def test_update_does_not_clobber_profile_bound_to_different_email(self, runner, tmp_path):
+        # Safety guard: a profile named "alice" that already binds
+        # alice@OTHER.com must NOT be hijacked by alice@example.com just
+        # because --update is on. Falls back to the suffix path.
+        result, root = self._run_all_accounts(
+            runner,
+            tmp_path,
+            update=True,
+            accounts=[(0, "alice@example.com", True)],
+            preexisting={"alice": {"account": {"authuser": 0, "email": "alice@OTHER.com"}}},
+        )
+        assert result.exit_code == 0, result.output
+        # The new profile lands in alice-2 with an in-band record.
+        assert _account_exists(root / "alice-2" / "storage_state.json")
+        # Existing alice metadata (legacy sibling context.json) is untouched.
+        assert _read_account(root / "alice" / "storage_state.json") == {
+            "authuser": 0,
+            "email": "alice@OTHER.com",
+        }
+
+    def test_update_is_idempotent_when_profile_already_has_matching_metadata(
+        self, runner, tmp_path
+    ):
+        # If "alice" already binds the same email, --update changes nothing
+        # observable (re-stamps the same metadata; doesn't create alice-2).
+        result, root = self._run_all_accounts(
+            runner,
+            tmp_path,
+            update=True,
+            accounts=[(0, "alice@example.com", True)],
+            preexisting={"alice": {"account": {"authuser": 0, "email": "alice@example.com"}}},
+        )
+        assert result.exit_code == 0, result.output
+        assert sorted(p.name for p in root.iterdir()) == ["alice"]
+        # P1-20: --update re-writes account metadata in-band; the read goes
+        # through ``read_account_metadata`` which prefers the in-band record
+        # when present and falls back to the legacy sibling context.json
+        # otherwise. Either way the assertion is on the canonical reader.
+        assert _read_account(root / "alice" / "storage_state.json") == {
+            "authuser": 0,
+            "email": "alice@example.com",
+        }
+
+    def test_update_requires_all_accounts(self, runner):
+        result = runner.invoke(cli, ["login", "--browser-cookies", "chrome", "--update"])
+        assert result.exit_code != 0
+        assert "--update" in result.output
+        assert "--all-accounts" in result.output
+
+    def test_all_accounts_matches_existing_profile_case_insensitively(self, runner, tmp_path):
+        """Stored email metadata may differ in case from what Google returns
+        on a later probe (e.g. ``Alice@Gmail.com`` stored, ``alice@gmail.com``
+        probed). The email-keyed reuse path must casefold both sides so the
+        same profile is reused rather than allocating a suffixed duplicate.
+        Regression for CodeRabbit's review on #594.
+        """
+        # No --update — proving the case-insensitive match works on the
+        # default reuse-by-email-metadata path (not the --update name path).
+        result, root = self._run_all_accounts(
+            runner,
+            tmp_path,
+            update=False,
+            accounts=[(0, "alice@gmail.com", True)],
+            preexisting={"alice": {"account": {"authuser": 0, "email": "Alice@Gmail.com"}}},
+        )
+        assert result.exit_code == 0, result.output
+        # No alice-2 — the existing alice profile was reused despite the
+        # casing mismatch.
+        assert (root / "alice-2").exists() is False
+        # Re-stamped metadata uses the email as Google reports it now. The
+        # in-band reader takes precedence over the legacy sibling record so
+        # the casefold-and-rewrite test sees the new value.
+        assert _read_account(root / "alice" / "storage_state.json") == {
+            "authuser": 0,
+            "email": "alice@gmail.com",
+        }
 
 
 class TestStaleAccountMetadataCleanup:
@@ -3476,3 +3751,716 @@ class TestStaleAccountMetadataCleanup:
         # Account metadata must be gone so subsequent token fetches don't keep
         # routing to the old account, while unrelated notebook context survives.
         assert json.loads((tmp_path / "context.json").read_text()) == {"notebook_id": "nb_existing"}
+
+
+# =============================================================================
+# Chromium multi-user-profile fan-out (issue #571)
+# =============================================================================
+
+
+def _make_chromium_profile(directory_name, human_name, cookies_db):
+    """Build a synthetic ChromiumProfile for fan-out tests."""
+    from notebooklm.cli._chromium_profiles import ChromiumProfile
+
+    return ChromiumProfile(
+        browser="chrome",
+        directory_name=directory_name,
+        human_name=human_name,
+        cookies_db=cookies_db,
+    )
+
+
+def _chromium_fanout_setup(tmp_path, profile_specs):
+    """Install patches that make the chromium fan-out path deterministic.
+
+    Args:
+        tmp_path: pytest tmp_path.
+        profile_specs: list of ``(directory_name, human_name, accounts_for_profile)``
+            where ``accounts_for_profile`` is a list of dicts
+            ``{"authuser": int, "email": str, "is_default": bool}``.
+
+    Returns:
+        Tuple ``(profiles, cookies_per_profile, accounts_per_profile)`` of
+        the data structures the patches will return. Useful when a test
+        wants to assert on what was set up.
+    """
+    profiles = []
+    cookies_per_profile = {}
+    accounts_per_profile = {}
+    for dir_name, human, account_dicts in profile_specs:
+        db = tmp_path / f"{dir_name}-Cookies"
+        db.write_bytes(b"x")  # presence-only, never opened by mocks
+        profile = _make_chromium_profile(dir_name, human, db)
+        profiles.append(profile)
+        # Unique per-profile cookie value so the writer-side assertions can
+        # distinguish which profile's jar was used when writing notebooklm
+        # storage_state.json files for each account.
+        cookies_per_profile[dir_name] = [
+            {
+                "domain": ".google.com",
+                "name": "SID",
+                "value": f"SID-from-{dir_name}",
+                "path": "/",
+                "secure": True,
+                "expires": 9999,
+                "http_only": False,
+            },
+            {
+                "domain": ".google.com",
+                "name": "__Secure-1PSIDTS",
+                "value": f"SIDTS-from-{dir_name}",
+                "path": "/",
+                "secure": True,
+                "expires": 9999,
+                "http_only": False,
+            },
+        ]
+        accounts_per_profile[dir_name] = account_dicts
+    return profiles, cookies_per_profile, accounts_per_profile
+
+
+@contextlib.contextmanager
+def _install_chromium_fanout_patches(
+    profiles,
+    cookies_per_profile,
+    accounts_per_profile,
+    *,
+    read_calls: list[str] | None = None,
+):
+    """Context manager that installs all fan-out patches for the test body.
+
+    Patches discovery, per-profile cookie reads, ``rookiepy`` (so the
+    optional-dep import inside ``read_chromium_profile_cookies`` succeeds),
+    and ``enumerate_accounts`` so each profile yields its own account list.
+    """
+    from notebooklm.auth import Account
+
+    def fake_discover(browser_name):
+        return profiles if browser_name.lower() == "chrome" else []
+
+    def fake_read(profile, *, domains):
+        if read_calls is not None:
+            read_calls.append(profile.directory_name)
+        return cookies_per_profile[profile.directory_name]
+
+    pending = {p.directory_name: list(accounts_per_profile[p.directory_name]) for p in profiles}
+
+    async def fake_enumerate(jar, *args, **kwargs):
+        # ``_enumerate_one_jar`` builds a jar from the cookies it just read,
+        # so the SID value (unique per profile in our setup) identifies which
+        # profile this call corresponds to.
+        sid = jar.get("SID", default="")
+        for dir_name in pending:
+            if sid == f"SID-from-{dir_name}":
+                spec = pending.pop(dir_name)
+                return [
+                    Account(authuser=a["authuser"], email=a["email"], is_default=a["is_default"])
+                    for a in spec
+                ]
+        raise AssertionError(f"unexpected enumerate_accounts call (SID={sid!r})")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.dict("sys.modules", {"rookiepy": MagicMock()}))
+        stack.enter_context(
+            patch(
+                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+                side_effect=fake_discover,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+                side_effect=fake_read,
+            )
+        )
+        stack.enter_context(patch("notebooklm.auth.enumerate_accounts", side_effect=fake_enumerate))
+        yield
+
+
+class TestChromiumFanoutAuthInspect:
+    """``auth inspect`` aggregates accounts across Chrome user-profiles (#571)."""
+
+    def test_lists_accounts_across_profiles_email_only_by_default(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 2",
+                    "Side",
+                    [{"authuser": 0, "email": "carol@ws.com", "is_default": True}],
+                ),
+            ],
+        )
+        with _install_chromium_fanout_patches(profiles, cookies, accounts):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome"])
+        assert result.exit_code == 0, result.output
+        assert "alice@gmail.com" in result.output
+        assert "bob@gmail.com" in result.output
+        assert "carol@ws.com" in result.output
+        # The result table is email-primary — no per-row browser-profile column
+        # by default. The "Reading cookies from N profiles…" status line may
+        # mention profile names, but the table rows don't repeat them.
+        table_lines = [line for line in result.output.splitlines() if "@" in line]
+        for row in table_lines:
+            assert "Default" not in row
+            assert "Profile 1" not in row
+            assert "Personal" not in row
+            assert "Work" not in row
+        # And the help text nudges the user toward -v.
+        assert "-v" in result.output
+
+    def test_verbose_shows_browser_user_profile_column(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        with _install_chromium_fanout_patches(profiles, cookies, accounts):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome", "-v"])
+        assert result.exit_code == 0, result.output
+        assert "Default" in result.output
+        assert "Profile 1" in result.output
+
+    def test_json_output_includes_browser_profile(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        with _install_chromium_fanout_patches(profiles, cookies, accounts):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        emails = {a["email"]: a["browser_profile"] for a in data["accounts"]}
+        assert emails == {
+            "alice@gmail.com": "Default",
+            "bob@gmail.com": "Profile 1",
+        }
+
+    def test_duplicate_email_across_profiles_deduped_first_wins(self, runner, tmp_path):
+        # Same email signed in to two Chrome user-profiles. Default wins
+        # (it's iterated first) and the second occurrence is dropped.
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        with _install_chromium_fanout_patches(profiles, cookies, accounts):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert [a["email"] for a in data["accounts"]] == ["alice@gmail.com"]
+        assert data["accounts"][0]["browser_profile"] == "Default"
+
+
+class TestChromiumFanoutAllAccounts:
+    """``login --browser-cookies chrome --all-accounts`` writes one profile per
+    unique Google account across every Chrome user-profile (#571)."""
+
+    def test_all_accounts_writes_profile_per_browser_user_profile(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 2",
+                    "Side",
+                    [{"authuser": 0, "email": "carol@ws.com", "is_default": True}],
+                ),
+            ],
+        )
+        target_root = tmp_path / "profiles"
+
+        def fake_get_storage_path(profile=None):
+            return target_root / (profile or "default") / "storage_state.json"
+
+        def fake_list_profiles():
+            if not target_root.exists():
+                return []
+            return sorted(p.name for p in target_root.iterdir() if p.is_dir())
+
+        with (
+            _install_chromium_fanout_patches(profiles, cookies, accounts),
+            patch("notebooklm.cli.session.get_storage_path", side_effect=fake_get_storage_path),
+            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
+            patch(
+                "notebooklm.cli.session.fetch_tokens_with_domains",
+                new_callable=AsyncMock,
+                return_value=("csrf", "sess"),
+            ),
+        ):
+            result = runner.invoke(cli, ["login", "--browser-cookies", "chrome", "--all-accounts"])
+
+        assert result.exit_code == 0, result.output
+        assert _account_exists(target_root / "alice" / "storage_state.json")
+        assert _account_exists(target_root / "bob" / "storage_state.json")
+        assert _account_exists(target_root / "carol" / "storage_state.json")
+        # Cookies written for "bob" must come from Profile 1, not Default —
+        # this is the core bug the fan-out fixes.
+        bob_storage = json.loads((target_root / "bob" / "storage_state.json").read_text())
+        sid_cookie = next(c for c in bob_storage["cookies"] if c["name"] == "SID")
+        assert sid_cookie["value"] == "SID-from-Profile 1"
+        # And alice@gmail.com's cookies come from Default.
+        alice_storage = json.loads((target_root / "alice" / "storage_state.json").read_text())
+        alice_sid = next(c for c in alice_storage["cookies"] if c["name"] == "SID")
+        assert alice_sid["value"] == "SID-from-Default"
+
+    def test_all_accounts_handles_profile_with_no_signed_in_account(self, runner, tmp_path):
+        # Profile 2 has a Cookies DB but no signed-in Google account
+        # (rookiepy decrypt succeeds, but enumerate_accounts rejects the jar).
+        # The remaining two profiles' accounts should still be written.
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                ("Profile 1", "Work", []),  # empty → signals signed-out below
+                (
+                    "Profile 2",
+                    "Side",
+                    [{"authuser": 0, "email": "carol@ws.com", "is_default": True}],
+                ),
+            ],
+        )
+
+        # Override the enumerate_accounts handler to SystemExit for Profile 1,
+        # mimicking ``_enumerate_one_jar`` exiting on a missing-SID jar.
+        from notebooklm.auth import Account
+
+        async def fake_enumerate(jar, *args, **kwargs):
+            sid = jar.get("SID", default="")
+            if sid == "SID-from-Profile 1":
+                # ``_enumerate_one_jar`` catches this and converts to a
+                # SystemExit, which the fan-out then catches as "signed out".
+                raise ValueError("no signed-in account at authuser=0")
+            for dir_name, spec in accounts.items():
+                if sid == f"SID-from-{dir_name}" and spec:
+                    return [
+                        Account(
+                            authuser=a["authuser"], email=a["email"], is_default=a["is_default"]
+                        )
+                        for a in spec
+                    ]
+            raise AssertionError(f"unexpected SID {sid!r}")
+
+        target_root = tmp_path / "profiles"
+
+        def fake_get_storage_path(profile=None):
+            return target_root / (profile or "default") / "storage_state.json"
+
+        def fake_list_profiles():
+            if not target_root.exists():
+                return []
+            return sorted(p.name for p in target_root.iterdir() if p.is_dir())
+
+        def fake_read(profile, *, domains):
+            return cookies[profile.directory_name]
+
+        def fake_discover(browser_name):
+            return profiles if browser_name.lower() == "chrome" else []
+
+        with (
+            patch.dict("sys.modules", {"rookiepy": MagicMock()}),
+            patch(
+                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+                side_effect=fake_discover,
+            ),
+            patch(
+                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+                side_effect=fake_read,
+            ),
+            patch("notebooklm.auth.enumerate_accounts", side_effect=fake_enumerate),
+            patch("notebooklm.cli.session.get_storage_path", side_effect=fake_get_storage_path),
+            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
+            patch(
+                "notebooklm.cli.session.fetch_tokens_with_domains",
+                new_callable=AsyncMock,
+                return_value=("csrf", "sess"),
+            ),
+        ):
+            result = runner.invoke(cli, ["login", "--browser-cookies", "chrome", "--all-accounts"])
+
+        assert result.exit_code == 0, result.output
+        assert _account_exists(target_root / "alice" / "storage_state.json")
+        assert _account_exists(target_root / "carol" / "storage_state.json")
+        # No profile written for the signed-out Profile 1.
+        assert not any(p.name not in {"alice", "carol"} for p in target_root.iterdir())
+
+
+class TestChromiumFanoutAccountSelector:
+    """``--account EMAIL`` picks the right cookie source even when the email
+    lives in a non-Default Chrome user-profile (#571)."""
+
+    def test_account_email_from_non_default_profile(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        target_dir = tmp_path / "profiles" / "bob"
+
+        def fake_get_storage_path(profile=None):
+            return target_dir / "storage_state.json"
+
+        with (
+            _install_chromium_fanout_patches(profiles, cookies, accounts),
+            patch("notebooklm.cli.session.get_storage_path", side_effect=fake_get_storage_path),
+            patch("notebooklm.cli.session._sync_server_language_to_config"),
+            patch(
+                "notebooklm.cli.session.fetch_tokens_with_domains",
+                new_callable=AsyncMock,
+                return_value=("csrf", "sess"),
+            ),
+        ):
+            result = runner.invoke(
+                cli,
+                ["login", "--browser-cookies", "chrome", "--account", "bob@gmail.com"],
+            )
+
+        assert result.exit_code == 0, result.output
+        storage = json.loads((target_dir / "storage_state.json").read_text())
+        sid = next(c for c in storage["cookies"] if c["name"] == "SID")
+        # Critically: bob's cookies must come from Profile 1, NOT Default.
+        # Before #571 the CLI couldn't see Profile 1 at all.
+        assert sid["value"] == "SID-from-Profile 1"
+
+
+class TestChromiumExplicitProfileSelector:
+    """``chrome::<profile>`` scopes cookie reads to one Chromium user-profile."""
+
+    def test_auth_inspect_scopes_to_human_profile_name(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        read_calls: list[str] = []
+
+        with _install_chromium_fanout_patches(profiles, cookies, accounts, read_calls=read_calls):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome::Work", "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["accounts"] == [
+            {
+                "email": "bob@gmail.com",
+                "is_default": True,
+                "browser_profile": "Profile 1",
+            }
+        ]
+        assert read_calls == ["Profile 1"]
+
+    def test_login_direct_cookie_read_scopes_to_directory_name(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        storage_file = tmp_path / "storage.json"
+        read_calls: list[str] = []
+
+        with (
+            _install_chromium_fanout_patches(profiles, cookies, accounts, read_calls=read_calls),
+            patch("notebooklm.cli.session.get_storage_path", return_value=storage_file),
+            patch("notebooklm.cli.session._sync_server_language_to_config"),
+            patch(
+                "notebooklm.cli.session.fetch_tokens_with_domains",
+                new_callable=AsyncMock,
+                return_value=("csrf", "sess"),
+            ),
+        ):
+            result = runner.invoke(cli, ["login", "--browser-cookies", "chrome::Profile 1"])
+
+        assert result.exit_code == 0, result.output
+        storage = json.loads(storage_file.read_text())
+        sid = next(c for c in storage["cookies"] if c["name"] == "SID")
+        assert sid["value"] == "SID-from-Profile 1"
+        assert read_calls == ["Profile 1"]
+
+    def test_login_account_mismatch_does_not_fall_back_to_other_profile(self, runner, tmp_path):
+        profiles, cookies, accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "a.b@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "my-profile",
+                    [{"authuser": 0, "email": "c.d@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+        read_calls: list[str] = []
+
+        with (
+            _install_chromium_fanout_patches(profiles, cookies, accounts, read_calls=read_calls),
+            patch(
+                "notebooklm.cli.session._write_extracted_cookies",
+                side_effect=AssertionError("must not write cookies for an account mismatch"),
+            ),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "login",
+                    "--browser-cookies",
+                    "chrome::my-profile",
+                    "--account",
+                    "a.b@gmail.com",
+                ],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "Account a.b@gmail.com not found among signed-in accounts" in result.output
+        assert "Available accounts: c.d@gmail.com" in result.output
+        assert read_calls == ["Profile 1"]
+
+    def test_unknown_profile_selector_lists_available_profiles(self, runner, tmp_path):
+        profiles, _cookies, _accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                ("Default", "Personal", []),
+                ("Profile 1", "Work", []),
+            ],
+        )
+
+        with (
+            patch(
+                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+                return_value=profiles,
+            ),
+            patch(
+                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+                side_effect=AssertionError("must not read cookies for an unknown selector"),
+            ),
+        ):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome::Missing"])
+
+        assert result.exit_code != 0, result.output
+        assert "Missing" in result.output
+        assert "Personal" in result.output
+        assert "Default" in result.output
+        assert "Work" in result.output
+        assert "Profile 1" in result.output
+
+    def test_ambiguous_human_name_selector_asks_for_directory(self, runner, tmp_path):
+        profiles, _cookies, _accounts = _chromium_fanout_setup(
+            tmp_path,
+            [
+                ("Profile 1", "Work", []),
+                ("Profile 2", "Work", []),
+            ],
+        )
+
+        with (
+            patch(
+                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+                return_value=profiles,
+            ),
+            patch(
+                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+                side_effect=AssertionError("must not read cookies for an ambiguous selector"),
+            ),
+        ):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome::Work"])
+
+        assert result.exit_code != 0, result.output
+        assert "ambiguous" in result.output
+        assert "Profile 1" in result.output
+        assert "Profile 2" in result.output
+
+    def test_empty_profile_selector_is_rejected_before_cookie_read(self, runner):
+        with patch(
+            "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+            side_effect=AssertionError("must not read cookies for an empty selector"),
+        ):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome::"])
+
+        assert result.exit_code != 0, result.output
+        assert "Empty Chromium profile selector" in result.output
+
+
+class TestChromiumFanoutBoundaryConditions:
+    """Boundary cases around when fan-out activates vs. legacy single-jar
+    path (raised by reviewers on #580)."""
+
+    def test_single_chromium_profile_uses_legacy_single_jar_path(self, runner):
+        """When discovery surfaces exactly ONE chromium user-profile, the
+        legacy ``_read_browser_cookies`` path runs (so existing rookiepy
+        mocks keep working). The new ``read_chromium_profile_cookies`` /
+        ``any_browser`` fan-out path must NOT be invoked.
+        """
+        from notebooklm.cli._chromium_profiles import ChromiumProfile
+
+        only_default = [
+            ChromiumProfile(
+                browser="chrome",
+                directory_name="Default",
+                human_name="Default",
+                cookies_db=Path("/dev/null"),
+            )
+        ]
+
+        mock_rk = _multiaccount_rookiepy_mock()
+
+        async def _enum(*args, **kwargs):
+            from notebooklm.auth import Account
+
+            return [Account(authuser=0, email="alice@example.com", is_default=True)]
+
+        with (
+            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch(
+                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+                return_value=only_default,
+            ),
+            patch(
+                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+                side_effect=AssertionError(
+                    "fan-out must NOT run when only 1 chromium profile exists"
+                ),
+            ),
+            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+        ):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome"])
+
+        assert result.exit_code == 0, result.output
+        # Legacy path was used → mock_rk.chrome was called, not any_browser.
+        mock_rk.chrome.assert_called_once()
+        assert "alice@example.com" in result.output
+
+    def test_network_error_aborts_fanout_not_silent_skip(self, runner, tmp_path):
+        """``httpx.RequestError`` during ``enumerate_accounts`` must abort
+        the entire fan-out with a clear network error, not get caught as
+        a per-profile "signed out" skip. (CodeRabbit major on #580.)
+        """
+        profiles, cookies, _ = _chromium_fanout_setup(
+            tmp_path,
+            [
+                (
+                    "Default",
+                    "Personal",
+                    [{"authuser": 0, "email": "alice@gmail.com", "is_default": True}],
+                ),
+                (
+                    "Profile 1",
+                    "Work",
+                    [{"authuser": 0, "email": "bob@gmail.com", "is_default": True}],
+                ),
+            ],
+        )
+
+        async def fake_enumerate(jar, *args, **kwargs):
+            raise httpx.ConnectError("DNS failure: notebooklm.google.com")
+
+        def fake_discover(browser_name):
+            return profiles if browser_name.lower() == "chrome" else []
+
+        def fake_read(profile, *, domains):
+            return cookies[profile.directory_name]
+
+        with (
+            patch.dict("sys.modules", {"rookiepy": MagicMock()}),
+            patch(
+                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+                side_effect=fake_discover,
+            ),
+            patch(
+                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+                side_effect=fake_read,
+            ),
+            patch("notebooklm.auth.enumerate_accounts", side_effect=fake_enumerate),
+        ):
+            result = runner.invoke(cli, ["auth", "inspect", "--browser", "chrome"])
+
+        # Fan-out must abort with non-zero exit + a network error message —
+        # NOT silently return "No accounts found" by collapsing each profile
+        # probe into the soft signed-out skip.
+        assert result.exit_code != 0, result.output
+        assert "network" in result.output.lower()
+        assert "DNS failure" in result.output

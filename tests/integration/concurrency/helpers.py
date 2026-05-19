@@ -1,8 +1,8 @@
-"""Reusable assertion helpers for the Tier 7 concurrency harness.
+"""Reusable assertion helpers for the concurrency harness.
 
 Three helpers, each scoped to a recurring assertion shape that
-appears across the Phase 2 fix tests. Add new helpers here only when
-they would be repeated in two or more Phase 2 tests — single-use
+appears across the fix tests. Add new helpers here only when
+they would be repeated in two or more tests — single-use
 assertions stay inline in their test module.
 
 Helpers
@@ -11,9 +11,9 @@ Helpers
     Given a stream of ``(timestamp, kind)`` events from a section that
     is supposed to be serialized (a lock, a per-resource queue, a
     per-conversation guard), asserts that no two ``enter`` events
-    occur without an intervening ``exit``. Used by Phase 2 tests for
-    `_refresh_lock`, the conversation-cache lock (T7.F1), the
-    per-task polling dedupe leader (T7.E2), etc.
+    occur without an intervening ``exit``. Used by tests for
+    `_refresh_lock`, the conversation-cache lock, the
+    per-task polling dedupe leader, etc.
 
 ``assert_unique_outputs(make_coro, n_concurrent)``
     Asserts N concurrent invocations of an async callable produce N
@@ -23,8 +23,8 @@ Helpers
 ``with_simulated_cancel(coro, delay, *, label=None)``
     Creates a task from ``coro`` and schedules ``task.cancel()`` after
     ``delay`` seconds. Returns the task's result, or the captured
-    exception (including ``CancelledError``). Used by Phase 2 tests
-    for `asyncio.shield` regressions (T7.C1, T7.C2, T7.C3, T7.C4):
+    exception (including ``CancelledError``). Used by tests for
+    `asyncio.shield` regressions across the concurrency-hardening work:
     cancel one waiter mid-flight, assert sibling work survives.
 
 Non-helpers
@@ -212,7 +212,7 @@ async def with_simulated_cancel(
     Notes
     -----
     Returning the exception (rather than raising) is intentional:
-    Phase 2 cancellation tests typically want to assert
+    Cancellation tests typically want to assert
     "the leader survived; the canceled follower received
     ``CancelledError``" — returning makes that two assertions, not
     one ``pytest.raises`` block per scenario.
@@ -220,7 +220,7 @@ async def with_simulated_cancel(
     Footgun: if ``T`` is itself a ``BaseException`` subclass (a
     coroutine that legitimately RETURNS an exception object rather
     than raising), the caller cannot distinguish "coro returned an
-    exception value" from "coro raised". Phase 2 tests that need
+    exception value" from "coro raised". Tests that need
     that distinction should write a custom assertion rather than
     rely on ``isinstance(result, BaseException)``.
     """
