@@ -2045,6 +2045,52 @@ def _add_file_error_response(file_path: str, code: str, message: str) -> dict[st
     }
 
 
+def _file_error_message(code: str) -> str:
+    messages = {
+        "FILE_ROOT_NOT_CONFIGURED": (
+            "add_file is disabled because NOTEBOOKLM_MCP_FILE_ROOT is not configured. "
+            "This tool reads files from the MCP server filesystem, not a chat sandbox."
+        ),
+        "FILE_OUTSIDE_ALLOWED_ROOT": (
+            "file_path is outside the configured MCP file root. Chat sandbox paths "
+            "such as /mnt/data are not visible to the MCP server."
+        ),
+        "FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT": (
+            "The path is inside the configured MCP file root, but no readable file exists "
+            "there. If you are using Docker, copy the file into ./mcp_imports on the host "
+            "first, then call add_file with /imports/<filename>."
+        ),
+        "IMPORT_FILENAME_REQUIRED": "filename must not be empty.",
+        "IMPORT_FILENAME_NOT_RELATIVE": "filename must be relative to the MCP import root.",
+        "IMPORT_FILENAME_OUTSIDE_ROOT": "filename must stay inside the MCP import root.",
+        "IMPORT_CONTENT_REQUIRED": "Provide exactly one of content or content_base64.",
+        "IMPORT_FILE_EXISTS": "A file already exists at that import path; set overwrite=true.",
+    }
+    return messages.get(code, code)
+
+
+def _file_root() -> Path:
+    root_env = os.environ.get(FILE_ROOT_ENV)
+    if not root_env:
+        raise ValidationError("FILE_ROOT_NOT_CONFIGURED")
+    return Path(root_env).resolve()
+
+
+def _resolve_import_write_path(filename: str, *, overwrite: bool) -> Path:
+    if not filename.strip():
+        raise ValidationError("IMPORT_FILENAME_REQUIRED")
+    requested = Path(filename)
+    if requested.is_absolute():
+        raise ValidationError("IMPORT_FILENAME_NOT_RELATIVE")
+    root = _file_root()
+    destination = (root / requested).resolve()
+    if destination != root and root not in destination.parents:
+        raise ValidationError("IMPORT_FILENAME_OUTSIDE_ROOT")
+    if destination.exists() and not overwrite:
+        raise ValidationError("IMPORT_FILE_EXISTS")
+    return destination
+
+
 def _resolve_allowed_file(file_path: str) -> Path:
     """Resolve *file_path* and confirm it lives inside the configured upload root.
 
@@ -2066,6 +2112,24 @@ def _resolve_allowed_file(file_path: str) -> Path:
     return resolved
 
 
+async def _add_safe_file(
+    client: NotebookLMClient, notebook_id: str, file_path: str
+) -> dict[str, Any]:
+    try:
+        safe_path = _resolve_allowed_file(file_path)
+    except ValidationError as e:
+        code = str(e)
+        return with_notebook_url(
+            _add_file_error_response(file_path, code, _file_error_message(code)),
+            notebook_id,
+        )
+    source = await client.sources.add_file(notebook_id, str(safe_path))
+    return with_notebook_url(
+        {"id": source.id, "title": source.title, "status": source_status_to_str(source.status)},
+        notebook_id,
+    )
+
+
 @mcp.tool()
 async def add_file(
     notebook_id: str,
@@ -2083,31 +2147,132 @@ async def add_file(
     disabled.
     """
     client = await get_client()
-    try:
-        safe_path = _resolve_allowed_file(file_path)
-    except ValidationError as e:
-        code = str(e)
-        messages = {
-            "FILE_ROOT_NOT_CONFIGURED": (
-                "add_file is disabled because NOTEBOOKLM_MCP_FILE_ROOT is not configured. "
-                "This tool reads files from the MCP server filesystem, not a chat sandbox."
-            ),
-            "FILE_OUTSIDE_ALLOWED_ROOT": (
-                "file_path is outside the configured MCP file root. Chat sandbox paths "
-                "such as /mnt/data are not visible to the MCP server."
-            ),
-            "FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT": (
-                "No readable file exists at that server-side path inside the configured "
-                "MCP file root."
-            ),
-        }
+    return await _add_safe_file(client, notebook_id, file_path)
+
+
+@mcp.tool()
+async def add_files(
+    notebook_id: str,
+    file_paths: list[str],
+    continue_on_error: bool = True,
+) -> dict[str, Any]:
+    """Add multiple server-side files as sources. (Write)
+
+    Each path must already exist under ``NOTEBOOKLM_MCP_FILE_ROOT``. In Docker,
+    copy files into host ``./mcp_imports`` and pass ``/imports/<filename>``.
+    """
+    client = await get_client()
+    results: list[dict[str, Any]] = []
+    for file_path in file_paths:
+        result = await _add_safe_file(client, notebook_id, file_path)
+        results.append(result)
+        if result.get("ok") is False and not continue_on_error:
+            break
+
+    succeeded = [r for r in results if r.get("id")]
+    failed = [r for r in results if r.get("ok") is False]
+    return with_notebook_url(
+        {
+            "ok": not failed,
+            "count": len(results),
+            "succeeded_count": len(succeeded),
+            "failed_count": len(failed),
+            "results": results,
+            "next_action": {
+                "tool": "list_sources",
+                "message": "Verify imported source readiness after batch file ingestion.",
+            },
+        },
+        notebook_id,
+    )
+
+
+@mcp.tool()
+async def add_import_file(
+    notebook_id: str,
+    filename: str,
+    content: str | None = None,
+    content_base64: str | None = None,
+    overwrite: bool = False,
+    add_as_source: bool = True,
+) -> dict[str, Any]:
+    """Write content into the MCP import root, optionally adding it as a source. (Write)
+
+    Use ``content`` for text/markdown/csv/json that is already available to the
+    calling agent. Use ``content_base64`` for small binary payloads. Large files
+    should be copied into host ``./mcp_imports`` and imported with ``add_file``
+    or ``add_files``.
+    """
+    if (content is None) == (content_base64 is None):
         return with_notebook_url(
-            _add_file_error_response(file_path, code, messages.get(code, str(e))),
+            _add_file_error_response(
+                filename,
+                "IMPORT_CONTENT_REQUIRED",
+                _file_error_message("IMPORT_CONTENT_REQUIRED"),
+            ),
             notebook_id,
         )
-    source = await client.sources.add_file(notebook_id, str(safe_path))
+
+    try:
+        destination = _resolve_import_write_path(filename, overwrite=overwrite)
+    except ValidationError as e:
+        code = str(e)
+        return with_notebook_url(
+            _add_file_error_response(filename, code, _file_error_message(code)),
+            notebook_id,
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if content_base64 is not None:
+        try:
+            data = base64.b64decode(content_base64, validate=True)
+        except Exception:
+            return with_notebook_url(
+                _add_file_error_response(
+                    filename,
+                    "IMPORT_CONTENT_INVALID_BASE64",
+                    "content_base64 is not valid base64.",
+                ),
+                notebook_id,
+            )
+        destination.write_bytes(data)
+    else:
+        destination.write_text(content or "", encoding="utf-8")
+
+    server_path = str(destination)
+    written = {
+        "ok": True,
+        "file": {
+            "filename": filename,
+            "server_path": server_path,
+            "size_bytes": destination.stat().st_size,
+        },
+    }
+    if not add_as_source:
+        return with_notebook_url(
+            {
+                **written,
+                "next_action": {
+                    "tool": "add_file",
+                    "args": {"notebook_id": notebook_id, "file_path": server_path},
+                },
+            },
+            notebook_id,
+        )
+
+    client = await get_client()
+    source = await client.sources.add_file(notebook_id, server_path)
     return with_notebook_url(
-        {"id": source.id, "title": source.title, "status": source_status_to_str(source.status)},
+        {
+            **written,
+            "id": source.id,
+            "title": source.title,
+            "status": source_status_to_str(source.status),
+            "next_action": {
+                "tool": "list_sources",
+                "message": "Verify imported source readiness after add_import_file.",
+            },
+        },
         notebook_id,
     )
 

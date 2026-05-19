@@ -96,6 +96,11 @@ Use `add_url_source(wait=false)` for URL/YouTube ingestion, then poll readiness.
 - A path such as `/mnt/data/...` belongs to a chat sandbox and is not directly
   visible to the MCP server.
 - If the content is already available in the chat, prefer `add_text_source`.
+- For text/markdown/csv/json content that should be handled as a file, use
+  `add_import_file(filename="...", content="...")`. This writes into `/imports`
+  and can add the written file as a source in one step.
+- For multiple existing server files, use `add_files(file_paths=[...])` with
+  `/imports/<filename>` paths, then verify with `list_sources`.
 - When `add_file` fails, read its structured `diagnostics` and `next_action`
   fields before suggesting a workaround.
 

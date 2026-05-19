@@ -96,6 +96,8 @@ EXPECTED_TOOLS = frozenset(
         "wait_source_ready",
         "add_drive",
         "add_file",
+        "add_files",
+        "add_import_file",
         "check_auth_status",
         "check_mcp_readiness",
     }
@@ -168,6 +170,7 @@ def _make_mock_client():
     client.sources.list = AsyncMock(return_value=[source])
     client.sources.add_url = AsyncMock(return_value=source)
     client.sources.add_text = AsyncMock(return_value=source)
+    client.sources.add_file = AsyncMock(return_value=source)
     client.sources.delete = AsyncMock(return_value=True)
     client.sources.refresh = AsyncMock(return_value=True)
     fulltext = MagicMock(content="full text body", char_count=42)
@@ -977,6 +980,93 @@ class TestToolLogic:
         assert result["diagnostics"]["allowed_root"] is None
         assert "add_text_source" in result["next_action"]["fallback_tool"]
         patch_client.sources.add_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_file_reports_missing_file_inside_import_root(
+        self, patch_client, monkeypatch
+    ):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", "/imports")
+
+        result = await srv.add_file("nb-1", "/imports/missing.md")
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT"
+        assert "/imports" in result["diagnostics"]["allowed_root"]
+        assert "./mcp_imports" in result["next_action"]["message"]
+        patch_client.sources.add_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_import_file_writes_text_and_adds_source(
+        self, patch_client, monkeypatch, tmp_path
+    ):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", str(tmp_path))
+
+        result = await srv.add_import_file("nb-1", "notes/source.md", content="# Source")
+
+        written = tmp_path / "notes" / "source.md"
+        assert written.read_text() == "# Source"
+        assert result["ok"] is True
+        assert result["file"]["server_path"] == str(written.resolve())
+        assert result["id"] == "src-1"
+        patch_client.sources.add_file.assert_awaited_once_with("nb-1", str(written.resolve()))
+
+    @pytest.mark.asyncio
+    async def test_add_import_file_rejects_path_escape(self, patch_client, monkeypatch, tmp_path):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", str(tmp_path))
+
+        result = await srv.add_import_file("nb-1", "../secret.md", content="secret")
+
+        assert result["ok"] is False
+        assert result["error"]["code"] == "IMPORT_FILENAME_OUTSIDE_ROOT"
+        patch_client.sources.add_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_import_file_can_only_write_without_adding_source(
+        self, patch_client, monkeypatch, tmp_path
+    ):
+        import notebooklm.mcp_server as srv
+
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", str(tmp_path))
+
+        result = await srv.add_import_file(
+            "nb-1",
+            "draft.txt",
+            content="draft",
+            add_as_source=False,
+        )
+
+        assert result["ok"] is True
+        assert result["file"]["size_bytes"] == 5
+        assert result["next_action"]["tool"] == "add_file"
+        patch_client.sources.add_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_files_batches_success_and_diagnostics(
+        self, patch_client, monkeypatch, tmp_path
+    ):
+        import notebooklm.mcp_server as srv
+
+        present = tmp_path / "present.md"
+        present.write_text("ok")
+        monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", str(tmp_path))
+
+        result = await srv.add_files(
+            "nb-1",
+            [str(present), str(tmp_path / "missing.md")],
+        )
+
+        assert result["ok"] is False
+        assert result["count"] == 2
+        assert result["succeeded_count"] == 1
+        assert result["failed_count"] == 1
+        assert result["results"][1]["error"]["code"] == "FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT"
+        patch_client.sources.add_file.assert_awaited_once_with("nb-1", str(present.resolve()))
 
     @pytest.mark.asyncio
     async def test_read_framework_manual_is_deprecated(self):
