@@ -9,12 +9,9 @@ docker compose -f "$repo_root/docker-compose.yml" up --no-deps --force-recreate 
   mcp-auth-sync
 
 if docker container inspect "$container_name" >/dev/null 2>&1; then
-  printf 'Recreating %s to apply the workspace auth mount...\n' "$container_name"
-  docker compose -f "$repo_root/docker-compose.yml" up -d --no-deps --force-recreate --no-build \
-    notebooklm-mcp >/dev/null
-  printf 'Checking container auth...\n'
+  printf 'Checking %s auth mirror...\n' "$container_name"
   docker exec "$container_name" sh -lc 'notebooklm auth check --test --json' >/dev/null
-  printf 'MCP container auth OK.\n'
+  printf 'MCP container auth OK. The server will reload auth before the next tool call.\n'
 else
   printf 'Container %s is not running yet. Start it with: docker compose up -d --build\n' \
     "$container_name"
