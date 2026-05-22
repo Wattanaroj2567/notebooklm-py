@@ -2,6 +2,7 @@ services:
   mcp-auth-sync:
     build:
       context: .
+      network: host
     container_name: notebooklm-mcp-auth-sync
     restart: "no"
     environment:
@@ -65,6 +66,7 @@ services:
   notebooklm-mcp:
     build:
       context: .
+      network: host
     container_name: notebooklm-mcp
     restart: unless-stopped
     environment:
