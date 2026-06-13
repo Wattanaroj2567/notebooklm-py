@@ -12,16 +12,14 @@ Post-fix: each call site wraps the synchronous save with
 blocking work runs on the default thread executor and the event loop
 keeps spinning sibling tasks.
 
-This test monkeypatches ``notebooklm.auth.save_cookies_to_storage`` to
+This test monkeypatches ``notebooklm._auth.storage.save_cookies_to_storage`` to
 ``time.sleep(0.5)``. While ``AuthTokens.from_storage`` is mid-save, a
 concurrently scheduled async task increments a counter every 50 ms.
 Pre-fix the counter is ~0–1 (loop frozen by the sync sleep); post-fix
 it is >= 5 (the sleep runs on a thread, loop keeps ticking).
 
-Why a unit-style test under ``tests/integration/concurrency/``: the
-wave-3 plan places every blocking-I/O regression under this directory
-even when the assertion is structural; the harness fixtures are
-re-usable but not required for this surface.
+These are unit-style regression tests under ``tests/unit/concurrency/`` so the
+blocking-I/O contract is exercised without the integration harness.
 """
 
 from __future__ import annotations
@@ -33,7 +31,8 @@ import time
 import pytest
 from pytest_httpx import HTTPXMock
 
-from _fixtures import patch_auth_seam
+import notebooklm._auth.refresh as _auth_refresh
+import notebooklm._auth.storage as _auth_storage
 from notebooklm import auth as auth_module
 from notebooklm.auth import AuthTokens
 
@@ -98,7 +97,9 @@ async def test_from_storage_save_does_not_block_event_loop(
         time.sleep(_SLEEP_SECONDS)
         return True
 
-    patch_auth_seam(monkeypatch, "save_cookies_to_storage", _blocking_save)
+    # ``AuthTokens.from_storage`` owns token loading in ``_auth.tokens`` and
+    # resolves the storage save through the private owner module.
+    monkeypatch.setattr(_auth_storage, "save_cookies_to_storage", _blocking_save)
 
     heartbeats = 0
     stop = asyncio.Event()
@@ -139,7 +140,7 @@ async def test_fetch_tokens_with_domains_save_does_not_block_event_loop(
     monkeypatch,
     httpx_mock: HTTPXMock,
 ) -> None:
-    """``fetch_tokens_with_domains`` (auth.py:3204) must offload its save too.
+    """``fetch_tokens_with_domains`` in ``notebooklm._auth.refresh`` must offload its save too.
 
     Same protocol as the from_storage test but exercises the second
     documented call site so a regression that fixes only one of the two
@@ -168,7 +169,10 @@ async def test_fetch_tokens_with_domains_save_does_not_block_event_loop(
         # return is fine; mirror the real function's None-by-default.
         time.sleep(_SLEEP_SECONDS)
 
-    patch_auth_seam(monkeypatch, "save_cookies_to_storage", _blocking_save)
+    # ``fetch_tokens_with_domains`` resolves ``save_cookies_to_storage`` through the
+    # module-local alias in ``notebooklm._auth.refresh``, so patch the consumer-side
+    # name rather than the canonical home in ``_auth.storage``.
+    monkeypatch.setattr(_auth_refresh, "save_cookies_to_storage", _blocking_save)
 
     heartbeats = 0
     stop = asyncio.Event()

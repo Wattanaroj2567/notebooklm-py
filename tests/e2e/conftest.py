@@ -1,5 +1,6 @@
 """E2E test fixtures and configuration."""
 
+import hashlib
 import logging
 import os
 import sys
@@ -19,13 +20,15 @@ except ImportError:
 
 from notebooklm import NotebookLMClient
 from notebooklm.auth import AuthTokens, load_auth_from_storage
-from notebooklm.exceptions import ChatError
+from notebooklm.exceptions import ChatError, RateLimitError
 from notebooklm.paths import get_profile_dir
 
 # Substrings in ChatError / skip messages that mark a server-side rate-limit
 # or quota rejection rather than a client bug. Covers both the explicit
 # UserDisplayableError message and the HTTP-status-wrapped 429 path in
-# _chat.py:156, plus the generation skip phrase in assert_generation_started.
+# ``notebooklm._chat.transport.chat_aware_authed_post``, the generation skip
+# phrase in assert_generation_started, and the "Rate limit:" prefix
+# _install_generation_rate_limit_skip adds to typed RateLimitError skips.
 _RATE_LIMIT_PHRASES = (
     "rate limit",
     "rate limited",
@@ -52,6 +55,62 @@ def _install_chat_rate_limit_skip(client: NotebookLMClient) -> None:
             raise
 
     client.chat.ask = _ask_with_skip
+
+
+def _install_generation_rate_limit_skip(client: NotebookLMClient) -> None:
+    """Wrap ``client.artifacts.generate_*``/``revise_*`` so ``RateLimitError`` becomes a skip.
+
+    The RPC layer raises a typed ``RateLimitError`` when Google rejects
+    CREATE_ARTIFACT with a quota error (e.g. upstream status 8, Resource
+    exhausted) — before any ``GenerationStatus`` exists, so the
+    ``is_rate_limited`` skip in ``assert_generation_started`` never runs.
+    That is server-side throttling, not a client defect. Only the precise
+    typed ``RateLimitError`` skips; every other exception still raises so
+    real defects stay visible.
+    """
+
+    def _wrap(original):
+        async def _with_skip(*args, **kwargs):
+            try:
+                return await original(*args, **kwargs)
+            except RateLimitError as e:
+                # The "Rate limit:" prefix guarantees a _RATE_LIMIT_PHRASES
+                # match regardless of the exception message wording, so the
+                # skip always lands in pytest_terminal_summary's section.
+                pytest.skip(f"Rate limit: {e}")
+
+        return _with_skip
+
+    for name in dir(client.artifacts):
+        if not (name.startswith("generate_") or name.startswith("revise_")):
+            continue
+        original = getattr(client.artifacts, name)
+        if not callable(original):
+            continue
+        setattr(client.artifacts, name, _wrap(original))
+
+
+def _emit_auth_route_diagnostic(auth_tokens: AuthTokens) -> None:
+    """Emit non-secret auth-routing context for CI debugging."""
+    source = (
+        "NOTEBOOKLM_AUTH_JSON"
+        if auth_tokens.storage_path is None and os.environ.get("NOTEBOOKLM_AUTH_JSON")
+        else "storage_state"
+    )
+    email_hash = "none"
+    if auth_tokens.account_email:
+        email_hash = hashlib.sha256(auth_tokens.account_email.lower().encode()).hexdigest()[:12]
+    message = (
+        "E2E auth route: "
+        f"source={source} "
+        f"storage_path={'none' if auth_tokens.storage_path is None else 'file'} "
+        f"authuser={auth_tokens.authuser} "
+        f"account_email_hash={email_hash}"
+    )
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::notice::{message}")
+    else:
+        logging.info(message)
 
 
 # =============================================================================
@@ -128,6 +187,16 @@ GENERATION_TEST_DELAY = 15.0
 
 # Delay between chat tests (seconds) to avoid API rate limits from rapid ask() calls
 CHAT_TEST_DELAY = 5.0
+E2E_TEST_DIR = Path(__file__).resolve().parent
+
+
+def _is_path_under(path: Path, directory: Path) -> bool:
+    """Return True when path resolves under directory."""
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def assert_generation_started(result, artifact_type: str = "Artifact") -> None:
@@ -212,6 +281,12 @@ def pytest_unconfigure(config):
         os.environ["NOTEBOOKLM_PROFILE"] = prev
     else:
         os.environ.pop("NOTEBOOKLM_PROFILE", None)
+
+
+def pytest_itemcollected(item):
+    """Mark every item under tests/e2e as E2E before marker deselection."""
+    if _is_path_under(Path(item.path), E2E_TEST_DIR):
+        item.add_marker(pytest.mark.e2e)
 
 
 def _skip_reason(report) -> str:
@@ -307,13 +382,16 @@ def auth_tokens() -> AuthTokens:
     """Load domain-preserving auth tokens from storage (session-scoped)."""
     import asyncio
 
-    return asyncio.run(AuthTokens.from_storage())
+    tokens = asyncio.run(AuthTokens.from_storage())
+    _emit_auth_route_diagnostic(tokens)
+    return tokens
 
 
 @pytest.fixture
 async def client(auth_tokens) -> AsyncGenerator[NotebookLMClient, None]:
     async with NotebookLMClient(auth_tokens, storage_path=auth_tokens.storage_path) as c:
         _install_chat_rate_limit_skip(c)
+        _install_generation_rate_limit_skip(c)
         yield c
 
 
@@ -328,7 +406,7 @@ def read_only_notebook_id():
     list, get, or query but do NOT modify the notebook. Do not use this
     fixture for tests that create, update, or delete resources.
 
-    See docs/contributing/testing.md for setup instructions.
+    See docs/development.md for setup instructions.
     """
     notebook_id = os.environ.get("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID")
     if not notebook_id:
@@ -341,7 +419,7 @@ def read_only_notebook_id():
             "  3. Generate some artifacts (audio, quiz, etc.)\n"
             "  4. Copy notebook ID from URL and run:\n"
             "     export NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID='your-notebook-id'\n\n"
-            "See docs/contributing/testing.md for details.\n",
+            "See docs/development.md for details.\n",
             returncode=1,
         )
     return notebook_id

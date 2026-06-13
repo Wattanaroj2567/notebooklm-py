@@ -6,137 +6,38 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
-from typing import IO, TYPE_CHECKING, Any, Literal, Protocol
+from typing import IO, Any, Literal
 from urllib.parse import urlparse
 
 import httpx
 
-from . import _source_upload
-from ._capabilities import (
-    AuthRouteProvider,
-    CookieJarProvider,
-    CoreRPCProvider,
-    TransportOperationProvider,
-    UploadConcurrencyProvider,
-)
-from ._source_add import SourceAddService
-from ._source_content import SourceContentRenderer
-from ._source_listing import SourceLister
-from ._source_polling import SourcePoller
-from ._source_upload import SourceUploadPipeline
+from ._lookup import unwrap_or_raise
+from ._row_adapters.sources import interpret_source_freshness
+from ._runtime.config import DEFAULT_MAX_CONCURRENT_UPLOADS
+from ._runtime.contracts import RpcCaller
+from ._settings import build_get_user_settings_params, extract_account_limits
+from ._source import upload as _source_upload
+from ._source.add import SourceAddService
+from ._source.content import SourceContentRenderer
+from ._source.listing import SourceLister
+from ._source.polling import SourcePoller
+from ._source.upload import SourceUploadPipeline
+from ._source.upload_payloads import build_rename_source_params
+from ._types.research import SourceGuide
 from ._url_utils import is_youtube_url
+from .exceptions import SourceNotFoundError
 from .rpc import RPCMethod
 from .types import (
     Source,
     SourceFulltext,
 )
 
-if TYPE_CHECKING:
-    from ._core import ClientCore
-
 logger = logging.getLogger(__name__)
-
-
-class _SourcesCore(
-    CoreRPCProvider,
-    AuthRouteProvider,
-    UploadConcurrencyProvider,
-    TransportOperationProvider,
-    CookieJarProvider,
-    Protocol,
-):
-    """Narrow per-sub-client view of the core required by :class:`SourcesAPI`.
-
-    Co-located with the sub-client that consumes it (per ADR-002). Inherits
-    the capabilities SourcesAPI uses through its upload pipeline:
-    ``rpc_call`` (from :class:`CoreRPCProvider`), authuser routing
-    (from :class:`AuthRouteProvider`), the upload-concurrency semaphore
-    + queue-wait recorder (from :class:`UploadConcurrencyProvider`),
-    transport-operation bookkeeping for the streaming upload POST
-    (from :class:`TransportOperationProvider`), and the live cookie
-    jar consumed by the Scotty upload HTTP path (from
-    :class:`CookieJarProvider`).
-    """
-
-    pass
 
 
 _SOURCE_ID_UUID_PATTERN = _source_upload._SOURCE_ID_UUID_PATTERN
 _extract_register_file_source_id = _source_upload._extract_register_file_source_id
 _looks_like_id_string = _source_upload._looks_like_id_string
-
-
-async def fetch_source_ids(core: "ClientCore", notebook_id: str) -> list[str]:
-    """Extract all source IDs from a notebook.
-
-    Fetches notebook data and extracts source IDs for use with
-    chat and artifact generation when targeting specific sources.
-
-    Args:
-        core: The :class:`ClientCore` instance providing the RPC entry point.
-        notebook_id: The notebook ID.
-
-    Returns:
-        List of source IDs. Empty list if no sources or on error.
-
-    Note:
-        Source IDs are triple-nested in RPC: source[0][0] contains the ID.
-    """
-    params = [notebook_id, None, [2], None, 0]
-    notebook_data = await core.rpc_call(
-        RPCMethod.GET_NOTEBOOK,
-        params,
-        source_path=f"/notebook/{notebook_id}",
-    )
-
-    source_ids: list[str] = []
-    if not notebook_data or not isinstance(notebook_data, list):
-        return source_ids
-
-    # Schema-drift detection points: log WARNING at each isinstance/len
-    # guard that fails on a non-empty response (real drift surfaces here,
-    # not at the safety-net except below).
-    try:
-        if not isinstance(notebook_data[0], list):
-            # notebook_data is already known to be a non-empty list here
-            # (guarded by `if not notebook_data` above).
-            logger.warning(
-                "get_source_ids: notebook_data[0] shape unexpected for %s "
-                "(schema drift?). top-type=%s",
-                notebook_id,
-                type(notebook_data[0]).__name__,
-            )
-            return source_ids
-
-        notebook_info = notebook_data[0]
-        if not (len(notebook_info) > 1 and isinstance(notebook_info[1], list)):
-            logger.warning(
-                "get_source_ids: notebook_info[1] not list for %s (schema drift?). len=%d",
-                notebook_id,
-                len(notebook_info),
-            )
-            return source_ids
-
-        sources = notebook_info[1]
-        for source in sources:
-            if not (isinstance(source, list) and source):
-                continue
-            first = source[0]
-            if not (isinstance(first, list) and first):
-                continue
-            sid = first[0]
-            if isinstance(sid, str):
-                source_ids.append(sid)
-    except (IndexError, TypeError) as e:
-        # Defense-in-depth: guards above should make this unreachable.
-        logger.warning(
-            "get_source_ids: unexpected exception despite guards for %s: %s",
-            notebook_id,
-            e,
-            exc_info=True,
-        )
-
-    return source_ids
 
 
 class SourcesAPI:
@@ -146,7 +47,7 @@ class SourcesAPI:
     and refreshing sources in notebooks.
 
     Usage:
-        async with await NotebookLMClient.from_storage() as client:
+        async with NotebookLMClient.from_storage() as client:
             sources = await client.sources.list(notebook_id)
             new_src = await client.sources.add_url(notebook_id, "https://example.com")
             await client.sources.rename(notebook_id, new_src.id, "Better Title")
@@ -154,13 +55,26 @@ class SourcesAPI:
 
     def __init__(
         self,
-        core: _SourcesCore,
+        rpc: RpcCaller,
+        *,
+        uploader: SourceUploadPipeline,
         upload_timeout: httpx.Timeout | None = None,
+        max_concurrent_uploads: int | None = DEFAULT_MAX_CONCURRENT_UPLOADS,
     ):
         """Initialize the sources API.
 
         Args:
-            core: The core client infrastructure.
+            rpc: The narrow :class:`RpcCaller` capability — sources
+                only needs ``rpc_call(...)`` for its own RPC paths
+                (delete, rename, refresh, freshness, drive add, text add).
+                Upload-flow capabilities (``kernel``, ``auth``,
+                ``operation_scope``) are owned by ``uploader``.
+            uploader: Stateful file-upload pipeline. REQUIRED — wired explicitly
+                by :class:`NotebookLMClient` (the only composition root that
+                knows the concrete ``Kernel`` + ``AuthMetadata`` +
+                ``record_upload_queue_wait`` callback). Direct callers must
+                supply a :class:`SourceUploadPipeline` instance themselves;
+                there is no implicit fallback.
             upload_timeout: Optional override for the ``httpx.Timeout`` used
                 by the resumable-upload start handshake and the finalize
                 POST. ``None`` (default) preserves the original hardcoded
@@ -171,15 +85,31 @@ class SourcesAPI:
                 defaults, NOT the original 10.0s. Specify all components
                 explicitly (e.g. ``httpx.Timeout(10.0, read=600.0)``) to
                 avoid surprises.
+            max_concurrent_uploads: Ceiling for concurrent
+                :meth:`add_file` uploads. The semaphore is owned by this
+                Sources upload pipeline, not by the shared core/session.
         """
-        self._core = core
-        self._capabilities = core
+        # ``upload_timeout`` / ``max_concurrent_uploads`` are accepted for API
+        # stability but honored by the injected ``uploader=`` pipeline (built by
+        # the :class:`NotebookLMClient` composition root); stored here only as
+        # historical attributes for callers that introspect the instance.
+        self._rpc = rpc
         self._adder = SourceAddService()
-        self._content = SourceContentRenderer(self._rpc_call, logger=logger)
-        self._lister = SourceLister(self._rpc_call)
+        self._content = SourceContentRenderer(self._rpc, logger=logger)
+        self._lister = SourceLister(self._rpc)
         self._poller = SourcePoller()
-        self._uploader = SourceUploadPipeline()
         self._upload_timeout = upload_timeout
+        self._max_concurrent_uploads = max_concurrent_uploads
+        self._uploader = uploader
+        self._uploader.configure_source_limit_lookup(self._get_source_limit)
+        # Single owner for the source-lifecycle verbs: the upload pipeline reuses
+        # the SAME ``SourceLister`` / ``SourcePoller`` instances this API uses for
+        # its ``list_sources`` / ``get_source`` / ``wait_*`` verbs rather than
+        # re-constructing parallel copies (issue #1205).
+        self._uploader.configure_source_lifecycle(
+            lister=self._lister,
+            poller=self._poller,
+        )
 
     async def _rpc_call(
         self,
@@ -193,7 +123,7 @@ class SourcesAPI:
         operation_variant: str | None = None,
     ) -> Any:
         """Delegate through the current core RPC method for late-bound test overrides."""
-        return await self._core.rpc_call(
+        return await self._rpc.rpc_call(
             method,
             params,
             source_path=source_path,
@@ -203,25 +133,20 @@ class SourcesAPI:
             operation_variant=operation_variant,
         )
 
-    def _resolve_upload_timeout(self, default: httpx.Timeout) -> httpx.Timeout:
-        """Return the configured upload timeout, or ``default`` if unset."""
-        return self._upload_timeout if self._upload_timeout is not None else default
-
     async def list(self, notebook_id: str, *, strict: bool = False) -> list[Source]:
         """List all sources in a notebook.
 
         Args:
             notebook_id: The notebook ID.
-            strict: Raise RPCError on malformed source-list responses instead
-                of returning an empty list. Intended for internal flows where
-                a malformed snapshot must not be treated as an empty notebook.
+            strict: Retained for call-site clarity; malformed source-list
+                responses always raise ``RPCError``. Empty notebooks return ``[]``.
 
         Returns:
             List of Source objects.
         """
         return await self._lister.list(notebook_id, strict=strict)
 
-    async def get(self, notebook_id: str, source_id: str) -> Source | None:
+    async def get(self, notebook_id: str, source_id: str) -> Source:
         """Get details of a specific source.
 
         Args:
@@ -229,13 +154,44 @@ class SourcesAPI:
             source_id: The source ID.
 
         Returns:
-            Source object with current status, or None if not found.
+            The :class:`~notebooklm.types.Source` with its current status.
+
+        Raises:
+            SourceNotFoundError: If no source with ``source_id`` exists (matches
+                ``notebooks.get``; issue #1247). Use :meth:`get_or_none` for the
+                sanctioned ``None``-on-miss lookup.
+        """
+        # ``unwrap_or_raise`` single-sources the raise-on-miss decision (#1247);
+        # internal callers needing the silent lookup use ``get_or_none``.
+        return unwrap_or_raise(
+            await self.get_or_none(notebook_id, source_id),
+            SourceNotFoundError(source_id),
+        )
+
+    async def get_or_none(self, notebook_id: str, source_id: str) -> Source | None:
+        """Get a source by ID, returning ``None`` when it does not exist.
+
+        The sanctioned ``None``-on-miss lookup (ADR-0019): unlike :meth:`get`
+        — which now raises :class:`~notebooklm.exceptions.SourceNotFoundError`
+        on a miss (#1247) — this returns ``None`` for a genuine absence and
+        emits no deprecation warning. Transport, auth, and decode
+        faults are **not** swallowed; only a real "not found" yields ``None``.
+
+        Args:
+            notebook_id: The notebook ID.
+            source_id: The source ID.
+
+        Returns:
+            The :class:`~notebooklm.types.Source`, or ``None`` if not found.
         """
         return await self._lister.get(
             notebook_id,
             source_id,
             list_sources=self.list,
         )
+
+    # Internal silent lookup for pollers/service code avoiding public ``get()`` misses.
+    _get_or_none = get_or_none
 
     async def wait_until_ready(
         self,
@@ -245,11 +201,14 @@ class SourcesAPI:
         initial_interval: float = 1.0,
         max_interval: float = 10.0,
         backoff_factor: float = 1.5,
+        transient_error_types: tuple[int | None, ...] | None = None,
     ) -> Source:
         """Wait for a source to become ready.
 
-        Polls the source status until it becomes READY or ERROR, or timeout.
-        Uses exponential backoff to reduce API load.
+        Polls until READY, terminal ERROR, or timeout. Configured transient
+        source types (audio/media and unclassified by default) keep polling
+        through status=ERROR because NotebookLM can report it briefly during
+        transcription/classification.
 
         Args:
             notebook_id: The notebook ID.
@@ -258,6 +217,8 @@ class SourcesAPI:
             initial_interval: Initial polling interval in seconds (default: 1).
             max_interval: Maximum polling interval in seconds (default: 10).
             backoff_factor: Multiplier for polling interval (default: 1.5).
+            transient_error_types: Source type codes whose status=ERROR is
+                transient; ``None`` uses the default media/unclassified policy.
 
         Returns:
             The ready Source object.
@@ -282,7 +243,8 @@ class SourcesAPI:
             initial_interval=initial_interval,
             max_interval=max_interval,
             backoff_factor=backoff_factor,
-            get_source=self.get,
+            transient_error_types=transient_error_types,
+            get_source=self.get_or_none,
             sleep=asyncio.sleep,
             monotonic=monotonic,
             logger=logger,
@@ -296,6 +258,7 @@ class SourcesAPI:
         initial_interval: float = 0.5,
         max_interval: float = 5.0,
         backoff_factor: float = 1.5,
+        transient_error_types: tuple[int | None, ...] | None = None,
     ) -> Source:
         """Wait for a source to be registered server-side (status >= PROCESSING).
 
@@ -333,7 +296,8 @@ class SourcesAPI:
             initial_interval=initial_interval,
             max_interval=max_interval,
             backoff_factor=backoff_factor,
-            get_source=self.get,
+            transient_error_types=transient_error_types,
+            get_source=self.get_or_none,
             sleep=asyncio.sleep,
             monotonic=monotonic,
             logger=logger,
@@ -402,13 +366,9 @@ class SourcesAPI:
             The created Source object. If wait=False, status may be PROCESSING.
 
         Example:
-            # Add and wait for processing
             source = await client.sources.add_url(nb_id, url, wait=True)
-
-            # Or add without waiting (for batch operations)
-            source = await client.sources.add_url(nb_id, url)
-            # ... add more sources ...
-            await client.sources.wait_for_sources(nb_id, [s.id for s in sources])
+            # ``wait=False`` returns immediately; poll later via
+            # ``wait_for_sources(nb_id, [s.id for s in sources])``.
         """
         return await self._adder.add_url(
             notebook_id,
@@ -472,7 +432,7 @@ class SourcesAPI:
             wait=wait,
             wait_timeout=wait_timeout,
             idempotent=idempotent,
-            rpc_call=self._rpc_call,
+            rpc=self._rpc,
             wait_until_ready=self.wait_until_ready,
             logger=logger,
         )
@@ -488,76 +448,40 @@ class SourcesAPI:
         title: str | None = None,
         on_progress: Callable[[int, int], object] | None = None,
     ) -> Source:
-        """Add a file source to a notebook using resumable upload.
+        """Add a file source to a notebook using Google's resumable upload.
 
-        Uses Google's resumable upload protocol:
-        1. Register source intent with RPC → get SOURCE_ID
-        2. Start upload session with SOURCE_ID (get upload URL)
-        3. Stream upload file content (memory-efficient for large files)
-        4. Optionally rename the source if a custom ``title`` was supplied
-           (the file-add RPC has no title slot, so a follow-up
-           ``UPDATE_SOURCE`` is the only way to set one).
-
-        Concurrency / FD lifecycle:
-            The upload section runs under
-            ``ClientCore.get_upload_semaphore()`` which bounds simultaneous
-            in-flight uploads at ``max_concurrent_uploads`` (default 4).
-            Each in-flight upload holds **one open file descriptor** for
-            the duration of the upload, so the cap doubles as an
-            FD-exhaustion guard. The file is opened ONCE during validation
-            and the resulting FD is held across the size-check, RPC
-            registration, upload-session start, and streamed body POST —
-            closing the TOCTOU window where the path could have been
-            replaced between two separate ``open()`` calls. A
-            ``try``/``with`` guarantees the FD is released on every exit
-            path, including ``CancelledError``.
+        Registers the source, opens an upload session, streams the file body
+        (memory-efficient for large files), and — if a custom ``title`` is given —
+        issues a follow-up ``UPDATE_SOURCE`` rename (the file-add RPC has no title
+        slot). Uploads run under the Sources-owned semaphore
+        (``max_concurrent_uploads``, default 4), which also caps open file
+        descriptors; the path is resolved before admission and opened exactly once
+        (a single open pins the bytes, so a later path swap cannot alter the upload).
 
         Args:
             notebook_id: The notebook ID.
             file_path: Path to the file to upload.
-            mime_type: Deprecated; unused. Retained as a positional argument for
-                backward compatibility. The MIME type is inferred server-side
-                from the filename extension. Passing a non-None value emits a
-                ``DeprecationWarning``. Slated for removal in a future minor
-                release (see ``# DEPRECATION-REMOVAL: v0.X.0`` below).
-            title: Optional display title. When provided and different from the
-                source filename, a rename is issued after upload so the source
-                appears with this title in the UI and API responses. Leading and
-                trailing whitespace is stripped; empty titles are rejected. If
-                the post-upload rename fails, the upload is preserved, a warning
-                is logged, and the returned source keeps the filename title.
-
-                Important: supplying a non-default title forces a brief
-                registration wait (~seconds) for the source to become visible
-                server-side *before* the rename is issued, even when
-                ``wait=False``. The UPDATE_SOURCE RPC silently no-ops against
-                an unregistered source, so blocking here is the only way to
-                honor the caller's intent. This narrow wait completes once
-                the source's status is non-ERROR (or transient-ERROR for
-                audio); it does NOT wait for full processing. See #388.
-            wait: If True, wait for source to be fully ready before returning.
-                Note that supplying ``title`` also forces a narrow pre-rename
-                registration wait regardless of this flag — see the ``title``
-                parameter above.
-            wait_timeout: Maximum seconds to wait if ``wait=True``. Also bounds
-                the narrow registration wait triggered by a custom ``title``;
-                that wait returns on the first PROCESSING/READY poll so it
-                completes in seconds for typical sources regardless of this
-                value. Default: 120.
-            on_progress: Optional sync or async callback invoked as
-                ``on_progress(bytes_sent, total_bytes)`` during the streaming
-                upload body. Callback exceptions propagate and abort the
-                upload, matching normal application callback semantics.
+            mime_type: Content type for the upload handshake; inferred from the
+                filename extension when omitted.
+            title: Optional display title. When set and different from the
+                filename, a rename is issued after upload (whitespace stripped;
+                empty rejected). A non-default title forces a brief registration
+                wait before the rename even when ``wait=False`` — UPDATE_SOURCE
+                no-ops against an unregistered source (#388); a failed rename is
+                logged and the filename title is kept.
+            wait: If True, wait for the source to be fully ready before returning.
+            wait_timeout: Max seconds to wait if ``wait=True`` (also bounds the
+                narrow registration wait above). Default: 120.
+            on_progress: Optional sync/async ``on_progress(bytes_sent, total)``
+                callback during the upload body; its exceptions abort the upload.
 
         Returns:
             The created Source object. If wait=False, status may be PROCESSING.
 
-        Supported file types:
-            - PDF: application/pdf
-            - Text: text/plain
-            - Markdown: text/markdown
-            - EPUB: application/epub+zip
-            - Word: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        Raises:
+            ValidationError: If the path is not a regular file, the title is
+                empty, or the file is an HTML-family type the upload endpoint
+                rejects (convert to text/Markdown/PDF first).
         """
         return await self._uploader.add_file(
             notebook_id,
@@ -567,15 +491,6 @@ class SourcesAPI:
             wait_timeout=wait_timeout,
             title=title,
             on_progress=on_progress,
-            deprecation_warning_stacklevel=3,
-            capabilities=self._capabilities,
-            register_file_source=self._register_file_source,
-            start_resumable_upload=self._start_resumable_upload,
-            upload_file_streaming=self._upload_file_streaming,
-            wait_until_ready=self.wait_until_ready,
-            wait_until_registered=self.wait_until_registered,
-            rename=self.rename,
-            logger=logger,
         )
 
     async def add_drive(
@@ -623,54 +538,94 @@ class SourcesAPI:
             mime_type=mime_type,
             wait=wait,
             wait_timeout=wait_timeout,
-            rpc_call=self._rpc_call,
+            rpc=self._rpc,
             list_sources=self.list,
             wait_until_ready=self.wait_until_ready,
             logger=logger,
         )
 
-    async def delete(self, notebook_id: str, source_id: str) -> bool:
+    async def delete(self, notebook_id: str, source_id: str) -> None:
         """Delete a source from a notebook.
+
+        Idempotent: deleting an already-absent source succeeds (returns
+        ``None``) and never raises ``SourceNotFoundError``. Real failures
+        (``403``/``5xx``/auth/transport) still propagate.
 
         Args:
             notebook_id: The notebook ID.
             source_id: The source ID to delete.
 
-        Returns:
-            True if deletion succeeded.
+        .. versionchanged:: 0.7.0
+            **Breaking change:** previously returned a hardcoded ``True``;
+            now returns ``None`` (issue #1211). ``if await source.delete(...):``
+            no longer enters its block.
         """
         logger.debug("Deleting source %s from notebook %s", source_id, notebook_id)
         params = [[[source_id]]]
-        await self._core.rpc_call(
+        await self._rpc.rpc_call(
             RPCMethod.DELETE_SOURCE,
             params,
             source_path=f"/notebook/{notebook_id}",
             allow_null=True,
         )
-        return True
 
-    async def rename(self, notebook_id: str, source_id: str, new_title: str) -> Source:
+    async def rename(
+        self,
+        notebook_id: str,
+        source_id: str,
+        new_title: str,
+        *,
+        return_object: bool = True,
+    ) -> Source | None:
         """Rename a source.
 
         Args:
             notebook_id: The notebook ID.
             source_id: The source ID to rename.
             new_title: The new title.
+            return_object: When ``True`` (default), return the renamed
+                :class:`~notebooklm.types.Source` (preferring the
+                ``UPDATE_SOURCE`` echo, fetching only on a null echo). When
+                ``False``, return ``None`` without hydrating. Miss-detection
+                runs in both modes (``False`` returns ``None`` but raises a miss).
 
         Returns:
-            Updated Source object.
+            The renamed :class:`~notebooklm.types.Source`, or ``None`` when
+            ``return_object=False``.
+
+        Raises:
+            SourceNotFoundError: if the source does not exist (a content/list
+                fetch, not a 404, detects it), in both ``return_object`` modes.
+
+        .. versionchanged:: 0.7.0
+            **Breaking change:** no longer fabricates an unverified
+            ``Source(id, title)`` on a null echo; it hydrates and raises
+            :class:`SourceNotFoundError` (#1255), plus ``return_object``.
+
+        .. versionchanged:: 0.8.0
+            **Breaking change:** ``return_object=False`` now runs the existence
+            preflight on a null echo too, raising on a miss (#1362).
         """
         logger.debug("Renaming source %s to: %s", source_id, new_title)
-        params = [None, [source_id], [[[new_title]]]]
-        result = await self._core.rpc_call(
+        params = build_rename_source_params(source_id, new_title)
+        result = await self._rpc.rpc_call(
             RPCMethod.UPDATE_SOURCE,
             params,
             source_path=f"/notebook/{notebook_id}",
             allow_null=True,
         )
-        return Source.from_api_response(result) if result else Source(id=source_id, title=new_title)
+        if result and return_object:
+            return Source.from_api_response(result, method_id=RPCMethod.UPDATE_SOURCE.value)
+        # Null echo: hydrate via the internal lookup (never public ``get()`` —
+        # #1247) so a miss raises; v0.8.0 (#1362) runs it to detect a miss.
+        if not return_object and result:
+            return None
+        source = await self._get_or_none(notebook_id, source_id)
+        if source is None:
+            raise SourceNotFoundError(source_id, method_id=RPCMethod.UPDATE_SOURCE.value)
+        return None if not return_object else source
 
-    async def refresh(self, notebook_id: str, source_id: str) -> bool:
+    async def refresh(self, notebook_id: str, source_id: str) -> None:
         """Refresh a source to get updated content (for URL/Drive sources).
 
         Args:
@@ -678,16 +633,20 @@ class SourcesAPI:
             source_id: The source ID to refresh.
 
         Returns:
-            True if refresh was initiated.
+            ``None`` on success; any failure raises first.
+
+        .. versionchanged:: 0.8.0
+            **Breaking change:** returns ``None`` (not always-``True``); the
+            ``-> bool`` annotation is dropped (#1290).
         """
         params = [None, [source_id], [2]]
-        await self._core.rpc_call(
+        await self._rpc.rpc_call(
             RPCMethod.REFRESH_SOURCE,
             params,
             source_path=f"/notebook/{notebook_id}",
             allow_null=True,
         )
-        return True
+        return None
 
     async def check_freshness(self, notebook_id: str, source_id: str) -> bool:
         """Check if a source needs to be refreshed.
@@ -698,34 +657,22 @@ class SourcesAPI:
 
         Returns:
             True if source is fresh, False if it needs refresh.
+
+        Raises:
+            DecodingError: If the freshness payload has a structurally
+                unrecognized shape (schema drift) — so callers can tell a miss
+                from drift instead of a silent "stale" (#1344).
         """
         params = [None, [source_id], [2]]
-        result = await self._core.rpc_call(
+        result = await self._rpc.rpc_call(
             RPCMethod.CHECK_SOURCE_FRESHNESS,
             params,
             source_path=f"/notebook/{notebook_id}",
             allow_null=True,
         )
-        # API returns different structures depending on source type:
-        #   - [] (empty array): source is fresh (URL sources)
-        #   - [[null, true, [source_id]]]: source is fresh (Drive sources)
-        #   - True: source is fresh
-        #   - False: source is stale
-        if result is True:
-            return True
-        if result is False:
-            return False
-        if isinstance(result, list):
-            # Empty array means fresh
-            if len(result) == 0:
-                return True
-            # Check for nested structure [[null, true, ...]] from Drive sources
-            first = result[0]
-            if isinstance(first, list) and len(first) > 1 and first[1] is True:
-                return True
-        return False
+        return interpret_source_freshness(result)
 
-    async def get_guide(self, notebook_id: str, source_id: str) -> dict[str, Any]:
+    async def get_guide(self, notebook_id: str, source_id: str) -> SourceGuide:
         """Get AI-generated summary and keywords for a specific source.
 
         This is the "Source Guide" feature shown when clicking on a source
@@ -736,9 +683,11 @@ class SourcesAPI:
             source_id: The source ID to get guide for.
 
         Returns:
-            Dictionary containing:
-                - summary: AI-generated summary with **bold** keywords (markdown)
-                - keywords: List of topic keyword strings
+            A :class:`~notebooklm._types.research.SourceGuide` with:
+                - ``summary``: AI-generated summary with **bold** keywords (markdown)
+                - ``keywords``: tuple of topic keyword strings
+
+            Use attribute access (``guide.summary``, ``guide.keywords``).
         """
         return await self._content.get_guide(notebook_id, source_id)
 
@@ -761,14 +710,15 @@ class SourcesAPI:
                 'notebooklm-py[markdown]'``).
 
         Returns:
-            SourceFulltext object with content, title, source_type, url, and char_count.
+            SourceFulltext object with content, title, kind, url, and char_count.
 
         Raises:
             SourceNotFoundError: If the source is not found or returns no data.
 
         Note:
-            Source type codes: 1=google_docs, 2=google_other, 3=pdf, 4=pasted_text,
-            5=web_page, 8=generated_text, 9=youtube
+            Source type codes include: 1=google_docs, 2=google_slides, 3=pdf,
+            4=pasted_text, 5=web_page, 8=markdown, 9=youtube, 10=media,
+            11=docx, 13=image, 14=google_spreadsheet, 16=csv, 17=epub.
 
             The ``"markdown"`` format works by requesting the HTML rendition
             from the API (params ``[3],[3]`` instead of ``[2],[2]``) and
@@ -780,9 +730,7 @@ class SourcesAPI:
             output_format=output_format,
         )
 
-    # =========================================================================
-    # Private helper methods
-    # =========================================================================
+    # --- Private helper methods ---
 
     def _extract_all_text(self, data: builtins.list, max_depth: int = 100) -> builtins.list[str]:
         """Recursively extract all text strings from nested arrays.
@@ -857,15 +805,14 @@ class SourcesAPI:
         client sees a 5xx / network error. The probe-then-retry loop
         in ``add_url`` owns recovery via ``idempotent_create``.
         """
-        # allow_null=False mirrors _register_file_source — ADD_SOURCE on
-        # success returns the new source row. A null result with a status
-        # code at wrb.fr[5] is the #407 / #474 mode; allow_null=True would
-        # swallow that diagnostic. The decoder now raises RPCError with the
-        # status code so add_url can wrap it into SourceAddError with detail.
+        # allow_null=False (mirrors _register_file_source): ADD_SOURCE returns the
+        # new source row on success. A null result with a status code at wrb.fr[5]
+        # is the #407 / #474 mode; allow_null=True would swallow that diagnostic,
+        # so the decoder raises RPCError with the code for add_url to wrap.
         return await self._adder.add_youtube_source(
             notebook_id,
             url,
-            rpc_call=self._rpc_call,
+            rpc=self._rpc,
         )
 
     async def _add_url_source(self, notebook_id: str, url: str) -> Any:
@@ -877,7 +824,7 @@ class SourcesAPI:
         return await self._adder.add_url_source(
             notebook_id,
             url,
-            rpc_call=self._rpc_call,
+            rpc=self._rpc,
         )
 
     async def _register_file_source(self, notebook_id: str, filename: str) -> str:
@@ -885,10 +832,16 @@ class SourcesAPI:
         return await self._uploader.register_file_source(
             notebook_id,
             filename,
-            rpc_call=self._rpc_call,
-            list_sources=self.list,
-            logger=logger,
         )
+
+    async def _get_source_limit(self) -> int | None:
+        """Return the current account's per-notebook source limit when advertised."""
+        result = await self._rpc_call(
+            RPCMethod.GET_USER_SETTINGS,
+            build_get_user_settings_params(),
+            source_path="/",
+        )
+        return extract_account_limits(result).source_limit
 
     async def _start_resumable_upload(
         self,
@@ -896,6 +849,7 @@ class SourcesAPI:
         filename: str,
         file_size: int,
         source_id: str,
+        content_type: str,
     ) -> str:
         """Start a resumable upload session and get the upload URL."""
         return await self._uploader.start_resumable_upload(
@@ -903,9 +857,7 @@ class SourcesAPI:
             filename,
             file_size,
             source_id,
-            capabilities=self._capabilities,
-            resolve_upload_timeout=self._resolve_upload_timeout,
-            async_client_factory=httpx.AsyncClient,
+            content_type,
         )
 
     async def _upload_file_streaming(
@@ -980,10 +932,6 @@ class SourcesAPI:
             filename=filename,
             on_progress=on_progress,
             total_bytes=total_bytes,
-            capabilities=self._capabilities,
-            resolve_upload_timeout=self._resolve_upload_timeout,
-            async_client_factory=httpx.AsyncClient,
-            cancel_upload_session=self._cancel_upload_session,
             logger=logger,
         )
 
@@ -1005,7 +953,5 @@ class SourcesAPI:
             upload_url,
             base_url,
             auth_route,
-            capabilities=self._capabilities,
-            async_client_factory=httpx.AsyncClient,
             logger=logger,
         )

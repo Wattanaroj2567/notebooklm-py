@@ -4,11 +4,11 @@ This module records and replays the **full three-leg** auth-refresh flow that
 ``test_auto_refresh.py`` covers only at the httpx-mock layer:
 
 1. **Failing batchexecute** — the client makes a ``LIST_NOTEBOOKS`` POST with a
-   deliberately invalidated CSRF token; Google returns HTTP **400** (not 401 —
-   stale CSRF is documented at ``_core.py:245-252``).
-2. **Homepage GET** — ``_perform_authed_post`` classifies the 400 as an auth
-   error via :func:`is_auth_error` and awaits ``refresh_auth``, which fetches
-   the NotebookLM homepage to re-extract ``SNlM0e`` + ``FdrFJe``.
+   deliberately invalidated CSRF token; Google returns HTTP **400** (not 401).
+2. **Homepage GET** — ``AuthRefreshMiddleware`` classifies the 400 as an auth
+   error via :func:`notebooklm._runtime.helpers.is_auth_error` and awaits
+   ``refresh_auth``, which fetches the NotebookLM homepage to re-extract
+   ``SNlM0e`` + ``FdrFJe``.
 3. **Retried batchexecute** — the same RPC is replayed with the fresh CSRF and
    the server returns a normal 200 ``wrb.fr`` envelope.
 
@@ -34,19 +34,12 @@ we substitute synthetic ``AuthTokens`` for the same reason, mirroring the
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-# Add tests directory to path for vcr_config + conftest helpers.
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-
-from conftest import _vcr_record_mode, skip_no_cassettes  # noqa: E402
-from notebooklm import NotebookLMClient  # noqa: E402
-from notebooklm.auth import AuthTokens  # noqa: E402
-from vcr_config import notebooklm_vcr  # noqa: E402
+from notebooklm import NotebookLMClient
+from notebooklm.auth import AuthTokens
+from tests.integration.conftest import _vcr_record_mode, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 CASSETTE_NAME = "auth_rotate_cookies_refresh.yaml"
 
@@ -72,7 +65,14 @@ async def _build_client_for_test() -> NotebookLMClient:
     if _vcr_record_mode:
         # ``from_storage`` performs a live homepage GET. Keep this OUT of the
         # cassette context so the recording captures only the refresh path.
-        return await NotebookLMClient.from_storage()
+        # We use the legacy await form here because we need a built-but-
+        # unentered client (the test opens it manually later). Suppress
+        # the DeprecationWarning since the legacy form is intentional.
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", DeprecationWarning)
+            return await NotebookLMClient.from_storage()
 
     synthetic_auth = AuthTokens(
         cookies={
@@ -104,8 +104,8 @@ async def test_stale_csrf_triggers_refresh_and_retry(
     3. POST ``batchexecute?rpcids=wXbhsf`` with the refreshed CSRF →
        HTTP 200 with the normal ``LIST_NOTEBOOKS`` ``wrb.fr`` envelope.
 
-    The 400 → refresh → retry sequence is what the ``rpc_call`` layer
-    promises in the docstring at ``_core.py:864-894``. Asserting both
+    The 400 → refresh → retry sequence is what ``AuthRefreshMiddleware`` and
+    ``RuntimeTransport.refresh_request_for_current_auth`` promise. Asserting both
     that the call returned a value (the retry succeeded) AND that a
     refresh happened (token mutated mid-call) gives us a fail-loud
     guard against a regression where the retry path silently no-ops.
@@ -117,7 +117,7 @@ async def test_stale_csrf_triggers_refresh_and_retry(
 
     client = await _build_client_for_test()
     # Eliminate the post-refresh retry delay so the test runs fast.
-    client._core._refresh_retry_delay = 0
+    client._composed.chain_host._refresh_retry_delay = 0
 
     # Track whether refresh_auth ran. We wrap the bound method so the
     # mutation is observable from outside the test. Using ``list[object]``
@@ -129,20 +129,25 @@ async def test_stale_csrf_triggers_refresh_and_retry(
         refresh_calls.append(None)
         return await original_refresh()
 
-    # The refresh callback is captured by ClientCore at construction;
-    # patch it on the core so the wrapper is what the retry loop sees.
-    client._core._refresh_callback = tracking_refresh
+    # The refresh callback is reached through the auth coordinator; patch it on
+    # the coordinator so the wrapper is what the retry loop sees.
+    client._collaborators.auth_coord._refresh_callback = tracking_refresh
 
     with notebooklm_vcr.use_cassette(CASSETTE_NAME) as cassette:
         async with client:
             # Deliberately corrupt the in-memory CSRF so the first
-            # batchexecute is guaranteed to draw a 400 from Google (the
-            # documented stale-CSRF response per ``_core.py:245-252``).
+            # batchexecute is guaranteed to draw a 400 from Google, which
+            # ``is_auth_error`` treats as stale-CSRF/auth-refreshable.
             # The ``update_auth_headers`` call is what actually plumbs the
             # new value into the live ``httpx.AsyncClient``'s default
-            # header set.
-            client._core.auth.csrf_token = "INVALID_CSRF_FOR_TEST"
-            client._core.update_auth_headers()
+            # header set. Wave 3 of plan ``host-protocol-removal`` deleted
+            # the Session-level ``update_auth_headers`` forward; call the
+            # canonical coordinator method directly with explicit kwargs.
+            client._auth.csrf_token = "INVALID_CSRF_FOR_TEST"
+            client._collaborators.auth_coord.update_auth_headers(
+                auth=client._auth,
+                kernel=client._collaborators.kernel,
+            )
 
             # This call's first attempt MUST 400; the rpc_call layer
             # then awaits refresh_auth (interaction 2 in the cassette)
@@ -154,13 +159,13 @@ async def test_stale_csrf_triggers_refresh_and_retry(
             # the corrupted value. Asserting the change makes this
             # test fail loudly if a future refactor accidentally
             # short-circuits the retry to "return the 400 unchanged".
-            assert client._core.auth.csrf_token != "INVALID_CSRF_FOR_TEST", (
+            assert client._auth.csrf_token != "INVALID_CSRF_FOR_TEST", (
                 "csrf_token should have been refreshed mid-call"
             )
 
     # The retry contract is: at most ONE refresh per ``rpc_call``. The
-    # state machine guards this via ``refreshed_this_call`` in
-    # ``_perform_authed_post``. Asserting equality (not >=) catches a
+    # state machine guards this via ``refreshed_this_call`` in the auth-refresh
+    # middleware. Asserting equality (not >=) catches a
     # regression where the loop runs twice on the same call.
     assert len(refresh_calls) == 1, (
         f"refresh_auth should run exactly once for one stale-CSRF call; got {len(refresh_calls)}"

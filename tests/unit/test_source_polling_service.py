@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from notebooklm._source_polling import SourcePoller
+from notebooklm._source.polling import SourcePoller
 from notebooklm._sources import SourcesAPI
 from notebooklm.types import (
     Source,
@@ -82,6 +82,42 @@ async def test_wait_until_ready_checks_timeout_after_get(
 
     assert exc_info.value.last_status == SourceStatus.PROCESSING
     sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wait_until_ready_clamps_sleep_to_remaining_timeout(
+    poller: SourcePoller,
+    logger: logging.Logger,
+) -> None:
+    processing = Source(id="src_1", status=SourceStatus.PROCESSING)
+    get_source = AsyncMock(return_value=processing)
+    sleeps: list[float] = []
+    clock = 0.0
+
+    def monotonic() -> float:
+        return clock
+
+    async def sleep(seconds: float) -> None:
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds
+
+    with pytest.raises(SourceTimeoutError) as exc_info:
+        await poller.wait_until_ready(
+            "nb_1",
+            "src_1",
+            timeout=1.0,
+            initial_interval=10.0,
+            get_source=get_source,
+            sleep=sleep,
+            monotonic=monotonic,
+            logger=logger,
+        )
+
+    assert exc_info.value.last_status == SourceStatus.PROCESSING
+    assert get_source.await_count == 1
+    assert sleeps == [1.0]
+    assert clock == 1.0
 
 
 @pytest.mark.asyncio
@@ -248,6 +284,41 @@ async def test_wait_until_registered_raises_timeout(
 
 
 @pytest.mark.asyncio
+async def test_wait_until_registered_clamps_sleep_to_remaining_timeout(
+    poller: SourcePoller,
+    logger: logging.Logger,
+) -> None:
+    get_source = AsyncMock(return_value=None)
+    sleeps: list[float] = []
+    clock = 0.0
+
+    def monotonic() -> float:
+        return clock
+
+    async def sleep(seconds: float) -> None:
+        nonlocal clock
+        sleeps.append(seconds)
+        clock += seconds
+
+    with pytest.raises(SourceTimeoutError) as exc_info:
+        await poller.wait_until_registered(
+            "nb_1",
+            "src_1",
+            timeout=1.0,
+            initial_interval=10.0,
+            get_source=get_source,
+            sleep=sleep,
+            monotonic=monotonic,
+            logger=logger,
+        )
+
+    assert exc_info.value.last_status is None
+    assert get_source.await_count == 1
+    assert sleeps == [1.0]
+    assert clock == 1.0
+
+
+@pytest.mark.asyncio
 async def test_wait_for_sources_catches_base_exception_and_drains_siblings(
     poller: SourcePoller,
     logger: logging.Logger,
@@ -288,7 +359,7 @@ async def test_wait_for_sources_catches_base_exception_and_drains_siblings(
 
 @pytest.mark.asyncio
 async def test_sources_api_wait_until_ready_delegates_with_call_time_dependencies() -> None:
-    api = SourcesAPI(MagicMock())
+    api = SourcesAPI(MagicMock(), uploader=MagicMock())
     ready = Source(id="src_1", status=SourceStatus.READY)
 
     with patch.object(api._poller, "wait_until_ready", new_callable=AsyncMock) as delegate:
@@ -302,21 +373,38 @@ async def test_sources_api_wait_until_ready_delegates_with_call_time_dependencie
     assert kwargs["max_interval"] == 10.0
     assert kwargs["backoff_factor"] == 1.5
     assert kwargs["get_source"].__self__ is api
-    assert kwargs["get_source"].__func__ is SourcesAPI.get
+    # The poller is wired with get_or_none (not public get), so the readiness
+    # poll never trips the get()-returns-None deprecation.
+    assert kwargs["get_source"].__func__ is SourcesAPI.get_or_none
 
 
 @pytest.mark.asyncio
-async def test_sources_api_wait_until_ready_resolves_sources_sleep_and_monotonic() -> None:
-    api = SourcesAPI(MagicMock())
+async def test_sources_api_wait_until_ready_resolves_sources_sleep_and_monotonic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import notebooklm._sources as _sources
+
+    api = SourcesAPI(MagicMock(), uploader=MagicMock())
     processing = Source(id="src_1", status=SourceStatus.PROCESSING)
     ready = Source(id="src_1", status=SourceStatus.READY)
 
-    with (
-        patch.object(api, "get", new_callable=AsyncMock, side_effect=[processing, ready]),
-        patch("notebooklm._sources.asyncio.sleep", new_callable=AsyncMock) as sleep,
-        patch("notebooklm._sources.monotonic", MagicMock(return_value=0.0)) as monotonic,
-    ):
-        result = await api.wait_until_ready("nb_1", "src_1", initial_interval=0.75)
+    sleep = AsyncMock()
+    monotonic = MagicMock(return_value=0.0)
+    monkeypatch.setattr(api, "get_or_none", AsyncMock(side_effect=[processing, ready]))
+    # Object-form patches against the locally-imported `_sources` seam alias:
+    # the production code resolves `asyncio.sleep`/`monotonic` from this module
+    # namespace (see `_sources.SourcesAPI.wait_until_ready`), so substituting them here
+    # exercises that resolution without an import-string patch.
+    # `_sources.monotonic` is a module-local alias (`from time import monotonic`),
+    # so patching it is already isolated. For `asyncio.sleep` we swap the whole
+    # `_sources.asyncio` binding for a mock wrapping the real module with only
+    # `sleep` overridden, so we never mutate the shared stdlib `asyncio` object.
+    fake_asyncio = MagicMock(wraps=_sources.asyncio)
+    fake_asyncio.sleep = sleep
+    monkeypatch.setattr(_sources, "asyncio", fake_asyncio)
+    monkeypatch.setattr(_sources, "monotonic", monotonic)
+
+    result = await api.wait_until_ready("nb_1", "src_1", initial_interval=0.75)
 
     assert result is ready
     sleep.assert_awaited_once_with(0.75)
@@ -325,7 +413,7 @@ async def test_sources_api_wait_until_ready_resolves_sources_sleep_and_monotonic
 
 @pytest.mark.asyncio
 async def test_sources_api_wait_for_sources_uses_late_bound_wait_until_ready() -> None:
-    api = SourcesAPI(MagicMock())
+    api = SourcesAPI(MagicMock(), uploader=MagicMock())
     api.wait_until_ready = AsyncMock(
         side_effect=[
             Source(id="src_1", status=SourceStatus.READY),

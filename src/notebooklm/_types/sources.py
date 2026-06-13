@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import sys
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..rpc.types import SourceStatus
 from .common import (
     UnknownTypeWarning,
-    _datetime_from_timestamp,
-    _deprecated_property_warning_state,
 )
+
+if TYPE_CHECKING:
+    from .._row_adapters.sources import SourceRow
 
 
 class SourceType(str, Enum):
@@ -81,28 +81,6 @@ _SOURCE_TYPE_COMPAT_MAP: dict[SourceType, str] = {
 }
 
 
-def _source_warning_state() -> set[int]:
-    # Read through the public facade so monkeypatch.setattr(notebooklm.types, ...)
-    # rebinding is reflected in this private implementation.
-    public_types = sys.modules.get("notebooklm.types")
-    if public_types is not None:
-        public_state = getattr(public_types, "_warned_source_types", None)
-        if isinstance(public_state, set):
-            return public_state
-    return _warned_source_types
-
-
-def _source_compat_map() -> dict[SourceType, str]:
-    # Read through the public facade so monkeypatch.setattr(notebooklm.types, ...)
-    # rebinding is reflected in this private implementation.
-    public_types = sys.modules.get("notebooklm.types")
-    if public_types is not None:
-        public_map = getattr(public_types, "_SOURCE_TYPE_COMPAT_MAP", None)
-        if isinstance(public_map, dict):
-            return public_map
-    return _SOURCE_TYPE_COMPAT_MAP
-
-
 def _safe_source_type(type_code: int | None) -> SourceType:
     """Convert internal type code to user-facing SourceType enum."""
     if type_code is None:
@@ -110,9 +88,8 @@ def _safe_source_type(type_code: int | None) -> SourceType:
 
     result = _SOURCE_TYPE_CODE_MAP.get(type_code)
     if result is None:
-        warned_source_types = _source_warning_state()
-        if type_code not in warned_source_types:
-            warned_source_types.add(type_code)
+        if type_code not in _warned_source_types:
+            _warned_source_types.add(type_code)
             warnings.warn(
                 f"Unknown source type code {type_code}. "
                 "Consider updating notebooklm-py to the latest version.",
@@ -124,35 +101,33 @@ def _safe_source_type(type_code: int | None) -> SourceType:
 
 
 def _extract_source_url(metadata: Any, *, allow_bare_http: bool = True) -> str | None:
-    """Extract a source URL from a ``src[2]`` metadata array."""
-    if not isinstance(metadata, list):
-        return None
-    url: str | None = None
-    if len(metadata) > 7:
-        url_list = metadata[7]
-        if isinstance(url_list, list) and len(url_list) > 0:
-            url = url_list[0]
-    if not url and len(metadata) > 5:
-        yt_data = metadata[5]
-        if isinstance(yt_data, list) and len(yt_data) > 0 and isinstance(yt_data[0], str):
-            url = yt_data[0]
-    if not url and allow_bare_http and len(metadata) > 0:
-        candidate = metadata[0]
-        if isinstance(candidate, str) and candidate.startswith("http"):
-            url = candidate
-    return url
+    """Extract a source URL from a ``src[2]`` metadata array.
+
+    Thin compatibility shim over
+    :meth:`notebooklm._row_adapters.sources.SourceRow.url_from_metadata`,
+    which centralises the ``metadata[7]`` > ``metadata[5]`` > ``metadata[0]``
+    positional precedence in the sanctioned row-adapter layer. The adapter
+    method reproduces this helper's exact (soft, un-coerced) semantics, so this
+    re-exported public helper is behavior-preserved while its position
+    knowledge no longer lives here.
+    """
+    from .._row_adapters.sources import SourceRow
+
+    return SourceRow.url_from_metadata(metadata, allow_bare_http=allow_bare_http)
 
 
 def _extract_source_created_at(metadata: Any) -> datetime | None:
-    """Extract a source creation timestamp from a ``src[2]`` metadata array."""
-    if not isinstance(metadata, list) or len(metadata) <= 2:
-        return None
+    """Extract a source creation timestamp from a ``src[2]`` metadata array.
 
-    timestamp_list = metadata[2]
-    if not isinstance(timestamp_list, list) or not timestamp_list:
-        return None
+    Thin compatibility shim over
+    :meth:`notebooklm._row_adapters.sources.SourceRow.created_at_from_metadata`,
+    which owns the ``metadata[2][0]`` timestamp position. Behavior-identical to
+    the original inline walk (both funnel the inner value through
+    :func:`_datetime_from_timestamp`).
+    """
+    from .._row_adapters.sources import SourceRow
 
-    return _datetime_from_timestamp(timestamp_list[0], datetime_type=datetime)
+    return SourceRow.created_at_from_metadata(metadata)
 
 
 @dataclass
@@ -164,25 +139,18 @@ class Source:
     url: str | None = None
     _type_code: int | None = field(default=None, repr=False)
     created_at: datetime | None = None
-    status: int = SourceStatus.READY
+    # ``status`` holds a :class:`~notebooklm.rpc.SourceStatus` member (an
+    # ``int`` enum) decoded from the GET_NOTEBOOK source-list status block.
+    # The annotation was previously ``int`` even though every construction
+    # path (the listing service and :meth:`from_api_response`) populates it
+    # with a ``SourceStatus``; ``SourceStatus`` is the accurate declared type
+    # and remains ``int``-compatible at runtime and for equality.
+    status: SourceStatus = SourceStatus.READY
 
     @property
     def kind(self) -> SourceType:
         """Get source type as SourceType enum."""
         return _safe_source_type(self._type_code)
-
-    @property
-    def source_type(self) -> str:
-        """Deprecated: Use .kind instead."""
-        _warned = _deprecated_property_warning_state()
-        if "Source.source_type" not in _warned:
-            _warned.add("Source.source_type")
-            warnings.warn(
-                "Source.source_type is deprecated, use .kind instead. Will be removed in v0.5.0.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return _source_compat_map().get(self.kind, "text")
 
     @property
     def is_ready(self) -> bool:
@@ -200,67 +168,88 @@ class Source:
         return self.status == SourceStatus.ERROR
 
     @classmethod
-    def from_api_response(cls, data: list[Any], notebook_id: str | None = None) -> Source:
-        """Parse source data from various API response formats."""
-        if not data or not isinstance(data, list):
-            raise ValueError(f"Invalid source data: {data}")
+    def from_row(cls, row: SourceRow) -> Source:
+        """Build a :class:`Source` from a normalized :class:`SourceRow`.
 
-        # Try deeply nested format: [[[[id], title, metadata, ...]]]
-        if isinstance(data[0], list) and len(data[0]) > 0:
-            if isinstance(data[0][0], list) and len(data[0][0]) > 0:
-                # Check if deeply nested vs medium nested
-                if isinstance(data[0][0][0], list):
-                    # Deeply nested: [[[[id], title, ...]]]
-                    entry = data[0][0]
-                    source_id = entry[0][0] if isinstance(entry[0], list) else entry[0]
-                    title = entry[1] if len(entry) > 1 else None
-                    # Fall through to the shared metadata parser below.
-                else:
-                    # Medium nested: [[['id'], 'title', ...]]
-                    entry = data[0]
-                    source_id = entry[0][0] if isinstance(entry[0], list) else entry[0]
-                    title = entry[1] if len(entry) > 1 else None
+        This is the **single** construction site for a :class:`Source`
+        from a parsed source row. Both :meth:`from_api_response` (the
+        public classmethod used by ``ADD_SOURCE`` / rename paths) and
+        :meth:`notebooklm._source.listing.SourceLister._parse_source`
+        (the ``GET_NOTEBOOK`` list/get/poll path) funnel through here so
+        every code path produces identical :class:`Source` instances —
+        including the decoded :attr:`status`.
 
-                    metadata = entry[2] if len(entry) > 2 and isinstance(entry[2], list) else None
-                    url = _extract_source_url(metadata, allow_bare_http=False)
-                    type_code = (
-                        metadata[4]
-                        if metadata is not None
-                        and len(metadata) > 4
-                        and isinstance(metadata[4], int)
-                        else None
-                    )
-                    created_at = _extract_source_created_at(metadata)
+        Minimal flat rows historically yield ``_type_code=None`` and skip
+        metadata-derived fields. That invariant is now handled by SourceRow
+        when no metadata list is present at ``_raw[2]``, so
+        :attr:`SourceRow.metadata` returns ``None`` and
+        :attr:`~SourceRow.type_code` / :attr:`~SourceRow.url` /
+        :attr:`~SourceRow.created_at` all resolve to ``None`` while
+        :attr:`~SourceRow.status` resolves to ``SourceStatus.READY``. The
+        single field mapping below therefore covers all three wire shapes
+        identically.
+        """
+        return cls(
+            id=row.id,
+            title=row.title,
+            url=row.url,
+            _type_code=row.type_code,
+            created_at=row.created_at,
+            status=row.status,
+        )
 
-                    return cls(
-                        id=str(source_id),
-                        title=title,
-                        url=url,
-                        _type_code=type_code,
-                        created_at=created_at,
-                    )
+    @classmethod
+    def from_api_response(
+        cls,
+        data: list[Any],
+        notebook_id: str | None = None,
+        *,
+        method_id: str | None = None,
+    ) -> Source:
+        """Parse source data from various API response formats.
 
-                metadata = entry[2] if len(entry) > 2 and isinstance(entry[2], list) else None
-                url = _extract_source_url(metadata)
-                type_code = (
-                    metadata[4]
-                    if metadata is not None and len(metadata) > 4 and isinstance(metadata[4], int)
-                    else None
-                )
-                created_at = _extract_source_created_at(metadata)
+        Multi-shape dispatch (the three wire shapes — deeply nested,
+        medium nested, flat) is centralised in
+        :meth:`notebooklm._row_adapters.sources.SourceRow.from_unknown_shape`;
+        position knowledge for the entry layout lives on
+        :class:`SourceRow` itself. This method only normalizes the wire
+        shape into a :class:`SourceRow` and defers to :meth:`from_row` —
+        the single construction site shared with the
+        ``GET_NOTEBOOK`` list/get/poll path
+        (:meth:`notebooklm._source.listing.SourceLister._parse_source`) —
+        so all paths produce identical :class:`Source` instances,
+        including the decoded :attr:`status`. ``status`` earlier silently
+        fell back to the ``SourceStatus.READY`` default here while the
+        listing path read it from the row.
 
-                return cls(
-                    id=str(source_id),
-                    title=title,
-                    url=url,
-                    _type_code=type_code,
-                    created_at=created_at,
-                )
+        Args:
+            data: Raw decoded source payload (one of the three wire
+                shapes handled by
+                :meth:`~notebooklm._row_adapters.sources.SourceRow.from_unknown_shape`).
+            notebook_id: Accepted for call-site symmetry and forward
+                compatibility but currently unused — the parsed source
+                wire shape carries no notebook reference, so this value
+                does not influence the returned :class:`Source`. It is
+                retained (rather than dropped) because
+                ``Source.from_api_response`` is tracked public surface;
+                removing the parameter would be a backward-incompatible
+                signature change flagged by
+                ``scripts/audit_public_api_compat.py``.
+            method_id: Originating RPC method id (e.g.
+                ``RPCMethod.ADD_SOURCE.value`` /
+                ``RPCMethod.UPDATE_SOURCE.value``) used only to tag
+                ``safe_index`` drift diagnostics with the real method.
+                Defaults to ``None``, which lets
+                :meth:`~notebooklm._row_adapters.sources.SourceRow.from_unknown_shape`
+                fall back to its ``GET_NOTEBOOK`` default — preserving
+                the historical behavior for callers that do not pass it.
+        """
+        # Keep the row-adapter dependency local so importing the source
+        # dataclass package does not pull source-row parsing helpers into
+        # the top-level public type facade.
+        from .._row_adapters.sources import SourceRow
 
-        # Simple flat format: [id, title] or [id, title, ...]
-        source_id = data[0] if len(data) > 0 else ""
-        title = data[1] if len(data) > 1 else None
-        return cls(id=str(source_id), title=title, _type_code=None)
+        return cls.from_row(SourceRow.from_unknown_shape(data, method_id=method_id))
 
 
 @dataclass
@@ -278,20 +267,6 @@ class SourceFulltext:
     def kind(self) -> SourceType:
         """Get source type as SourceType enum."""
         return _safe_source_type(self._type_code)
-
-    @property
-    def source_type(self) -> str:
-        """Deprecated: Use .kind instead."""
-        _warned = _deprecated_property_warning_state()
-        if "SourceFulltext.source_type" not in _warned:
-            _warned.add("SourceFulltext.source_type")
-            warnings.warn(
-                "SourceFulltext.source_type is deprecated, use .kind instead. "
-                "Will be removed in v0.5.0.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return _source_compat_map().get(self.kind, "text")
 
     def find_citation_context(
         self,

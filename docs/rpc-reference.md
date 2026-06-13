@@ -1,14 +1,15 @@
 # RPC & UI Reference
 
 **Status:** Active
-**Last Updated:** 2026-05-14
-**Source of Truth:** `src/notebooklm/rpc/types.py`
+**Last Updated:** 2026-06-11
+**Source of Truth:** `src/notebooklm/rpc/types.py` for method IDs; payload builders in `src/notebooklm/` and golden tests under `tests/unit/`
 **Purpose:** Complete reference for RPC methods, UI selectors, and payload structures
 
-> **Note:** Payload structures extracted from actual implementation in `src/notebooklm/`.
-> Each payload includes a reference to its source file. The CREATE_ARTIFACT
-> payloads below were re-verified against the live builders in `_artifacts.py`
-> on 2026-05-14 (AUDIO, VIDEO_EXPLAINER, VIDEO_BRIEF, VIDEO_CINEMATIC,
+> **Note:** Payload structures are extracted from the implementation builders in
+> `src/notebooklm/` and pinned by golden unit tests. Each payload includes a
+> reference to its owning source file. The CREATE_ARTIFACT payloads below were
+> re-verified against the live builders in `_artifact/payloads.py` on
+> 2026-06-11 (AUDIO, VIDEO_EXPLAINER, VIDEO_BRIEF, VIDEO_CINEMATIC,
 > STUDY_GUIDE, BRIEFING_DOC, BLOG_POST, MIND_MAP, QUIZ, FLASHCARDS,
 > INFOGRAPHIC, SLIDE_DECK, DATA_TABLE).
 
@@ -23,20 +24,26 @@
 | `wXbhsf` | LIST_NOTEBOOKS | List all notebooks | `_notebooks.py` |
 | `CCqFvf` | CREATE_NOTEBOOK | Create new notebook | `_notebooks.py` |
 | `rLM1Ne` | GET_NOTEBOOK | Get notebook details + sources | `_notebooks.py` |
-| `s0tc2d` | RENAME_NOTEBOOK | Rename, chat config, share access | `_notebooks.py`, `_chat.py` |
+| `s0tc2d` | RENAME_NOTEBOOK | Rename, chat config, share access | `_notebooks.py`, `_chat/api.py` |
 | `WWINqb` | DELETE_NOTEBOOK | Delete a notebook | `_notebooks.py` |
-| `izAoDd` | ADD_SOURCE | Add URL/text/YouTube source | `_sources.py` |
-| `o4cbdc` | ADD_SOURCE_FILE | Register uploaded file (PDF, DOCX, EPUB, etc.) | `_sources.py` |
+| `izAoDd` | ADD_SOURCE | Add URL/text/YouTube/Drive source | `_source/add.py` via `_sources.py` |
+| `o4cbdc` | ADD_SOURCE_FILE | Register uploaded file (PDF, DOCX, EPUB, etc.) | `_source/upload.py`, `_source/upload_payloads.py` |
 | `tGMBJ` | DELETE_SOURCE | Delete a source | `_sources.py` |
 | `b7Wfje` | UPDATE_SOURCE | Rename source | `_sources.py` |
 | `tr032e` | GET_SOURCE_GUIDE | Get source summary | `_sources.py` |
+| `hizoJc` | GET_SOURCE | Get clean fulltext content of a source | `_source/content.py` |
+| `agX4Bc` | CREATE_LABEL | AI-generate label groupings and create manual labels | `_labels.py` |
+| `I3xc3c` | LIST_LABELS | List source labels for a notebook | `_labels.py` |
+| `le8sX` | UPDATE_LABEL | Rename label, set emoji, add/remove sources | `_labels.py`, `_label/params.py` |
+| `GyzE7e` | DELETE_LABEL | Delete one or more labels (batch) | `_labels.py` |
 | `R7cb6c` | CREATE_ARTIFACT | Unified artifact generation | `_artifacts.py` |
 | `gArtLc` | LIST_ARTIFACTS | List artifacts in a notebook | `_artifacts.py` |
 | `V5N4be` | DELETE_ARTIFACT | Delete artifact | `_artifacts.py` |
 | `KmcKPe` | REVISE_SLIDE | Revise an individual slide via prompt | `_artifacts.py` |
-| `hPTbtc` | GET_LAST_CONVERSATION_ID | Get most recent conversation ID | `_chat.py` |
-| `khqZz` | GET_CONVERSATION_TURNS | Get Q&A turns for a conversation | `_chat.py` |
-| `J7Gthc` | DELETE_CONVERSATION | Delete a conversation (web UI's "Delete history") | `_chat.py` |
+| `Rytqqe` | RETRY_ARTIFACT | Retry a failed Studio artifact in place | `_artifacts.py` |
+| `hPTbtc` | GET_LAST_CONVERSATION_ID | Get most recent conversation ID | `_chat/api.py` |
+| `khqZz` | GET_CONVERSATION_TURNS | Get Q&A turns for a conversation | `_chat/api.py` |
+| `J7Gthc` | DELETE_CONVERSATION | Delete a conversation (web UI's "Delete history") | `_chat/api.py` |
 | `CYK0Xb` | CREATE_NOTE | Create a note (placeholder) | `_notes.py` |
 | `cYAfTb` | UPDATE_NOTE | Update note content/title | `_notes.py` |
 | `AH0mwd` | DELETE_NOTE | Delete a note | `_notes.py` |
@@ -51,11 +58,11 @@
 | `LBwxtb` | IMPORT_RESEARCH | Import research results | `_research.py` |
 | `rc3d8d` | RENAME_ARTIFACT | Rename artifact | `_artifacts.py` |
 | `Krh3pd` | EXPORT_ARTIFACT | Export to Docs/Sheets | `_artifacts.py` |
-| `RGP97b` | SHARE_ARTIFACT | Toggle notebook sharing | `_notebooks.py` |
-| `QDyure` | SHARE_NOTEBOOK | Set notebook visibility (restricted/public) | `_notebooks.py` |
+| `RGP97b` | SHARE_ARTIFACT | Legacy notebook/artifact share-link toggle | `_sharing_manager.py` |
+| `QDyure` | SHARE_NOTEBOOK | Set notebook visibility (restricted/public) | `_sharing.py` |
 | `JFMDGd` | GET_SHARE_STATUS | Get notebook share settings | `_sharing.py` |
 | `ciyUvf` | GET_SUGGESTED_REPORTS | Get AI-suggested report formats | `_artifacts.py` |
-| `v9rmvd` | GET_INTERACTIVE_HTML | Fetch quiz/flashcard HTML content | `_artifacts.py` |
+| `v9rmvd` | GET_INTERACTIVE_HTML | Fetch quiz/flashcard HTML (`[0][9][0]`) / interactive mind-map tree (`[0][9][3]`) | `_artifact/downloads.py` |
 | `fejl7e` | REMOVE_RECENTLY_VIEWED | Remove notebook from recent list | `_notebooks.py` |
 | `ZwVcOc` | GET_USER_SETTINGS | Get user settings including output language | `_settings.py` |
 | `hT54vc` | SET_USER_SETTINGS | Set user settings (e.g., output language) | `_settings.py` |
@@ -68,7 +75,7 @@
 | 1 | Audio | Audio Overview |
 | 2 | Report | Briefing Doc, Study Guide, Blog Post |
 | 3 | Video | Video Overview |
-| 4 | Quiz/Flashcards | Quiz (variant=2), Flashcards (variant=1) |
+| 4 | Quiz/Flashcards (QUIZ_FLASHCARD alias) | Quiz (variant=2), Flashcards (variant=1) |
 | 5 | Mind Map | Mind Map |
 | 7 | Infographic | Infographic |
 | 8 | Slide Deck | Slide Deck |
@@ -165,8 +172,8 @@ params = [
     title,  # 0: Notebook title
     None,   # 1
     None,   # 2
-    [2],    # 3: Fixed flag
-    [1],    # 4: Fixed flag
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+            # 3: Shared request-options wrapper (`build_template_block()`)
 ]
 ```
 
@@ -243,51 +250,49 @@ ADD_SOURCE_MODAL = {
 
 ### RPC: ADD_SOURCE (izAoDd) - URL
 
-**Source:** `_sources.py::_add_url_source()`
+**Source:** `_source/add.py::SourceAddService.add_url_source()`
 
 ```python
-# URL goes at position [2] in an 8-element array
+# URL goes at position [2] in an 11-element source spec.
 params = [
-    [[None, None, [url], None, None, None, None, None]],  # 0: Source config
+    [[None, None, [url], None, None, None, None, None, None, None, 1]],
     notebook_id,                                           # 1: Notebook ID
-    [2],                                                   # 2: Source type flag
-    None,                                                  # 3
-    None,                                                  # 4
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+                                                           # 2: Shared request-options wrapper
 ]
 ```
 
 ### RPC: ADD_SOURCE (izAoDd) - Text
 
-**Source:** `_sources.py::add_text()`
+**Source:** `_source/add.py::SourceAddService.add_text()`
 
 ```python
-# [title, content] at position [1] in an 8-element array
+# [title, content] at position [1] in an 11-element source spec; slot [3] is
+# the captured source-type code for pasted text.
 params = [
-    [[None, [title, content], None, None, None, None, None, None]],  # 0
-    notebook_id,                                                      # 1
-    [2],                                                              # 2
-    None,                                                             # 3
-    None,                                                             # 4
+    [[None, [title, content], None, 2, None, None, None, None, None, None, 1]],
+    notebook_id,
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
 ]
 ```
 
 ### RPC: ADD_SOURCE (izAoDd) - YouTube
 
-**Source:** `_sources.py::_add_youtube_source()`
+**Source:** `_source/add.py::SourceAddService.add_youtube_source()`
 
 ```python
-# YouTube URL at position [7] in an 11-element array (different from regular URL!)
+# YouTube URL at position [7] in the source spec (different from regular URL).
 params = [
     [[None, None, None, None, None, None, None, [url], None, None, 1]],  # 0
     notebook_id,                                                          # 1
-    [2],                                                                  # 2
-    [1, None, None, None, None, None, None, None, None, None, [1]],      # 3: Extra config
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+                                                                            # 2: Shared wrapper
 ]
 ```
 
 ### RPC: ADD_SOURCE (izAoDd) - Google Drive
 
-**Source:** `_sources.py::add_drive()`
+**Source:** `_source/add.py::SourceAddService.add_drive()`
 
 ```python
 # Drive source structure - single-wrapped (not double!)
@@ -305,7 +310,10 @@ params = [
 ]
 ```
 
-**Note:** The nesting level is critical. Web UI sends `[source_data]` (single wrap), not `[[source_data]]` (double wrap).
+**Note:** Drive add is intentionally still on the older `[2]`,
+`[1, ..., [1]]` tail pending a fresh live Drive capture. URL, YouTube, text,
+CREATE_NOTEBOOK, and ADD_SOURCE_FILE use the shared nested wrapper from
+`_source/upload_payloads.py::build_template_block()`.
 
 ### RPC: DELETE_SOURCE (tGMBJ)
 
@@ -345,6 +353,142 @@ params = [
 # Quadruple-nested source ID!
 params = [[[[source_id]]]]
 ```
+
+### RPC: GET_SOURCE (hizoJc)
+
+**Source:** `_source/content.py::get_fulltext()`
+
+**Purpose:** Get raw text or clean HTML/markdown content of a source.
+
+**Params:**
+```python
+# Position 0: Single-nested source ID
+# Position 1: Output type: [2] for plain text, [3] for cleaned HTML/markdown structure
+# Position 2: Format selector matching position 1
+params = [
+    [source_id],  # 0
+    [2],          # 1
+    [2],          # 2
+]
+```
+
+**Request format:**
+```python
+await rpc_call(
+    RPCMethod.GET_SOURCE,
+    params,
+    source_path=f"/notebook/{notebook_id}",
+)
+```
+
+---
+
+## Source Labels
+
+Source labels group a notebook's sources into AI-generated (or manually named)
+topic buckets. A label is a standalone entity — a source carries no
+back-reference; the label owns a list of source IDs, and membership is
+many-to-many (a source can belong to multiple labels). Every label RPC's first
+argument is the recurring request-options wrapper used by `_settings.py`:
+
+```python
+OPTS = [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]]
+```
+
+### The Label Tuple (response shape)
+
+Each label is a 4-tuple `[name, sources, label_id, emoji]`:
+
+| Slot | Field | Notes |
+|------|-------|-------|
+| `[0]` | `name` | str |
+| `[1]` | `sources` | `[[source_id], ...]` (each UUID wrapped in its own 1-element list); **`None`** for a new empty label |
+| `[2]` | `label_id` | server-assigned UUID |
+| `[3]` | `emoji` | `""` when unset, else the emoji string |
+
+**Response envelopes differ by RPC:** `CREATE_LABEL` returns
+`[None, [label, ...]]` (label set at index `[1]`); `LIST_LABELS` returns
+`[[label, ...]]` (label set at index `[0]`); `UPDATE_LABEL` and `DELETE_LABEL`
+echo `[]` on success.
+
+### RPC: CREATE_LABEL (agX4Bc)
+
+**Source:** `_labels.py::generate()`, `_labels.py::create()` (builders in `_label/params.py`)
+
+A single multi-mode RPC; the mode is selected by which slot is populated. Slot
+`[4]` drives AI auto-labeling (`generate`); slot `[5]` creates manual labels
+(`create`).
+
+```python
+# Auto-label / Reorganize -> All sources (slot [4] = []) - WIPES + regenerates with new ids
+params = [OPTS, notebook_id, None, None, []]
+
+# Reorganize -> Unlabeled sources (slot [4] = [0]) - preserves existing labels
+params = [OPTS, notebook_id, None, None, [0]]
+
+# Manual create (slot [5] = [[name, emoji]])
+params = [OPTS, notebook_id, None, None, None, [["New Label", ""]]]
+```
+
+**Response (all modes):** the full post-op label set — `[None, [label, ...]]`.
+
+### RPC: LIST_LABELS (I3xc3c)
+
+**Source:** `_labels.py::list()`
+
+```python
+params = [OPTS, notebook_id]
+```
+
+**Response:** `[[label, ...]]` — a single-element outer list wrapping the labels
+(**not** `[None, [label, ...]]` like `agX4Bc`). Each label's slot `[1]` carries
+its source UUIDs, so one `list()` call gives the complete source→label mapping.
+
+### RPC: UPDATE_LABEL (le8sX)
+
+**Source:** `_labels.py::update()`, `rename()`, `set_emoji()`,
+`add_sources()`, `remove_sources()` (builder: `_label/params.py`)
+
+A unified label-update RPC covering rename, emoji, and source membership. Slot
+`[3]` is a fieldmask `[[name_emoji, sources_add, sources_remove]]`; populate
+only the group(s) you want to change.
+
+```python
+# Rename (name_emoji = [name]; sources omitted)
+params = [OPTS, notebook_id, label_id, [[[new_name]]]]
+
+# Set emoji (name slot None, emoji set; sources omitted)
+params = [OPTS, notebook_id, label_id, [[[None, emoji]]]]
+
+# Add source(s) (name_emoji None, sources set) - APPENDS, does not replace
+params = [OPTS, notebook_id, label_id, [[None, [[source_id]]]]]
+
+# Remove source from this label only (sources_add None, sources_remove set)
+params = [OPTS, notebook_id, label_id, [[None, None, [[source_id]]]]]
+```
+
+**Note:** the `sources` group **appends** (send only the IDs to add — existing
+members survive) and labels may **overlap** (adding a source does not remove it
+from any other label). Source **removal** is supported via the `UPDATE_LABEL`
+fieldmask's `sources_remove` slot (`[3][0][2]`) — un-assigning the source from
+this label only (it stays in the notebook and in any other label). The current
+API loops one RPC per unique source id for add/remove membership changes; the
+wire shape honors only the first id in each group.
+
+**Response:** `[]` on success.
+
+### RPC: DELETE_LABEL (GyzE7e)
+
+**Source:** `_labels.py::delete()`
+
+Batch-capable — label IDs are passed as an array. Deleting a label does **not**
+delete its sources (they become unlabeled).
+
+```python
+params = [OPTS, notebook_id, [label_id, ...]]
+```
+
+**Response:** `[]` on success.
 
 ---
 
@@ -400,7 +544,7 @@ params = [
 
 ### RPC: RENAME_NOTEBOOK (s0tc2d) - Configure Chat
 
-**Source:** `_chat.py::configure()`
+**Source:** `_chat/api.py::configure()`
 
 ```python
 # Chat goal codes (ChatGoal enum)
@@ -427,7 +571,7 @@ params = [
 
 ### RPC: GET_LAST_CONVERSATION_ID (hPTbtc)
 
-**Source:** `_chat.py::get_conversation_id()`
+**Source:** `_chat/api.py::get_conversation_id()`
 
 Returns the most recent conversation ID for a notebook. The server always returns
 exactly one ID regardless of the `limit` param. Use `GET_CONVERSATION_TURNS` to
@@ -448,7 +592,7 @@ params = [
 
 ### RPC: GET_CONVERSATION_TURNS (khqZz)
 
-**Source:** `_chat.py::get_conversation_turns()`
+**Source:** `_chat/api.py::get_conversation_turns()`
 
 Returns the Q&A turns for a specific conversation. Turns are ordered newest-first.
 
@@ -470,7 +614,7 @@ params = [
 
 ### RPC: DELETE_CONVERSATION (J7Gthc)
 
-**Source:** `_chat.py::delete_conversation()`
+**Source:** `_chat/api.py::delete_conversation()`
 
 Deletes a conversation server-side. Mirrors the NotebookLM web UI's "Delete
 history" button. After the call, the next `ask()` with no `conversation_id`
@@ -526,11 +670,11 @@ await page.locator(".create-artifact-button-container:has-text('Audio')").click(
 
 **All artifact types use `R7cb6c` with different content type codes and nested configs.**
 
-**Source:** `_artifacts.py`
+**Source:** `_artifacts.py` (param builders: `_artifact/payloads.py`)
 
 #### Audio Overview (Type 1)
 
-**Source:** `_artifacts.py::generate_audio()`
+**Source:** `_artifacts.py::ArtifactsAPI` (param builders: `_artifact/payloads.py`)
 
 ```python
 source_ids_triple = [[[sid]] for sid in source_ids]  # [[[s1]], [[s2]], ...]
@@ -688,7 +832,7 @@ params = [
         [
             None,
             [
-                2,                    # Variant: 2=quiz, 1=flashcards
+                2,                    # Variant: 2=quiz, 1=flashcards, 4=interactive mind map
                 None,
                 instructions,
                 None,
@@ -723,7 +867,7 @@ params = [
         [
             None,
             [
-                1,                    # Variant: 1=flashcards (vs 2=quiz)
+                1,                    # Variant: 1=flashcards (vs 2=quiz, 4=interactive mind map)
                 None,
                 instructions,
                 None,
@@ -832,6 +976,39 @@ params = [
 ]
 ```
 
+#### Interactive Mind Map (Type 4 / variant 4) - Uses CREATE_ARTIFACT (R7cb6c)
+
+**Source:** `_artifact/payloads.py::build_interactive_mind_map_artifact_params()`,
+`_mind_maps_api.py::MindMapsAPI.generate()`
+
+NotebookLM's web app now generates an **interactive** mind map — a studio
+artifact in the type-4 family with `variant 4` (distinct from the note-backed
+JSON mind map above, which the library surfaces with the synthetic type code 5).
+Unlike the synchronous note-backed kind, this is created asynchronously via
+`CREATE_ARTIFACT` and polled to completion (issue #1256).
+
+```python
+# RPC: CREATE_ARTIFACT (R7cb6c) — interactive mind map
+params = [
+    [2],
+    notebook_id,
+    [
+        None, None,
+        4,                                        # 2: artifact type (type-4 family)
+        [[[sid]] for sid in source_ids],          # 3: nested source ids
+        None, None, None, None, None,
+        [None, [4]],                              # 9: [_, [variant]] → variant 4 = interactive mind map
+    ],
+]
+```
+
+**Reading the tree:** the interactive map exposes its `{"name", "children"}`
+node tree through `GET_INTERACTIVE_HTML` (v9rmvd) — the same RPC used for
+quiz/flashcard HTML, but the JSON tree lives at **`[0][9][3]`** (the rendered
+HTML body is at `[0][9][0]`). `client.mind_maps.get_tree()` and
+`download_mind_map` both read that position; `client.mind_maps` unifies the two
+kinds behind a single `MindMapKind` discriminator.
+
 ### RPC: LIST_ARTIFACTS (gArtLc)
 
 **Source:** `_artifacts.py::list()`, `_artifacts.py::poll_status()`
@@ -875,7 +1052,8 @@ params = [
 
 ### RPC: CREATE_NOTE (saved-from-chat variant) (CYK0Xb)
 
-**Source:** `_mind_map.py::save_chat_answer_as_note()` / `_notes.py::create_from_chat()`
+**Source:** `_chat/notes.py::save_chat_answer_as_note()` (canonical owner) —
+exposed publicly as `ChatAPI.save_answer_as_note(...)`.
 
 **Note:** This is the same RPC method ID as plain CREATE_NOTE above, but uses a **7-element** params array (vs the 5-element blank-note form) and **mode flag `[2]`** to tell the server the note carries a saved chat answer. The server stores per-citation source-passage metadata so `[N]` markers in the answer render as hover-anchored links in the NotebookLM web UI. No follow-up UPDATE_NOTE is needed — this is a single round-trip.
 
@@ -940,10 +1118,10 @@ params = [
 
 **Encoding quirks**:
 - Rendering-flag arrays use the integer `0`, not the boolean `false` — `json.dumps(False)` emits `false`, which the server *normalizes* but the wire-channel match is strict. The encoder uses integer `0` to stay byte-exact with the captured request.
-- The server appears to apply a "smart title" pass for `[2]`-mode notes — the captured response title differed from the captured request title (the request sent `"New Saved Note"`; the response stored `"Le Verger de la Connaissance : Le Cas de la Pomme"`). `NotesAPI.create_from_chat()` surfaces the server-stored title in the returned `Note`.
+- The server appears to apply a "smart title" pass for `[2]`-mode notes — the captured response title differed from the captured request title (the request sent `"New Saved Note"`; the response stored `"Le Verger de la Connaissance : Le Cas de la Pomme"`). `ChatAPI.save_answer_as_note()` surfaces the server-stored title in the returned `Note`.
 
 **Known gaps**:
-- The `passage_id` UUID at slot `[3][0][5][0][0]` does NOT appear in the streaming chat response shape we currently parse. `_build_source_passage_descriptor` falls back to `chunk_id` as a placeholder when `ChatReference.passage_id` is unset (which is always, in production today). Empirically the server accepts this and the web UI still renders hover anchors. If a future capture reveals where this UUID comes from, populate `ChatReference.passage_id` in `_chat_protocol.py::parse_single_citation()` and the encoder will use it automatically.
+- The `passage_id` UUID at slot `[3][0][5][0][0]` does NOT appear in the streaming chat response shape we currently parse. `_build_source_passage_descriptor` falls back to `chunk_id` as a placeholder when `ChatReference.passage_id` is unset (which is always, in production today). Empirically the server accepts this and the web UI still renders hover anchors. If a future capture reveals where this UUID comes from, populate `ChatReference.passage_id` in `_chat_wire.py::parse_single_citation()` and the encoder will use it automatically.
 - Multi-citation segmentation uses a *cumulative-span* heuristic (each `[N]` anchors `clean_text[0..position]` rather than a per-segment span). This matches the captured single-citation payload exactly but is unverified against multi-citation captures. See issue #660 PR description.
 
 ### RPC: UPDATE_NOTE (cYAfTb)
@@ -1243,11 +1421,14 @@ params = [
 
 ### Notebook Sharing Overview
 
-**Sharing is a notebook-level setting.** When you share a notebook, ALL artifacts become accessible.
+Notebook sharing and artifact deep-link sharing are separate toggles:
+`SHARE_NOTEBOOK` governs who can open the notebook at all, while
+`SHARE_ARTIFACT` is the legacy share-link path used to build or toggle a
+notebook URL with an optional `?artifactId=` target.
 
 Notebooks have **three sharing dimensions**:
 
-1. **Visibility** (SHARE_NOTEBOOK - QDyure or SHARE_ARTIFACT - RGP97b):
+1. **Notebook visibility** (SHARE_NOTEBOOK - QDyure):
    - `[0]` = Restricted (only explicitly shared users)
    - `[1]` = Anyone with the link
 
@@ -1274,7 +1455,10 @@ await client.sharing.add_user(notebook_id, "user@example.com", SharePermission.V
 - Notebook: `https://notebooklm.google.com/notebook/{notebook_id}`
 - Artifact deep-link: `https://notebooklm.google.com/notebook/{notebook_id}?artifactId={artifact_id}`
 
-The `?artifactId=xxx` parameter creates a deep link that opens the notebook and navigates to that specific artifact. Mind Maps cannot be shared (no public URLs).
+The `?artifactId=xxx` parameter creates a deep link that opens the notebook and
+navigates to that specific artifact. It does not make the artifact an
+independent public resource outside the notebook. Mind Maps cannot be shared
+(no public URLs).
 
 ---
 
@@ -1629,7 +1813,7 @@ await rpc_call(
 Common language codes include:
 - `en` (English), `ja` (日本語), `zh_Hans` (中文简体), `zh_Hant` (中文繁體)
 - `ko` (한국어), `es` (Español), `fr` (Français), `de` (Deutsch), `pt_BR` (Português)
-- See `cli/language.py::SUPPORTED_LANGUAGES` for the full list of 80+ languages
+- See `cli/language_cmd.py::SUPPORTED_LANGUAGES` for the full list of 80+ languages
 
 ---
 
@@ -1684,11 +1868,62 @@ await rpc_call(
 # Response: Export result with document URL
 ```
 
+### RPC: RETRY_ARTIFACT (Rytqqe)
+
+**Source:** `_artifacts.py::retry_failed()`
+
+Retry a failed Studio artifact in place — the equivalent of the NotebookLM web
+UI "Retry" button. The failed artifact is **not** deleted first; the same
+`artifact_id` is preserved and the artifact moves from `failed` back to
+`in_progress`, so existing `poll_status()` / `wait_for_completion()` flows keep
+working against it. Captured/validated across video, audio, and infographic
+artifacts (issue #1319).
+
+```python
+params = [
+    retry_options,  # 0: fixed client capability blob (see below)
+    artifact_id,    # 1: ID of the failed artifact to retry
+]
+
+# retry_options is a type-agnostic literal, sent verbatim regardless of
+# artifact type. The trailing [[1, 4, 8, 2, 3, 6]] is a static
+# artifact-type-code capability list, not artifact-specific.
+retry_options = [
+    2,
+    None,
+    None,
+    [1, None, None, None, None, None, None, None, None, None, [1]],
+    [[1, 4, 8, 2, 3, 6]],
+]
+
+# Called with source_path:
+await rpc_call(
+    RPCMethod.RETRY_ARTIFACT,
+    params,
+    source_path=f"/notebook/{notebook_id}",
+    allow_null=True,
+)
+```
+
+**Response:** payload index `0` is a standard artifact row (positionally
+identical to a `LIST_ARTIFACTS` row): `row[0]` is the same `artifact_id`
+(returned as the task id) and `row[4] == 1` (`PROCESSING` → `in_progress`).
+
+Contract (ADR-0019 "async kickoff"): an accepted retry returns
+`GenerationStatus(status="in_progress")`; a synchronous server refusal
+(`USER_DISPLAYABLE_ERROR` — rate limit, quota, or non-retryable artifact)
+**raises** the underlying `RateLimitError` / `RPCError`; a null / missing-id
+result raises `ArtifactFeatureUnavailableError`. A retry may still fail again
+provider-side — observed by polling as a later terminal `failed` status — so
+callers decide whether to re-invoke.
+
 ### RPC: SHARE_ARTIFACT (RGP97b)
 
-**Source:** `_notebooks.py::share()`
+**Source:** `_sharing_manager.py::ShareManager.share()` (legacy share-link toggle)
 
-Toggle notebook sharing. **Sharing is a notebook-level setting** - when enabled, ALL artifacts in the notebook become accessible via their URLs.
+Toggle the legacy share-link state for a notebook URL, optionally with an
+artifact deep-link target. Distinct from `SHARE_NOTEBOOK` (`QDyure`), which
+governs notebook visibility and user permissions.
 
 Note: Mind Maps are NOT shareable (they don't have public URLs).
 
@@ -1721,9 +1956,11 @@ await rpc_call(
 
 ### RPC: GET_INTERACTIVE_HTML (v9rmvd)
 
-**Source:** `_artifacts.py::_get_artifact_content()`
+**Source:** `_artifact/downloads.py::_get_artifact_content()` (quiz/flashcard HTML), `_artifact/downloads.py::_get_interactive_mind_map_tree()` (interactive mind-map tree)
 
-Fetch HTML content for quiz or flashcard artifacts. Used for downloading these artifact types in various formats.
+Fetch the interactive payload for a studio artifact. Used both for quiz/flashcard
+HTML and for the **interactive** mind-map JSON node tree (issue #1256) — the same
+RPC, but the two kinds read different cells of index `9`.
 
 ```python
 params = [artifact_id]  # Just the artifact ID
@@ -1738,12 +1975,17 @@ await rpc_call(
 # Response structure:
 # [[
 #     ...,                    # indices 0-8: metadata
-#     [html_content],         # index 9: HTML content array
+#     [                       # index 9: interactive content array
+#         html_content,       #   [9][0]: rendered HTML body (quiz / flashcard)
+#         ...,
+#         ...,
+#         tree_json,          #   [9][3]: interactive mind-map {"name","children"} tree (JSON string)
+#     ],
 #     ...
 # ]]
 #
-# HTML content contains quiz questions or flashcard data
-# that can be parsed into JSON, Markdown, or kept as HTML.
+# Quiz/flashcard download reads [0][9][0] (HTML → JSON/Markdown/HTML).
+# Interactive mind-map download reads [0][9][3] (the JSON node tree).
 ```
 
 ### RPC: GET_SUGGESTED_REPORTS (ciyUvf)
@@ -1827,7 +2069,8 @@ These RPC method IDs exist in `rpc/types.py` but are either legacy (superseded b
 
 | RPC ID | Method | Status | Notes |
 |--------|--------|--------|-------|
-| `hizoJc` | GET_SOURCE | Broken | Code comments indicate this doesn't work; `get()` uses GET_NOTEBOOK instead |
+
+> **Note:** `GET_SOURCE` (`hizoJc`) was previously listed here as "Broken" but is now active — used by `_source/content.py::get_fulltext()`. See [RPC Method Status](#rpc-method-status) and the detailed section above.
 
 **Why keep these?** These IDs are preserved in the codebase in case:
 1. Google re-enables or changes their functionality

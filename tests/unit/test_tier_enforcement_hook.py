@@ -27,6 +27,13 @@ a faithful copy of the hook so the regression test does NOT depend on importing
 the real conftest (which would also drag in unrelated infrastructure). The
 inlined hook is kept in lockstep with the real one — if the real hook's
 detection logic changes, update ``HOOK_SOURCE`` here too.
+
+The scenarios run via ``runpytest_subprocess`` (not in-process ``runpytest``):
+the synthetic project mirrors the real ``tests/`` package layout (with
+``__init__.py`` files), so an in-process run would collide with the parent
+session's already-imported ``tests.*`` modules in ``sys.modules`` and fail
+collection with ``ModuleNotFoundError``. A fresh subprocess isolates the
+synthetic ``tests`` package from the real one.
 """
 
 from __future__ import annotations
@@ -90,6 +97,7 @@ HOOK_SOURCE = textwrap.dedent(
 MARKER_REGISTRATION = textwrap.dedent(
     """
     [pytest]
+    asyncio_default_fixture_loop_scope = function
     markers =
         vcr: vcr-tier
         allow_no_vcr: opt out
@@ -106,9 +114,6 @@ def _scaffold(pytester: pytest.Pytester, integration_body: str) -> None:
             "tests/integration/test_under_test.py": integration_body,
         }
     )
-    # Empty ``__init__.py`` files so the synthetic ``tests/integration/`` is
-    # treated as the same kind of package layout pytest sees in the real repo.
-    pytester.makepyfile(**{"tests/__init__.py": "", "tests/integration/__init__.py": ""})
 
 
 def test_violation_rejected(pytester: pytest.Pytester) -> None:
@@ -122,7 +127,7 @@ def test_violation_rejected(pytester: pytest.Pytester) -> None:
             """
         ).strip(),
     )
-    result = pytester.runpytest("tests/integration/")
+    result = pytester.runpytest_subprocess("tests/integration/")
     # ``UsageError`` from a collection hook ends the run with exit code != 0
     # and the message printed to stderr.
     assert result.ret != 0
@@ -147,7 +152,7 @@ def test_allow_no_vcr_optout_honored(pytester: pytest.Pytester) -> None:
             """
         ).strip(),
     )
-    result = pytester.runpytest("tests/integration/")
+    result = pytester.runpytest_subprocess("tests/integration/")
     assert result.ret == 0
     result.assert_outcomes(passed=1)
 
@@ -168,7 +173,7 @@ def test_vcr_marker_honored(pytester: pytest.Pytester) -> None:
             """
         ).strip(),
     )
-    result = pytester.runpytest("tests/integration/")
+    result = pytester.runpytest_subprocess("tests/integration/")
     assert result.ret == 0
     result.assert_outcomes(passed=1)
 
@@ -185,8 +190,6 @@ def test_use_cassette_decorator_honored(pytester: pytest.Pytester) -> None:
     pytester.makeini(MARKER_REGISTRATION)
     pytester.makepyfile(
         **{
-            "tests/__init__.py": "",
-            "tests/integration/__init__.py": "",
             "tests/integration/conftest.py": HOOK_SOURCE,
             "tests/integration/test_with_use_cassette.py": textwrap.dedent(
                 """
@@ -212,7 +215,7 @@ def test_use_cassette_decorator_honored(pytester: pytest.Pytester) -> None:
             ).strip(),
         }
     )
-    result = pytester.runpytest("tests/integration/")
+    result = pytester.runpytest_subprocess("tests/integration/")
     assert result.ret == 0
     result.assert_outcomes(passed=1)
 
@@ -228,9 +231,6 @@ def test_unit_tier_not_gated(pytester: pytest.Pytester) -> None:
     pytester.makepyfile(
         **{
             "tests/integration/conftest.py": HOOK_SOURCE,
-            "tests/__init__.py": "",
-            "tests/integration/__init__.py": "",
-            "tests/unit/__init__.py": "",
             "tests/unit/test_bare.py": textwrap.dedent(
                 """
                 def test_unit_no_marker():
@@ -239,6 +239,6 @@ def test_unit_tier_not_gated(pytester: pytest.Pytester) -> None:
             ).strip(),
         }
     )
-    result = pytester.runpytest("tests/unit/")
+    result = pytester.runpytest_subprocess("tests/unit/")
     assert result.ret == 0
     result.assert_outcomes(passed=1)

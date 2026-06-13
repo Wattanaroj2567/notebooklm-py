@@ -1,8 +1,12 @@
-"""Runtime environment helpers for NotebookLM endpoints and defaults.
+"""Internal environment/default resolvers for NotebookLM runtime behavior.
 
 Centralises lookup of environment variables that influence the live behavior
 of the client. Keeping these here avoids scattering ``os.environ.get`` calls
 across the codebase and gives each override a single, documented entry point.
+
+This is an implementation module. Public configuration imports stay on
+``notebooklm.config``, which deliberately re-exports only the supported subset
+of endpoint/language helpers from here.
 """
 
 from __future__ import annotations
@@ -15,19 +19,6 @@ PERSONAL_BASE_HOST = "notebooklm.google.com"
 ENTERPRISE_BASE_HOST = "notebooklm.cloud.google.com"
 
 _ALLOWED_BASE_HOSTS = frozenset({PERSONAL_BASE_HOST, ENTERPRISE_BASE_HOST})
-
-STRICT_DECODE_ENV = "NOTEBOOKLM_STRICT_DECODE"
-
-
-def is_strict_decode_enabled() -> bool:
-    """Return True if the strict-decode mode is enabled.
-
-    By default, schema-drift helpers (e.g. ``safe_index``) fall back to
-    warn-and-return-None during the soft-rollout window. Setting
-    ``NOTEBOOKLM_STRICT_DECODE=1`` (or ``true``/``True``) flips them to raise
-    ``UnknownRPCMethodError`` instead, surfacing drift early.
-    """
-    return os.environ.get(STRICT_DECODE_ENV, "0") in ("1", "true", "True")
 
 
 def get_base_url() -> str:
@@ -97,10 +88,12 @@ def get_default_language() -> str:
     This value is threaded into two places:
 
     * The ``hl`` URL query parameter on every batchexecute RPC call
-      (``_core._build_url`` and ``_chat.ask``).
-    * The default ``language`` argument of the language-aware
-      ``ArtifactsAPI.generate_*`` methods, which embed the code into the
-      RPC payload.
+      (``RpcExecutor.build_url`` and
+      ``_chat.wire.build_streaming_chat_request``).
+    * Language-aware ``ArtifactsAPI.generate_*`` calls when callers pass
+      ``language=None`` to opt in to environment/default resolution. Omitting
+      ``language`` in the public Python API keeps the historical ``"en"``
+      artifact-language default.
     """
     raw = os.environ.get("NOTEBOOKLM_HL", "") or ""
     return raw.strip() or "en"

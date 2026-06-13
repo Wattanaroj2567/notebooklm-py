@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from notebooklm._artifacts import ArtifactsAPI
+from notebooklm._row_adapters.artifacts import ArtifactRow
 from notebooklm.rpc.types import ArtifactStatus, ArtifactTypeCode
 from notebooklm.types import ArtifactNotReadyError
 
@@ -45,11 +46,20 @@ def _artifact(
 
 @pytest.fixture
 def api() -> ArtifactsAPI:
-    """Build an ArtifactsAPI with no-op core / notes — only the helper is exercised."""
-    mock_core = MagicMock()
-    mock_core.rpc_call = AsyncMock()
-    mock_notes = MagicMock()
-    return ArtifactsAPI(mock_core, notes_api=mock_notes)
+    """Build an ArtifactsAPI with no-op runtime / mind-map — only the helper is exercised."""
+    from notebooklm._mind_map import NoteBackedMindMapService
+    from notebooklm._note_service import NoteService
+    from tests._fixtures.fake_core import make_fake_core
+
+    mock_core = make_fake_core(rpc_call=AsyncMock())
+    return ArtifactsAPI(
+        rpc=mock_core,
+        drain=mock_core,
+        lifecycle=mock_core,
+        notebooks=MagicMock(),
+        mind_maps=MagicMock(spec=NoteBackedMindMapService),
+        note_service=MagicMock(spec=NoteService),
+    )
 
 
 class TestSelectArtifactFiltering:
@@ -128,6 +138,24 @@ class TestSelectArtifactFiltering:
         )
 
         assert result[0] == "ok"
+
+    def test_adapter_selector_returns_artifact_row(self, api: ArtifactsAPI) -> None:
+        """New internal selector returns the adapter while preserving raw selector behavior."""
+        candidates = [
+            _artifact("old", ArtifactTypeCode.AUDIO, ArtifactStatus.COMPLETED, 100),
+            _artifact("newest", ArtifactTypeCode.AUDIO, ArtifactStatus.COMPLETED, 999),
+        ]
+
+        result = api._listing.select_completed_artifact_row(
+            candidates,
+            artifact_id=None,
+            type_name="Audio",
+            no_result_error_key="audio",
+            type_code=ArtifactTypeCode.AUDIO,
+        )
+
+        assert isinstance(result, ArtifactRow)
+        assert result.id == "newest"
 
 
 class TestSelectArtifactExplicitId:

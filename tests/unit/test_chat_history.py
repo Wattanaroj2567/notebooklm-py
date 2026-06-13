@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import notebooklm.cli.chat_cmd as chat_cmd_module
 from notebooklm._chat import ChatAPI
+from notebooklm.exceptions import UnknownRPCMethodError
 
 
 class TestParseTurnsToQaPairs:
@@ -87,16 +89,44 @@ class TestParseTurnsToQaPairs:
         assert result[1] == ("Second?", "Answer to second.")
 
     def test_empty_turns_data(self):
+        """Falsy payloads are absence — soft ``[]``, no drift."""
         assert ChatAPI._parse_turns_to_qa_pairs(None) == []
         assert ChatAPI._parse_turns_to_qa_pairs([]) == []
-        assert ChatAPI._parse_turns_to_qa_pairs("not a list") == []
+        assert ChatAPI._parse_turns_to_qa_pairs("") == []
+
+    def test_truthy_non_list_payload_raises(self):
+        """A truthy non-list TOP-LEVEL payload is wire drift, not absence.
+
+        This historically parsed to a silent ``[]`` (the fabricated-empty-
+        history class this hardening removes); per the #1485
+        absence-vs-malformed policy it now raises ``UnknownRPCMethodError``
+        from ``unwrap_conversation_turns`` — same as the inner-slot case.
+        """
+        with pytest.raises(UnknownRPCMethodError):
+            ChatAPI._parse_turns_to_qa_pairs("not a list")
+        with pytest.raises(UnknownRPCMethodError):
+            ChatAPI._parse_turns_to_qa_pairs({"unexpected": "dict"})
 
     def test_empty_inner_list(self):
         assert ChatAPI._parse_turns_to_qa_pairs([[]]) == []
 
-    def test_inner_not_list(self):
-        assert ChatAPI._parse_turns_to_qa_pairs(["string"]) == []
-        assert ChatAPI._parse_turns_to_qa_pairs([42]) == []
+    def test_none_inner_slot_is_soft_empty(self):
+        """A ``None`` where the turn list belongs is absence, not drift."""
+        assert ChatAPI._parse_turns_to_qa_pairs([None]) == []
+
+    def test_inner_not_list_raises(self):
+        """A *truthy non-list* where the turn list belongs is wire drift.
+
+        Historically this silently parsed to ``[]`` — fabricating an empty
+        chat history on a Google reshape. Per the #1485 absence-vs-malformed
+        policy it now raises ``UnknownRPCMethodError`` (via
+        ``unwrap_conversation_turns``), consistent with the strict
+        ``safe_index`` leaf behavior in ``_extract_next_turn_content``.
+        """
+        with pytest.raises(UnknownRPCMethodError):
+            ChatAPI._parse_turns_to_qa_pairs(["string"])
+        with pytest.raises(UnknownRPCMethodError):
+            ChatAPI._parse_turns_to_qa_pairs([42])
 
     def test_malformed_turn_too_short(self):
         """Turns with fewer than 3 elements are skipped."""
@@ -109,6 +139,72 @@ class TestParseTurnsToQaPairs:
         ]
         result = ChatAPI._parse_turns_to_qa_pairs(turns_data)
         assert result == [("Valid question?", "Valid answer.")]
+
+    def test_malformed_turn_skip_logs_debug_diagnostic(self, caplog):
+        """A skipped malformed turn leaves a DEBUG record (never fully silent)."""
+        import logging
+
+        turns_data = [
+            [
+                "not a turn",  # malformed row: skipped WITH a diagnostic
+                [None, None, 1, "Valid question?"],
+                [None, None, 2, None, [["Valid answer."]]],
+            ]
+        ]
+        with caplog.at_level(logging.DEBUG, logger="notebooklm"):
+            result = ChatAPI._parse_turns_to_qa_pairs(turns_data)
+
+        assert result == [("Valid question?", "Valid answer.")]
+        assert any(
+            r.levelno == logging.DEBUG and "skipping malformed turn" in r.message
+            for r in caplog.records
+        )
+
+    def test_unrecognized_role_code_logs_debug_and_skips(self, caplog):
+        """A well-formed turn with a role outside {1, 2} is role-slot drift.
+
+        Historically such rows vanished silently — real history could parse
+        to ``[]`` with zero diagnostics. The walk now leaves a DEBUG record
+        before skipping, and surrounding valid pairs still parse (#1485).
+        """
+        import logging
+
+        turns_data = [
+            [
+                [None, None, "user", "Drifted question?"],  # unknown role code
+                [None, None, 1, "Valid question?"],
+                [None, None, 2, None, [["Valid answer."]]],
+            ]
+        ]
+        with caplog.at_level(logging.DEBUG, logger="notebooklm"):
+            result = ChatAPI._parse_turns_to_qa_pairs(turns_data)
+
+        assert result == [("Valid question?", "Valid answer.")]
+        assert any(
+            r.levelno == logging.DEBUG and "unrecognized role code" in r.message
+            for r in caplog.records
+        )
+
+    def test_unpaired_answer_rows_do_not_log_role_diagnostic(self, caplog):
+        """Ordinary unpaired ROLE_ANSWER rows are NOT role drift — no log.
+
+        Answers are legitimately consumed via pairing; only role values
+        outside {ROLE_QUESTION, ROLE_ANSWER} get the diagnostic.
+        """
+        import logging
+
+        turns_data = [
+            [
+                [None, None, 2, None, [["Orphan answer."]]],
+                [None, None, 1, "Question?"],
+                [None, None, 2, None, [["Paired answer."]]],
+            ]
+        ]
+        with caplog.at_level(logging.DEBUG, logger="notebooklm"):
+            result = ChatAPI._parse_turns_to_qa_pairs(turns_data)
+
+        assert result == [("Question?", "Paired answer.")]
+        assert not any("unrecognized role code" in r.message for r in caplog.records)
 
     def test_non_list_turn_skipped(self):
         """Non-list items in the turns array are skipped but break Q-A adjacency."""
@@ -125,15 +221,21 @@ class TestParseTurnsToQaPairs:
         assert result == [("Question?", "")]
 
     def test_answer_with_index_error(self):
-        """Answer turn with broken structure yields empty answer string."""
+        """Answer turn with broken structure raises under strict decoding.
+
+        Strict decoding is the only mode (the ``NOTEBOOKLM_STRICT_DECODE=0``
+        soft-mode opt-out was retired in v0.7.0), so a non-descendable inner
+        shape raises ``UnknownRPCMethodError`` rather than degrading to an
+        empty answer.
+        """
         turns_data = [
             [
                 [None, None, 1, "Question?"],
                 [None, None, 2, None, []],  # empty nested list
             ]
         ]
-        result = ChatAPI._parse_turns_to_qa_pairs(turns_data)
-        assert result == [("Question?", "")]
+        with pytest.raises(UnknownRPCMethodError):
+            ChatAPI._parse_turns_to_qa_pairs(turns_data)
 
     def test_answer_with_none_text(self):
         """Answer turn where text is None yields 'None' (str conversion)."""
@@ -186,28 +288,28 @@ class TestFormatHelpers:
     """Tests for CLI formatting helpers."""
 
     def test_format_single_qa_both_present(self):
-        from notebooklm.cli.chat import _format_single_qa
+        from notebooklm.cli.chat_cmd import _format_single_qa
 
         result = _format_single_qa("What is AI?", "AI is artificial intelligence.")
         assert "**Q:** What is AI?" in result
         assert "**A:** AI is artificial intelligence." in result
 
     def test_format_single_qa_question_only(self):
-        from notebooklm.cli.chat import _format_single_qa
+        from notebooklm.cli.chat_cmd import _format_single_qa
 
         result = _format_single_qa("What is AI?", "")
         assert "**Q:** What is AI?" in result
         assert "**A:**" not in result
 
     def test_format_single_qa_answer_only(self):
-        from notebooklm.cli.chat import _format_single_qa
+        from notebooklm.cli.chat_cmd import _format_single_qa
 
         result = _format_single_qa("", "The answer.")
         assert "**Q:**" not in result
         assert "**A:** The answer." in result
 
     def test_format_single_qa_both_empty(self):
-        from notebooklm.cli.chat import _format_single_qa
+        from notebooklm.cli.chat_cmd import _format_single_qa
 
         result = _format_single_qa("", "")
         assert result == ""
@@ -217,7 +319,7 @@ class TestDetermineConversationId:
     """Tests for _determine_conversation_id CLI helper."""
 
     def test_explicit_conversation_id_used(self):
-        from notebooklm.cli.chat import _determine_conversation_id
+        from notebooklm.cli.chat_cmd import _determine_conversation_id
 
         result = _determine_conversation_id(
             explicit_conversation_id="conv_explicit",
@@ -228,9 +330,9 @@ class TestDetermineConversationId:
         assert result == "conv_explicit"
 
     def test_different_notebook_starts_new(self):
-        from notebooklm.cli.chat import _determine_conversation_id
+        from notebooklm.cli.chat_cmd import _determine_conversation_id
 
-        with patch("notebooklm.cli.chat.get_current_notebook", return_value="nb_old"):
+        with patch.object(chat_cmd_module, "get_current_notebook", return_value="nb_old"):
             result = _determine_conversation_id(
                 explicit_conversation_id=None,
                 explicit_notebook_id="nb_new",
@@ -240,11 +342,11 @@ class TestDetermineConversationId:
         assert result is None
 
     def test_same_notebook_continues_cached(self):
-        from notebooklm.cli.chat import _determine_conversation_id
+        from notebooklm.cli.chat_cmd import _determine_conversation_id
 
         with (
-            patch("notebooklm.cli.chat.get_current_notebook", return_value="nb_123"),
-            patch("notebooklm.cli.chat.get_current_conversation", return_value="conv_cached"),
+            patch.object(chat_cmd_module, "get_current_notebook", return_value="nb_123"),
+            patch.object(chat_cmd_module, "get_current_conversation", return_value="conv_cached"),
         ):
             result = _determine_conversation_id(
                 explicit_conversation_id=None,
@@ -255,9 +357,9 @@ class TestDetermineConversationId:
         assert result == "conv_cached"
 
     def test_no_explicit_notebook_uses_cached(self):
-        from notebooklm.cli.chat import _determine_conversation_id
+        from notebooklm.cli.chat_cmd import _determine_conversation_id
 
-        with patch("notebooklm.cli.chat.get_current_conversation", return_value="conv_cached"):
+        with patch.object(chat_cmd_module, "get_current_conversation", return_value="conv_cached"):
             result = _determine_conversation_id(
                 explicit_conversation_id=None,
                 explicit_notebook_id=None,
@@ -272,7 +374,7 @@ class TestGetLatestConversationFromServer:
 
     @pytest.mark.asyncio
     async def test_returns_conversation_id(self):
-        from notebooklm.cli.chat import _get_latest_conversation_from_server
+        from notebooklm.cli.chat_cmd import _get_latest_conversation_from_server
 
         client = MagicMock()
         client.chat.get_conversation_id = AsyncMock(return_value="conv_from_server")
@@ -282,7 +384,7 @@ class TestGetLatestConversationFromServer:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_conversations(self):
-        from notebooklm.cli.chat import _get_latest_conversation_from_server
+        from notebooklm.cli.chat_cmd import _get_latest_conversation_from_server
 
         client = MagicMock()
         client.chat.get_conversation_id = AsyncMock(return_value=None)
@@ -292,7 +394,7 @@ class TestGetLatestConversationFromServer:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_exception(self):
-        from notebooklm.cli.chat import _get_latest_conversation_from_server
+        from notebooklm.cli.chat_cmd import _get_latest_conversation_from_server
 
         client = MagicMock()
         client.chat.get_conversation_id = AsyncMock(side_effect=RuntimeError("Network error"))

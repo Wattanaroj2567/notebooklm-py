@@ -30,13 +30,19 @@ from pathlib import Path
 
 import pytest
 
+from tests.cassette_patterns import (
+    find_cookie_leaks,
+    find_credential_leaks,
+    is_clean,
+    scrub_cookie_header,
+    scrub_set_cookie,
+)
+from tests.vcr_config import scrub_string
+
+pytestmark = pytest.mark.repo_lint
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_DIR = REPO_ROOT / "tests"
-# ``tests/vcr_config.py`` lives directly under ``tests/`` (not in a package).
-# Other test modules add it to ``sys.path``; we follow the same convention.
-sys.path.insert(0, str(TESTS_DIR))
-
-from vcr_config import scrub_string  # noqa: E402
 
 GUARD_SCRIPT = TESTS_DIR / "scripts" / "check_cassettes_clean.py"
 REGRESSION_FIXTURE = TESTS_DIR / "fixtures" / "bad_cassettes" / "bad_sid_starting_with_s.yaml"
@@ -208,6 +214,62 @@ def test_authuser_email_scrubbed_for_any_domain(url: str) -> None:
     # And the canonical placeholder is present with the URL-encoded ``%40`` shape
     # so VCR's URL-match path still sees a well-formed ``authuser=`` value.
     assert "authuser=SCRUBBED_EMAIL%40example.com" in scrubbed
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # The actual leak shape from the 9 affected cassettes: the email-bearing
+        # inner URL is the *value* of a ``continue=`` redirect param, so its
+        # ``?authuser=`` got percent-encoded one extra level — ``?``→``%3F``,
+        # ``=``→``%3D``, ``@``→``%40`` (issue #1368).
+        "https://accounts.google.com/SignOutOptions?hl=en&continue="
+        "https://notebooklm.google.com/%3Fauthuser%3Dalice%40gmail.com&ec=GBRAmgU",
+        # ``brandaccounts`` redirect variant — same double-encoded inner URL.
+        "https://myaccount.google.com/brandaccounts?authuser=0&continue="
+        "https://notebooklm.google.com/%3Fauthuser%3Dalice%40gmail.com&service=/",
+        # Workspace / custom domain — shape-based detection must not narrow to
+        # the public-provider allowlist.
+        "https://notebooklm.google.com/%3Fauthuser%3Dalice%40company.com&ec=x",
+        # Plus-aliased local part (``+``→``%2B`` on the wire), multi-dot TLD.
+        "https://notebooklm.google.com/%3Fauthuser%3Dops%2Btag%40eng.corp.example.co.uk",
+    ],
+)
+def test_double_encoded_authuser_email_scrubbed_and_detected(url: str) -> None:
+    """Double-encoded ``authuser%3D…%40…`` redirect URLs are caught (#1368).
+
+    Regression gate for the leak class where the maintainer's email rode
+    double-URL-encoded inside Google account-menu ``continue=`` redirect URLs.
+    The single-encoded ``authuser=`` scrubber anchors on a literal ``=`` so it
+    never matched ``authuser%3D``, and the email detector anchored on a literal
+    ``@`` so it never matched ``%40`` — both the scrubber and the
+    ``is_clean``/``find_credential_leaks`` detectors slipped the form silently.
+
+    Asserts (a) the detectors FLAG the double-encoded form, and (b)
+    ``scrub_string`` redacts it to the canonical placeholder.
+    """
+    # (a) Detectors flag the leak on the raw double-encoded content.
+    ok, leaks = is_clean(url)
+    assert not ok, f"is_clean failed to flag double-encoded authuser leak: {url!r}"
+    assert any("alice" in leak or "ops" in leak for leak in leaks), leaks
+    assert find_credential_leaks(url), (
+        f"find_credential_leaks failed to flag double-encoded authuser leak: {url!r}"
+    )
+
+    # (b) The original email value is gone in every shape after scrubbing.
+    scrubbed = scrub_string(url)
+    assert "alice" not in scrubbed
+    assert "ops" not in scrubbed
+    assert "company.com" not in scrubbed
+    assert "corp.example" not in scrubbed
+    assert "%40gmail.com" not in scrubbed
+    # The canonical double-encoded placeholder is present so VCR's URL-match
+    # path still sees a well-formed value on replay.
+    assert "authuser%3DSCRUBBED_EMAIL%40example.com" in scrubbed
+    # And the scrubbed output passes the guard cleanly (idempotent validation).
+    ok_after, leaks_after = is_clean(scrubbed)
+    assert ok_after, f"scrubbed output still flagged: {leaks_after}"
+    assert find_credential_leaks(scrubbed) == []
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +519,48 @@ def test_python_guard_recursive_skips_examples_subdir(tmp_path: Path) -> None:
     assert "Leak (email)" in res_explicit.stdout
 
 
+def test_python_guard_secrets_only_scans_examples_subtree(tmp_path: Path) -> None:
+    """``--secrets-only --recursive`` scans an ``examples/`` subtree (#1266).
+
+    The default scan skips ``examples/`` (placeholder fixtures trip the full
+    heuristics), but ``--secrets-only`` matches only credential shapes — which
+    never occur in placeholder fixtures — so it MUST descend into ``examples/``
+    or a real key hidden there would be a silent blind spot. The key is built
+    by concatenation so no contiguous key literal lives in this source file.
+    Also exercises the ``.json`` widening: the default scan globs only ``.yaml``.
+    """
+    fake_key = "AIza" + "Z" * 35
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "leak.json").write_text(f'{{"JrWMbf":"{fake_key}"}}\n', encoding="utf-8")
+
+    # Default mode would skip the examples/ subtree AND only globs .yaml.
+    res_default = _run_guard("--recursive", str(tmp_path))
+    assert res_default.returncode == 0, res_default.stdout + res_default.stderr
+
+    # Secrets-only descends into examples/ and scans the .json file.
+    res_secrets = _run_guard("--secrets-only", "--recursive", str(tmp_path))
+    assert res_secrets.returncode == 1, res_secrets.stdout + res_secrets.stderr
+    assert "Google API key" in res_secrets.stdout
+
+
+def test_python_guard_secrets_only_ignores_placeholder_content(tmp_path: Path) -> None:
+    """``--secrets-only`` does not flag placeholder content that trips is_clean.
+
+    A real-provider email is a leak under the full heuristics but NOT a
+    high-severity credential shape — this is the property that makes scanning
+    fixture dirs full of ``"Scrubbed ..."`` / test-email placeholders viable.
+    """
+    cassette = tmp_path / "fixture.json"
+    cassette.write_text('{"email":"realname@gmail.com"}\n', encoding="utf-8")
+    # Full heuristics WOULD flag the email ...
+    assert _run_guard(str(cassette)).returncode == 1
+    # ... but secrets-only stays silent.
+    res = _run_guard("--secrets-only", str(cassette))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "0 leaks found" in res.stdout
+
+
 def test_python_guard_exits_zero_when_no_cassettes_found(tmp_path: Path) -> None:
     """An empty cassette directory is a valid clean state (matches bash)."""
     empty_dir = tmp_path / "empty"
@@ -503,3 +607,158 @@ def test_python_guard_repo_allowlist_is_explicit_basename_list() -> None:
     # future regressions would re-introduce entries here.
     for required in ():
         assert required in entries, f"missing required allowlist entry: {required}"
+
+
+# ===========================================================================
+# Name-AGNOSTIC cookie-value scrubbing + detection
+# ===========================================================================
+#
+# Regression for the name-anchored-scrubber leak: cookies NOT on the
+# ``SESSION_COOKIES`` allowlist (Google Analytics ``_ga`` / ``_ga_<id>`` /
+# ``_gcl_au``, plus one-offs like ``AEC``) kept their REAL values in committed
+# cassettes because the recorder only scrubbed enumerated cookie NAMES. The
+# fix adds a name-agnostic pass: every cookie pair's value is cleared, names
+# preserved; and the clean-gate flags ANY non-placeholder cookie value going
+# forward.
+
+# Distinctive real-looking analytics values — if any byte survives the
+# name-agnostic scrub, the assertions below fail loudly.
+_GA_VALUE = "GA1.1.1567240762.1778846987"
+_GA_ID_VALUE = "GS2.1.s1778846986$o1$g0$t1778846986$j60$l0$h0"
+_GCL_VALUE = "1.1.1583381276.1778846987"
+
+
+def test_name_agnostic_scrub_clears_analytics_and_unknown_cookies() -> None:
+    """``scrub_cookie_header`` clears EVERY cookie value, name-agnostic.
+
+    Covers the confirmed-leak names (``_ga`` / ``_ga_W0LDH41ZCB`` / ``_gcl_au``)
+    plus an arbitrary unknown ``foo=bar`` cookie. Allowlisted session cookies
+    are still cleared, and every cookie NAME is preserved.
+    """
+    header = (
+        f"SID=SCRUBBED; _ga={_GA_VALUE}; _ga_W0LDH41ZCB={_GA_ID_VALUE}; "
+        f"_gcl_au={_GCL_VALUE}; foo=bar"
+    )
+    scrubbed = scrub_cookie_header(header)
+
+    # No real value survives.
+    for secret in (_GA_VALUE, _GA_ID_VALUE, _GCL_VALUE, "bar"):
+        assert secret not in scrubbed, f"value {secret!r} survived name-agnostic scrub:\n{scrubbed}"
+
+    # Every name preserved, every value the canonical placeholder.
+    for name in ("SID", "_ga", "_ga_W0LDH41ZCB", "_gcl_au", "foo"):
+        assert f"{name}=SCRUBBED" in scrubbed, f"cookie {name!r} not cleared to placeholder"
+
+
+def test_name_agnostic_cookie_scrub_is_idempotent() -> None:
+    """A second pass over already-scrubbed cookies is a no-op."""
+    header = f"SID=SCRUBBED; _ga={_GA_VALUE}; foo=bar"
+    once = scrub_cookie_header(header)
+    twice = scrub_cookie_header(once)
+    assert once == twice
+
+
+def test_set_cookie_scrub_preserves_attributes() -> None:
+    """``scrub_set_cookie`` clears only the cookie value, keeps attributes.
+
+    The leading ``name=value`` pair is scrubbed; ``Path`` / ``Domain`` /
+    ``Expires`` / ``Secure`` / ``HttpOnly`` / ``SameSite`` attributes survive
+    verbatim so cassette replay still sees a well-formed Set-Cookie.
+    """
+    sc = (
+        "NID=realtoken_value_123; expires=Thu, 23-Jul-2026 02:49:53 GMT; "
+        "path=/; domain=.google.com; HttpOnly; Secure; SameSite=none"
+    )
+    scrubbed = scrub_set_cookie(sc)
+    assert "realtoken_value_123" not in scrubbed
+    assert "NID=SCRUBBED" in scrubbed
+    for attr in (
+        "expires=Thu",
+        "path=/",
+        "domain=.google.com",
+        "HttpOnly",
+        "Secure",
+        "SameSite=none",
+    ):
+        assert attr in scrubbed, f"Set-Cookie attribute {attr!r} was disturbed:\n{scrubbed}"
+    # Idempotent.
+    assert scrub_set_cookie(scrubbed) == scrubbed
+
+
+def test_find_cookie_leaks_flags_unscrubbed_analytics_cookies() -> None:
+    """``find_cookie_leaks`` flags every non-placeholder cookie value."""
+    header = f"SID=SCRUBBED; _ga={_GA_VALUE}; _gcl_au={_GCL_VALUE}; foo=bar"
+    leaks = find_cookie_leaks(header)
+    flagged = {leak.split("cookie '")[1].split("'")[0] for leak in leaks}
+    assert {"_ga", "_gcl_au", "foo"} <= flagged, f"missed a leak: {leaks}"
+    # Allowlisted-but-scrubbed SID is NOT a leak.
+    assert "SID" not in flagged
+    # Fully-scrubbed header has zero leaks.
+    assert find_cookie_leaks(scrub_cookie_header(header)) == []
+
+
+def test_is_clean_flags_unscrubbed_cookie_value_name_agnostic() -> None:
+    """``is_clean`` flags an off-allowlist cookie sharing a session-cookie run.
+
+    The name-agnostic pass only fires inside a ``;``-delimited run carrying a
+    known session cookie (so it never false-positives on incidental body
+    ``k=v`` content). A leaked ``_ga`` riding next to ``SID=`` is flagged.
+    """
+    dirty = f"APISID=SCRUBBED; SID=SCRUBBED; _ga={_GA_VALUE}; _gcl_au={_GCL_VALUE}"
+    ok, leaks = is_clean(dirty)
+    assert not ok
+    assert any("_ga" in leak for leak in leaks)
+    assert any("_gcl_au" in leak for leak in leaks)
+
+    # Fully scrubbed cookie run is clean.
+    clean_ok, clean_leaks = is_clean("APISID=SCRUBBED; SID=SCRUBBED; _ga=SCRUBBED")
+    assert clean_ok, clean_leaks
+
+
+def test_is_clean_does_not_flag_incidental_body_key_value() -> None:
+    """A ``k=v; k=v`` body fragment WITHOUT a session cookie is not flagged."""
+    body = "width=100; height=200; color=red; charset=UTF-8"
+    ok, leaks = is_clean(body)
+    assert ok, f"name-agnostic cookie pass false-positived on body content: {leaks}"
+
+
+def test_guard_flags_a_cassette_with_unscrubbed_analytics_cookie(tmp_path: Path) -> None:
+    """End-to-end: the clean-gate FLAGS a cassette leaking ``_ga`` (folded scalar).
+
+    Builds a cassette whose request ``Cookie:`` header carries a scrubbed
+    session cookie alongside an UNSCRUBBED ``_ga`` analytics cookie, written
+    as a YAML list value (the recorded shape), and asserts the guard exits 1
+    and names the leak — proving the name-agnostic detection survives the
+    YAML-aware whole-file cookie pass too.
+    """
+    import yaml
+
+    cassette = {
+        "interactions": [
+            {
+                "request": {
+                    "body": "",
+                    "headers": {
+                        "Cookie": [f"SID=SCRUBBED; _ga={_GA_VALUE}; _gcl_au={_GCL_VALUE}"],
+                        "Host": ["notebooklm.google.com"],
+                    },
+                    "method": "GET",
+                    "uri": "https://notebooklm.google.com/",
+                },
+                "response": {
+                    "body": {"string": "{}"},
+                    "headers": {},
+                    "status": {"code": 200, "message": "OK"},
+                },
+            }
+        ],
+        "version": 1,
+    }
+    cassette_path = tmp_path / "leak_ga.yaml"
+    cassette_path.write_text(yaml.dump(cassette), encoding="utf-8")
+
+    result = _run_guard(str(cassette_path))
+    assert result.returncode == 1, (
+        f"guard failed to flag _ga leak:\n{result.stdout}\n{result.stderr}"
+    )
+    assert "_ga" in result.stdout, f"leak not named in report:\n{result.stdout}"

@@ -27,6 +27,12 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
+from notebooklm._auth.cookie_policy import (
+    build_cookie_domain_allowlist as _neutral_build_cookie_domain_allowlist,
+)
+from notebooklm._auth.cookie_policy import (
+    resolve_optional_cookie_domains as _neutral_resolve_optional_cookie_domains,
+)
 from notebooklm.auth import (
     ALLOWED_COOKIE_DOMAINS,
     OPTIONAL_COOKIE_DOMAINS,
@@ -35,18 +41,64 @@ from notebooklm.auth import (
     _is_allowed_cookie_domain,
     convert_rookiepy_cookies_to_storage_state,
 )
-from notebooklm.cli.session import (
+from notebooklm.cli.services.login import (
     _build_google_cookie_domains,
-    _parse_include_domains,
     _resolve_optional_cookie_domains,
 )
+from notebooklm.cli.session_cmd import _parse_include_domains
 from notebooklm.notebooklm_cli import cli
+from tests._fixtures import patch_session_login_dual
+
+
+class TestNeutralBuilderMatchesCliBuilder:
+    """Drift canary: the neutral cookie-domain builder in
+    ``notebooklm._auth.cookie_policy`` (consumed by the Playwright
+    browser-capture filter) must stay equivalent to the CLI extractor builder
+    ``cli.services.login._build_google_cookie_domains`` (consumed by the
+    rookiepy / Firefox paths). Both derive from the same shared constants; this
+    pins that they never silently diverge, so the on-disk ``storage_state.json``
+    cookie set is identical regardless of which login path wrote it.
+    """
+
+    @pytest.mark.parametrize(
+        "include_optional, include_domains",
+        [
+            (False, None),
+            (True, None),
+            (False, set()),
+            (False, {"youtube"}),
+            (False, {"docs"}),
+            (False, {"myaccount"}),
+            (False, {"mail"}),
+            (False, {"youtube", "docs"}),
+            (False, {"youtube", "docs", "myaccount", "mail"}),
+            (False, {"all"}),
+        ],
+    )
+    def test_builders_produce_identical_domain_sets(self, include_optional, include_domains):
+        cli_domains = _build_google_cookie_domains(
+            include_optional=include_optional, include_domains=include_domains
+        )
+        neutral_domains = _neutral_build_cookie_domain_allowlist(
+            include_optional=include_optional, include_domains=include_domains
+        )
+        # Order is not significant for the allowlist; compare as sets.
+        assert set(cli_domains) == set(neutral_domains)
+
+    @pytest.mark.parametrize(
+        "labels",
+        [set(), {"youtube"}, {"docs", "mail"}, {"all"}],
+    )
+    def test_optional_resolvers_match(self, labels):
+        assert _resolve_optional_cookie_domains(labels) == (
+            _neutral_resolve_optional_cookie_domains(labels)
+        )
 
 
 class TestRequiredVsOptional:
     """REQUIRED is empirically justified; OPTIONAL is opt-in only."""
 
-    def test_required_set_includes_core_auth_domains(self):
+    def test_required_set_includes_runtime_auth_domains(self):
         """Codex caution: host + dotted variants must both stay in REQUIRED."""
         for domain in (
             ".google.com",
@@ -474,7 +526,7 @@ class TestLoginCliFlag:
         monkeypatch.delenv("NOTEBOOKLM_AUTH_JSON", raising=False)
         runner = CliRunner()
 
-        with patch("notebooklm.cli.session._login_browser_cookies_single") as login_single:
+        with patch_session_login_dual("_login_browser_cookies_single") as login_single:
             result = runner.invoke(
                 cli,
                 [
@@ -496,7 +548,7 @@ class TestLoginCliFlag:
         monkeypatch.delenv("NOTEBOOKLM_AUTH_JSON", raising=False)
         runner = CliRunner()
 
-        with patch("notebooklm.cli.session._login_browser_cookies_single"):
+        with patch_session_login_dual("_login_browser_cookies_single"):
             result = runner.invoke(
                 cli,
                 ["login", "--browser-cookies", "chrome"],
@@ -510,7 +562,7 @@ class TestLoginCliFlag:
         monkeypatch.delenv("NOTEBOOKLM_AUTH_JSON", raising=False)
         runner = CliRunner()
 
-        with patch("notebooklm.cli.session._login_browser_cookies_single"):
+        with patch_session_login_dual("_login_browser_cookies_single"):
             result = runner.invoke(
                 cli,
                 [
@@ -575,7 +627,7 @@ class TestAuthRefreshCliFlag:
         monkeypatch.setenv("NOTEBOOKLM_HOME", str(tmp_path))
         runner = CliRunner()
 
-        with patch("notebooklm.cli.session._refresh_from_browser_cookies") as helper:
+        with patch_session_login_dual("_refresh_from_browser_cookies") as helper:
             result = runner.invoke(
                 cli,
                 [
@@ -606,7 +658,7 @@ class TestAuthInspectCliFlag:
         """``--include-domains=youtube`` reaches ``_enumerate_browser_accounts``."""
         runner = CliRunner()
 
-        with patch("notebooklm.cli.session._enumerate_browser_accounts") as enum:
+        with patch_session_login_dual("_enumerate_browser_accounts") as enum:
             enum.return_value = ([], [])
             result = runner.invoke(
                 cli,

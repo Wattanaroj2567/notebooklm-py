@@ -5,7 +5,7 @@ This script makes minimal API calls to exercise RPC methods and verify
 that the method IDs in rpc/types.py still match what the API returns.
 
 Exit codes:
-    0 - All RPC methods OK (or only transient rate-limit errors)
+    0 - All RPC methods OK (or only transient errors: rate-limits / ReadTimeouts)
     1 - One or more RPC methods have mismatched IDs
     2 - Authentication or infrastructure failure (not an RPC problem)
     3 - One or more RPC methods returned a non-transient ERROR
@@ -16,9 +16,12 @@ Priority order when multiple statuses are present:
 
 Transient errors that still exit 0 are limited to rate-limit signals
 (HTTP 429, gRPC ``RESOURCE_EXHAUSTED``, and the decoder's user-displayable
-``API rate limit`` / quota messages raised as ``RateLimitError``).
-Everything else is treated as a real failure so the nightly canary can
-flag silent breakage.
+``API rate limit`` / quota messages raised as ``RateLimitError``) plus
+``httpx.ReadTimeout`` against Google's RPC endpoints — those are almost
+always server-side slowness, not an RPC contract change, and they
+consistently pass on retry (see #1004). Everything else (parse failures,
+unexpected HTTP status codes, schema mismatches) is still treated as a
+real failure so the nightly canary can flag silent breakage.
 
 Environment variables:
     NOTEBOOKLM_AUTH_JSON - Playwright storage state JSON (required)
@@ -48,6 +51,11 @@ from uuid import uuid4
 
 import httpx
 
+from notebooklm._artifact.payloads import build_retry_artifact_params
+from notebooklm._chat.wire import (
+    build_streaming_chat_request,
+    parse_streaming_chat_response,
+)
 from notebooklm._env import get_default_language
 from notebooklm._logging import scrub_secrets
 from notebooklm._notebooks import build_create_notebook_params
@@ -58,6 +66,7 @@ from notebooklm.auth import (
     get_authuser_for_storage,
     load_auth_from_storage,
 )
+from notebooklm.exceptions import ChatError, ChatResponseParseError, DecodingError
 from notebooklm.paths import get_storage_path
 from notebooklm.rpc import (
     RPCError,
@@ -72,6 +81,7 @@ from notebooklm.rpc.decoder import (
     parse_chunked_response,
     strip_anti_xssi,
 )
+from notebooklm.rpc.types import _QUERY_ENDPOINT_PATH
 
 
 class CheckStatus(str, Enum):
@@ -269,7 +279,9 @@ async def make_rpc_request(
     except httpx.HTTPStatusError as e:
         return None, f"HTTP {e.response.status_code}"
     except httpx.RequestError as e:
-        return None, str(e)
+        # ``httpx.ReadTimeout`` can stringify to ``""``; fall back to the
+        # class name so callers don't mislabel it as an empty response (#864).
+        return None, str(e) or type(e).__name__
 
 
 async def make_rpc_call(
@@ -292,7 +304,7 @@ async def make_rpc_call(
         Tuple of (list of RPC IDs found in response, error message or None)
     """
     response_text, error = await make_rpc_request(client, auth, method, params, source_path)
-    if error:
+    if error is not None:
         return [], error
     if response_text is None:
         return [], "Empty response from server"
@@ -343,7 +355,7 @@ async def test_rpc_method(
         status=CheckStatus.ERROR,
         expected_id=expected_id,
         found_ids=found_ids,
-        error=error or "RPC ID not found in response",
+        error=error if error is not None else "RPC ID not found in response",
     )
 
 
@@ -371,7 +383,7 @@ async def test_rpc_method_with_data(
     expected_id = method.value
 
     response_text, error = await make_rpc_request(client, auth, method, params, source_path)
-    if error:
+    if error is not None:
         return CheckResult(
             method=method,
             status=CheckStatus.ERROR,
@@ -505,6 +517,13 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
     if method == RPCMethod.LIST_ARTIFACTS:
         return [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
 
+    # LIST_LABELS: list a notebook's source labels (read-only; OPTS wrapper + nb id)
+    if method == RPCMethod.LIST_LABELS:
+        return [
+            [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+            notebook_id,
+        ]
+
     # Notebook operations (read-only - rename to same name is a no-op)
     if method == RPCMethod.RENAME_NOTEBOOK:
         return [notebook_id, "RPC Health Check Test", None, None, None]
@@ -537,6 +556,13 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
         # Params: [[2], artifact_id, [[[slide_index, prompt]]]]
         # Will fail with placeholder artifact_id but still echoes method ID in error response
         return [[2], "placeholder_artifact_id", [[[0, "RPC health check test"]]]]
+
+    if method == RPCMethod.RETRY_ARTIFACT:
+        # Params: [retry_options, artifact_id]. The placeholder artifact_id
+        # matches no real artifact, so this is a safe liveness probe (no
+        # actual retry is kicked off) that still echoes the method ID in the
+        # error response — same posture as REVISE_SLIDE/RENAME_ARTIFACT above.
+        return build_retry_artifact_params("placeholder_artifact_id")
 
     # Research operations (read-only - poll/import only)
     if method == RPCMethod.POLL_RESEARCH:
@@ -630,7 +656,7 @@ async def check_method(
     # Make the call
     found_ids, error = await make_rpc_call(client, auth, method, params)
 
-    if error:
+    if error is not None:
         # Check if error response still contains our expected ID
         if expected_id in found_ids:
             return CheckResult(
@@ -660,6 +686,142 @@ async def check_method(
     )
 
 
+@dataclass
+class _ChatQueryProbe:
+    """Method-like sentinel for the ``GenerateFreeFormStreamed`` chat probe.
+
+    The streamed-chat orchestration endpoint is NOT a batchexecute RPC ID — it
+    is a ``PATH_NOT_METHOD`` ``v1`` URL segment (see ``_QUERY_ENDPOINT_PATH`` in
+    ``rpc/types.py``), so it has no :class:`RPCMethod` enum member and cannot be
+    probed by ``make_rpc_call``/``check_method`` like the obfuscated method IDs.
+    This ducktype gives the probe's :class:`CheckResult` the ``.name`` /
+    ``.value`` attributes that ``print_summary`` / ``format_check_output`` /
+    ``partition_errors`` read, so the chat result flows through the existing
+    summary + exit-code machinery unchanged (an ``ERROR`` here is classified
+    and reported as drift exactly like a method-ID probe).
+    """
+
+    name: str = "GENERATE_FREE_FORM_STREAMED"
+    value: str = _QUERY_ENDPOINT_PATH
+
+
+# Singleton sentinel reused for every chat-probe CheckResult.
+CHAT_QUERY_PROBE = _ChatQueryProbe()
+
+
+async def check_chat_query(
+    client: httpx.AsyncClient,
+    auth: AuthTokens,
+    notebook_id: str | None,
+) -> CheckResult:
+    """Probe the streamed-chat ``GenerateFreeFormStreamed`` orchestration RPC.
+
+    This is the chat surface's drift canary. Unlike the batchexecute method-ID
+    probes, the chat endpoint is a hardcoded ``v1`` path with no obfuscated RPC
+    ID to echo back, so liveness is asserted on the *wire shape* instead: issue
+    one minimal request and require an HTTP 200 plus a recognizable stream frame
+    (a ``wrb.fr`` envelope or a server ``"er"`` frame).
+
+    Classification mirrors the method-ID probes:
+
+    * Parseable stream (an answer, or a server-side ``ChatError`` frame the
+      parser recognizes — including a rate-limit / rejected frame) -> ``OK``:
+      the wire contract is intact, the server merely declined this request.
+    * Zero parseable chunks (:class:`ChatResponseParseError`) -> ``ERROR``: the
+      response body was empty or the wire format drifted. This is the schema
+      drift the canary exists to catch.
+    * Non-200 / transport failure -> ``ERROR`` (rate-limit / ReadTimeout text is
+      still classified as transient downstream by ``is_transient_error``).
+
+    Skipped when no notebook ID is configured (the request needs one for
+    server-side conversation persistence).
+    """
+    if not notebook_id:
+        return CheckResult(
+            method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
+            status=CheckStatus.SKIPPED,
+            expected_id=CHAT_QUERY_PROBE.value,
+            found_ids=[],
+            error="No notebook ID provided (chat probe needs one)",
+        )
+
+    url, body, extra_headers = build_streaming_chat_request(
+        snapshot=auth,
+        notebook_id=notebook_id,
+        question="RPC health check ping.",
+        source_ids=[],
+        conversation_history=None,
+        conversation_id=None,
+        reqid=int(uuid4().int % 1_000_000),
+    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie": auth.cookie_header,
+        **extra_headers,
+    }
+
+    try:
+        response = await client.post(url, content=body, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return CheckResult(
+            method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
+            status=CheckStatus.ERROR,
+            expected_id=CHAT_QUERY_PROBE.value,
+            found_ids=[],
+            error=f"HTTP {e.response.status_code}",
+        )
+    except httpx.RequestError as e:
+        # ``httpx.ReadTimeout`` can stringify to ``""``; fall back to the class
+        # name so the downstream transient classifier (and the operator) sees a
+        # usable signal — same posture as ``make_rpc_request`` (#864).
+        return CheckResult(
+            method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
+            status=CheckStatus.ERROR,
+            expected_id=CHAT_QUERY_PROBE.value,
+            found_ids=[],
+            error=str(e) or type(e).__name__,
+        )
+
+    try:
+        parse_streaming_chat_response(response.text)
+    except (ChatResponseParseError, DecodingError, json.JSONDecodeError) as e:
+        # Zero parseable chunks (empty/drifted body), a structurally malformed
+        # JSON body (``json.JSONDecodeError`` — a ``ValueError`` subclass we
+        # catch specifically so a bare ``ValueError`` from a real bug still
+        # propagates), OR strict positional drift raising DecodingError /
+        # UnknownRPCMethodError from the wire decoder: all are the schema-drift
+        # signal the canary exists to surface. Catch them here so a drifted
+        # response returns a clean ERROR result rather than crashing the canary.
+        return CheckResult(
+            method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
+            status=CheckStatus.ERROR,
+            expected_id=CHAT_QUERY_PROBE.value,
+            found_ids=[],
+            error=f"Parse error: {e}",
+        )
+    except ChatError as e:
+        # A recognized server-side ``"er"`` / rate-limit frame: the wire shape
+        # is INTACT (the parser identified the frame), the server simply
+        # declined this request. Treat as OK — the contract is healthy. The
+        # message is preserved for the operator (and so a rate-limit frame
+        # stays visible), but it does not fail the canary.
+        return CheckResult(
+            method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
+            status=CheckStatus.OK,
+            expected_id=CHAT_QUERY_PROBE.value,
+            found_ids=[CHAT_QUERY_PROBE.value],
+            error=f"Server declined (recognized frame): {e}",
+        )
+
+    return CheckResult(
+        method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
+        status=CheckStatus.OK,
+        expected_id=CHAT_QUERY_PROBE.value,
+        found_ids=[CHAT_QUERY_PROBE.value],
+    )
+
+
 async def setup_temp_resources(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -669,7 +831,8 @@ async def setup_temp_resources(
 
     Tests CREATE_NOTEBOOK, ADD_SOURCE, ADD_SOURCE_FILE, START_FAST_RESEARCH,
     CREATE_NOTE, and CREATE_ARTIFACT RPC methods.
-    Polls for artifact completion before testing DELETE_ARTIFACT in cleanup.
+    Gives artifact generation a short grace period before testing DELETE_ARTIFACT
+    in cleanup.
     """
     temp = TempResources()
 
@@ -839,18 +1002,20 @@ async def setup_temp_resources(
                 preview = scrub_secrets(repr(data))[:200]
                 print(f"  WARNING: CREATE_ARTIFACT ID extraction failed. Response: {preview}")
 
-        # Poll for artifact completion
+        # Probe LIST_ARTIFACTS briefly so artifact generation gets a grace
+        # period before DELETE_ARTIFACT cleanup.
         if temp.artifact_id:
-            # Poll up to 30 seconds for flashcard generation to complete
+            # Probe for up to 30 seconds before cleanup.
             max_polls = 15
             poll_interval = 2.0
-            artifact_ready = False
+            artifact_list_live = False
             polls_done = 0
 
             for _ in range(max_polls):
                 await asyncio.sleep(poll_interval)
                 polls_done += 1
-                # Use LIST_ARTIFACTS and find by ID (no poll-by-ID RPC exists)
+                # LIST_ARTIFACTS is the available liveness probe; there is no
+                # poll-by-ID RPC here.
                 poll_result = await test_rpc_method(
                     client,
                     auth,
@@ -858,17 +1023,18 @@ async def setup_temp_resources(
                     [[2], temp.notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"'],
                     source_path=f"/notebook/{temp.notebook_id}",
                 )
-                # Check if status indicates completion (status code 3 = ready)
-                # We don't add poll results to avoid cluttering output
+                # We only need the method to succeed; poll results are omitted
+                # to keep output focused on the primary checks.
                 if poll_result.status == CheckStatus.OK:
-                    artifact_ready = True
+                    artifact_list_live = True
                     break
 
-            if artifact_ready:
-                print(f"  Artifact ready after {polls_done * poll_interval:.0f}s polling")
+            if artifact_list_live:
+                print(f"  Artifact list live after {polls_done * poll_interval:.0f}s polling")
             else:
                 print(
-                    f"  Artifact not ready after {max_polls * poll_interval:.0f}s (continuing anyway)"
+                    f"  Artifact list not live after {max_polls * poll_interval:.0f}s "
+                    "(continuing anyway)"
                 )
     else:
         # Skip artifact tests - no source_id available
@@ -1023,6 +1189,19 @@ async def run_health_check(full_mode: bool = False) -> list[CheckResult]:
                 if i < total and result.status != CheckStatus.SKIPPED:
                     await asyncio.sleep(CALL_DELAY)
 
+            # Probe the streamed-chat orchestration RPC. It is not an
+            # ``RPCMethod`` (it is a ``PATH_NOT_METHOD`` ``v1`` URL segment),
+            # so it is checked separately from the method-ID loop above — but
+            # its ``CheckResult`` flows through the same summary + exit-code
+            # machinery so chat drift fails the canary like any other probe.
+            chat_result = await check_chat_query(client, auth, notebook_id)
+            results.append(chat_result)
+            chat_icon = STATUS_ICONS[chat_result.status]
+            chat_line = f"{chat_icon:8} {chat_result.method.name} ({chat_result.expected_id})"
+            if chat_result.error and chat_result.status != CheckStatus.OK:
+                chat_line += f" - {scrub_secrets(chat_result.error)}"
+            print(chat_line)
+
         finally:
             if full_mode and temp_resources.notebook_id:
                 print()
@@ -1032,31 +1211,48 @@ async def run_health_check(full_mode: bool = False) -> list[CheckResult]:
     return results
 
 
-# Substrings that mark an ERROR as a transient rate-limit signal.
-# These are the ONLY errors that count as transient — everything else
-# (timeouts, parse failures, unexpected HTTP errors) is treated as a real
-# failure so the nightly canary can flag silent breakage. Keep this list
+# Substrings that mark an ERROR as a transient signal. Keep this list
 # narrow on purpose: broadening it would mask real RPC drift.
 #
-# ``API rate limit`` catches the decoder's user-displayable messages
-# raised as ``RateLimitError`` ("API rate limit exceeded..." and
-# "API rate limit or quota exceeded..."). These reach the canary via the
-# ``except RPCError`` parse-error branch in ``test_rpc_method_with_data``
-# and were previously misclassified as non-transient.
+# Currently classified as transient:
+#   * ``HTTP 429`` and gRPC ``RESOURCE_EXHAUSTED`` — explicit rate-limit
+#     signals from the backend.
+#   * ``API rate limit`` — catches the decoder's user-displayable messages
+#     raised as ``RateLimitError`` ("API rate limit exceeded..." and
+#     "API rate limit or quota exceeded..."). These reach the canary via
+#     the ``except RPCError`` parse-error branch in
+#     ``test_rpc_method_with_data`` and were previously misclassified.
+#   * ``ReadTimeout`` — ``httpx.ReadTimeout`` against Google's RPC
+#     endpoints is almost always server-side slowness, not an RPC
+#     contract change. It consistently passes on retry (see #1004 and
+#     prior occurrences on 2026-05-20). Only the ``httpx.ReadTimeout``
+#     class name is treated as transient — ``ConnectTimeout`` /
+#     ``WriteTimeout`` / ``PoolTimeout`` stay non-transient because they
+#     point at client- or network-side problems worth surfacing.
+#
+# Everything else (other timeouts, parse failures, unexpected HTTP
+# status codes, schema mismatches) is still treated as a real failure
+# so the nightly canary can flag silent breakage.
 TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
     "HTTP 429",
     "RESOURCE_EXHAUSTED",
     "API rate limit",
+    "ReadTimeout",
 )
 
 
 def is_transient_error(error_message: str | None) -> bool:
-    """Return True if an ERROR result is a transient rate-limit signal.
+    """Return True if an ERROR result is a transient signal.
 
-    Rate-limit responses (HTTP 429, gRPC ``RESOURCE_EXHAUSTED``) are the
-    only errors classified as transient. They are expected on throttled
-    days and should not trip the canary. Anything else — timeouts, parse
-    failures, unexpected HTTP errors — is treated as a real failure.
+    Transient signals (filtered out of the auto-open path):
+      * Rate-limit responses (HTTP 429, gRPC ``RESOURCE_EXHAUSTED``,
+        decoder ``RateLimitError`` messages).
+      * ``httpx.ReadTimeout`` against Google's RPC endpoints — these
+        are server-side flakes that pass on retry (issue #1004).
+
+    Anything else — other timeouts, parse failures, unexpected HTTP
+    status codes — is treated as a real failure that warrants
+    investigation.
     """
     if not error_message:
         return False
@@ -1165,7 +1361,7 @@ def print_summary(results: list[CheckResult]) -> int:
         print("       These are real failures (not rate-limit transients).")
         return 3
     if transient_errors:
-        print("RESULT: PASS - Only transient rate-limit errors observed")
+        print("RESULT: PASS - Only transient errors observed (rate-limits / ReadTimeouts)")
         print("       Review ERROR DETAILS above for affected methods.")
         return 0
     print("RESULT: PASS - All tested RPC methods OK")

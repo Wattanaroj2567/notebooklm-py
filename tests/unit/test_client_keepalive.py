@@ -8,8 +8,10 @@ import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+import notebooklm._auth.keepalive as _auth_keepalive
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 ROTATE_URL_RE = re.compile(r"^https://accounts\.google\.com/RotateCookies$")
 
@@ -74,13 +76,36 @@ async def _wait_until_storage_contains(storage_path, needle: str, failure_messag
     pytest.fail(failure_message)
 
 
+def _rotate_requests(httpx_mock: HTTPXMock) -> list[httpx.Request]:
+    return [r for r in httpx_mock.get_requests() if ROTATE_URL_RE.match(str(r.url))]
+
+
+async def _wait_for_rotate_requests(
+    httpx_mock: HTTPXMock,
+    *,
+    minimum: int,
+    failure_message: str,
+) -> None:
+    """Wait until the background keepalive task has emitted RotateCookies requests."""
+    requests: list[httpx.Request] = []
+    for _ in range(50):
+        requests = _rotate_requests(httpx_mock)
+        if len(requests) >= minimum:
+            return
+        await asyncio.sleep(0.05)
+
+    requests = _rotate_requests(httpx_mock)
+    if len(requests) < minimum:
+        pytest.fail(f"{failure_message}; got {len(requests)}")
+
+
 class TestKeepaliveDisabledByDefault:
     @pytest.mark.asyncio
     async def test_keepalive_off_by_default(self, mock_auth, httpx_mock: HTTPXMock):
         """No keepalive task is spawned and no extra HTTP calls fire by default."""
         client = NotebookLMClient(mock_auth)
         async with client:
-            assert client._core._keepalive_task is None
+            assert client._collaborators.lifecycle._keepalive_task is None
             # Give the loop a chance to run; nothing should happen
             await asyncio.sleep(0.1)
 
@@ -108,12 +133,12 @@ class TestKeepaliveLifecycle:
         )
 
         async with client:
-            task = client._core._keepalive_task
+            task = client._collaborators.lifecycle._keepalive_task
             assert task is not None
             assert not task.done()
 
         # Task should be cleaned up; no warnings should be raised.
-        assert client._core._keepalive_task is None
+        assert client._collaborators.lifecycle._keepalive_task is None
         # Either cancelled or finished; never left dangling.
         assert task.done()
 
@@ -127,7 +152,7 @@ class TestKeepaliveFloor:
             keepalive=10.0,
             keepalive_min_interval=60.0,
         )
-        assert client._core._keepalive_interval == 60.0
+        assert client._collaborators.lifecycle._keepalive_interval == 60.0
 
     @pytest.mark.asyncio
     async def test_floor_does_not_lower_higher_interval(self, mock_auth):
@@ -137,7 +162,7 @@ class TestKeepaliveFloor:
             keepalive=600.0,
             keepalive_min_interval=60.0,
         )
-        assert client._core._keepalive_interval == 600.0
+        assert client._collaborators.lifecycle._keepalive_interval == 600.0
 
     @pytest.mark.asyncio
     async def test_none_keeps_disabled(self, mock_auth):
@@ -147,7 +172,7 @@ class TestKeepaliveFloor:
             keepalive=None,
             keepalive_min_interval=60.0,
         )
-        assert client._core._keepalive_interval is None
+        assert client._collaborators.lifecycle._keepalive_interval is None
 
 
 class TestKeepaliveValidation:
@@ -176,9 +201,7 @@ class TestKeepalivePokes:
         the loop's pacing is the only thing being tested here.
         """
 
-        from _fixtures import patch_auth_seam
-
-        patch_auth_seam(monkeypatch, "_KEEPALIVE_RATE_LIMIT_SECONDS", 0.0)
+        monkeypatch.setattr(_auth_keepalive, "_KEEPALIVE_RATE_LIMIT_SECONDS", 0.0)
         httpx_mock.add_response(
             url=ROTATE_URL_RE,
             is_optional=True,
@@ -193,12 +216,11 @@ class TestKeepalivePokes:
         )
 
         async with client:
-            await asyncio.sleep(0.5)
-
-        poke_requests = [r for r in httpx_mock.get_requests() if "RotateCookies" in str(r.url)]
-        assert len(poke_requests) >= 2, (
-            f"Expected at least 2 keepalive pokes, got {len(poke_requests)}"
-        )
+            await _wait_for_rotate_requests(
+                httpx_mock,
+                minimum=2,
+                failure_message="Expected at least 2 keepalive pokes",
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.no_default_keepalive_mock
@@ -210,9 +232,7 @@ class TestKeepalivePokes:
         attempt by the in-process claim.
         """
 
-        from _fixtures import patch_auth_seam
-
-        patch_auth_seam(monkeypatch, "_KEEPALIVE_RATE_LIMIT_SECONDS", 0.0)
+        monkeypatch.setattr(_auth_keepalive, "_KEEPALIVE_RATE_LIMIT_SECONDS", 0.0)
         # First poke: connection error. Subsequent pokes: 204.
         httpx_mock.add_exception(
             url=ROTATE_URL_RE,
@@ -232,16 +252,19 @@ class TestKeepalivePokes:
         )
 
         async with client:
-            await asyncio.sleep(0.4)
+            await _wait_for_rotate_requests(
+                httpx_mock,
+                minimum=1,
+                failure_message="Expected first keepalive poke",
+            )
             # Task is still running after the failure
-            assert client._core._keepalive_task is not None
-            assert not client._core._keepalive_task.done()
-
-        poke_requests = [r for r in httpx_mock.get_requests() if "RotateCookies" in str(r.url)]
-        # First call raised; at least one further successful call must follow.
-        assert len(poke_requests) >= 2, (
-            f"Loop should have retried after failure; got {len(poke_requests)} pokes"
-        )
+            assert client._collaborators.lifecycle._keepalive_task is not None
+            assert not client._collaborators.lifecycle._keepalive_task.done()
+            await _wait_for_rotate_requests(
+                httpx_mock,
+                minimum=2,
+                failure_message="Loop should have retried after failure",
+            )
 
 
 class TestKeepalivePersistenceFailure:
@@ -266,12 +289,14 @@ class TestKeepalivePersistenceFailure:
             save_calls.append(path)
             raise OSError("simulated disk full")
 
-        monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", boom)
-
+        # Phase 2 PR 4: inject the cookie-saver seam directly at the client
+        # constructor rather than monkeypatching the legacy
+        # ``notebooklm._core.save_cookies_to_storage`` indirection.
         client = NotebookLMClient(
             auth,
             keepalive=0.05,
             keepalive_min_interval=0.01,
+            cookie_saver=boom,
         )
 
         with caplog.at_level("WARNING", logger="notebooklm._core"):
@@ -348,8 +373,8 @@ class TestKeepaliveExplicitStoragePath:
 
     def test_explicit_storage_path_normalizes_onto_auth_without_mutating_caller(self, tmp_path):
         """The constructor exposes ``storage_path`` on ``client.auth`` so
-        ``refresh_auth()`` and ``ClientCore.close()`` (which read
-        ``self._core.auth.storage_path`` directly, not the keepalive-specific
+        ``refresh_auth()`` and ``NotebookLMClient.close()`` (which read
+        ``self._auth.storage_path`` directly, not the keepalive-specific
         path) persist to the same file. Crucially, the caller's original
         ``AuthTokens`` is *not* mutated, so reusing one ``AuthTokens`` across
         multiple ``NotebookLMClient`` instances with different storage paths
@@ -369,7 +394,7 @@ class TestKeepaliveExplicitStoragePath:
 
         assert client.auth.storage_path == storage_path, (
             "Explicit storage_path must be reflected on client.auth so non-keepalive "
-            "code paths (refresh_auth, ClientCore.close) see the same file"
+            "code paths (refresh_auth, NotebookLMClient.close) see the same file"
         )
         assert auth.storage_path is None, (
             "Caller's AuthTokens must not be mutated — sharing one AuthTokens "
@@ -378,10 +403,8 @@ class TestKeepaliveExplicitStoragePath:
 
     @pytest.mark.asyncio
     @pytest.mark.no_default_keepalive_mock
-    async def test_close_persists_to_explicit_storage_path(
-        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
-    ):
-        """``ClientCore.close()`` calls ``save_cookies_to_storage`` with the
+    async def test_close_persists_to_explicit_storage_path(self, tmp_path, httpx_mock: HTTPXMock):
+        """``NotebookLMClient.close()`` calls ``save_cookies_to_storage`` with the
         explicit constructor ``storage_path`` even when keepalive never ran
         and ``auth.storage_path`` was ``None`` originally — proving the
         normalization actually wires the on-close save, not just the
@@ -401,9 +424,8 @@ class TestKeepaliveExplicitStoragePath:
         def spy(cookies, path, **kwargs):
             save_calls.append((cookies, path))
 
-        monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", spy)
-
-        client = NotebookLMClient(auth, storage_path=storage_path)
+        # Phase 2 PR 4: inject the cookie-saver seam directly.
+        client = NotebookLMClient(auth, storage_path=storage_path, cookie_saver=spy)
         async with client:
             pass  # no RPC calls; keepalive disabled by default
 
@@ -456,15 +478,15 @@ class TestKeepalivePersistence:
 
 
 class TestSaveCookiesUnification:
-    """Tests for ClientCore.save_cookies — the single chokepoint that close,
+    """Tests for NotebookLMClient.save_cookies — the single chokepoint that close,
     keepalive, and refresh_auth all route through."""
 
     @pytest.mark.asyncio
-    async def test_save_cookies_takes_in_process_lock_before_writing(self, tmp_path, monkeypatch):
-        """``ClientCore.save_cookies`` holds ``_save_lock`` for the duration of
+    async def test_save_cookies_takes_in_process_lock_before_writing(self, tmp_path):
+        """``NotebookLMClient.save_cookies`` holds ``_save_lock`` for the duration of
         the worker-thread write, so an older snapshot can't clobber a newer one
         within the same process."""
-        from notebooklm._core import ClientCore
+        from notebooklm.client import NotebookLMClient
 
         auth = AuthTokens(
             cookies={"SID": "x", "__Secure-1PSIDTS": "test_1psidts"},
@@ -473,26 +495,33 @@ class TestSaveCookiesUnification:
             storage_path=tmp_path / "storage_state.json",
         )
         (tmp_path / "storage_state.json").write_text('{"cookies": []}')
-        core = ClientCore(auth)
 
         lock_held_during_save: list[bool] = []
         call_kwargs: list[dict] = []
+        core_ref: dict[str, NotebookLMClient] = {}
 
         def spy(jar, path, **kwargs):
             """Record lock state and the kwargs.
 
             Capturing ``kwargs`` here is the regression guard for the §3.4.1
-            fix: if ``ClientCore.save_cookies`` ever stops threading
+            fix: if ``NotebookLMClient.save_cookies`` ever stops threading
             ``original_snapshot=`` through, the assertion below catches it
             before production silently reverts to legacy merge.
             """
-            lock_held_during_save.append(core._save_lock.locked())
+            lock_held_during_save.append(
+                core_ref["core"]._collaborators.cookie_persistence.save_lock.locked()
+            )
             call_kwargs.append(kwargs)
             return True
 
-        monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", spy)
+        # Phase 2 PR 4: inject the cookie-saver seam at construction.
+        core = build_client_shell_for_tests(auth, cookie_saver=spy)
+        core_ref["core"] = core
 
-        await core.save_cookies(httpx.Cookies())
+        await core._collaborators.lifecycle.save_cookies(
+            core._collaborators.cookie_persistence,
+            httpx.Cookies(),
+        )
 
         assert lock_held_during_save == [True], (
             "save_cookies must hold _save_lock for the duration of "
@@ -505,10 +534,10 @@ class TestSaveCookiesUnification:
 
     @pytest.mark.asyncio
     async def test_refresh_auth_routes_save_through_save_cookies(
-        self, tmp_path, monkeypatch, httpx_mock: HTTPXMock
+        self, tmp_path, httpx_mock: HTTPXMock
     ):
         """``refresh_auth`` no longer calls ``save_cookies_to_storage`` directly;
-        it routes through ``ClientCore.save_cookies`` so the in-process lock is
+        it routes through ``NotebookLMClient.save_cookies`` so the in-process lock is
         held — preventing an older keepalive snapshot from clobbering the
         freshly-refreshed tokens."""
         storage_path = tmp_path / "storage_state.json"
@@ -545,10 +574,9 @@ class TestSaveCookiesUnification:
             content=b'<html><script>window.WIZ_global_data={"SNlM0e":"new_csrf","FdrFJe":"new_sid"};</script></html>',
         )
 
-        client = NotebookLMClient(auth)
-
         save_calls: list[bool] = []
         snapshot_kwarg_present: list[bool] = []
+        client_ref: dict[str, NotebookLMClient] = {}
 
         def spy(jar, path, **kwargs):
             """Record whether ``_save_lock`` is held when refresh_auth's save fires
@@ -558,11 +586,15 @@ class TestSaveCookiesUnification:
             must route through the snapshot/delta path, never the legacy
             full-merge path.
             """
-            save_calls.append(client._core._save_lock.locked())
+            save_calls.append(
+                client_ref["client"]._collaborators.cookie_persistence.save_lock.locked()
+            )
             snapshot_kwarg_present.append("original_snapshot" in kwargs)
             return True
 
-        monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", spy)
+        # Phase 2 PR 4: inject the cookie-saver seam at construction.
+        client = NotebookLMClient(auth, cookie_saver=spy)
+        client_ref["client"] = client
 
         async with client:
             await client.refresh_auth()

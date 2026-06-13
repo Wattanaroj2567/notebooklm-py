@@ -1,5 +1,7 @@
 """Unit tests for sharing types and API."""
 
+from typing import Any
+
 import pytest
 
 from notebooklm.rpc.types import ShareAccess, SharePermission, ShareViewLevel
@@ -67,6 +69,37 @@ class TestSharedUser:
 
         assert user.email == ""
         assert user.permission == SharePermission.VIEWER
+
+    def test_from_api_response_malformed_email_warns(self, caplog):
+        """A present-but-non-str email slot fabricates ``""`` LOUDLY (#1485).
+
+        The degrade is kept (a raising entry parser would abort the whole
+        shared-user list), but the fabricated empty email now leaves a
+        WARNING with a bounded payload preview instead of silently flowing a
+        non-string into ``SharedUser.email``.
+        """
+        import logging
+
+        data = [12345, 2]
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            user = SharedUser.from_api_response(data)
+
+        assert user.email == ""
+        assert any(
+            r.levelno == logging.WARNING and "email slot malformed" in r.message
+            for r in caplog.records
+        )
+
+    def test_from_api_response_null_email_is_silent_empty(self, caplog):
+        """A ``None`` email slot is absence, not drift — silent ``""`` degrade."""
+        import logging
+
+        data = [None, 2]
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            user = SharedUser.from_api_response(data)
+
+        assert user.email == ""
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
     def test_from_api_response_partial_user_info(self):
         """Test parsing with partial user info (only name, no avatar)."""
@@ -146,6 +179,114 @@ class TestShareStatus:
         assert status.access == ShareAccess.RESTRICTED
 
 
+def _legacy_shared_user_from_api_response(data: list[Any]) -> dict[str, Any]:
+    """Verbatim copy of the PRE-DRAIN ``SharedUser.from_api_response`` decode.
+
+    Mirrors the hand-rolled ``data[i]`` reads that the ``safe_index`` migration
+    replaced, so the differential test below can prove byte-for-byte parity on
+    present / empty / too-short / malformed inputs. Returns only the decoded
+    fields (no warning side-effect) as a dict.
+    """
+    email = ""
+    if data:
+        raw_email = data[0]
+        if isinstance(raw_email, str):
+            email = raw_email
+    perm_value = data[1] if len(data) > 1 else 3
+    try:
+        permission = SharePermission(perm_value)
+    except (TypeError, ValueError):
+        permission = SharePermission.VIEWER
+
+    display_name = None
+    avatar_url = None
+    if len(data) > 3 and isinstance(data[3], list):
+        user_info = data[3]
+        display_name = user_info[0] if user_info else None
+        avatar_url = user_info[1] if len(user_info) > 1 else None
+
+    return {
+        "email": email,
+        "permission": permission,
+        "display_name": display_name,
+        "avatar_url": avatar_url,
+    }
+
+
+def _legacy_share_status_from_api_response(data: list[Any], notebook_id: str) -> dict[str, Any]:
+    """Verbatim copy of the PRE-DRAIN ``ShareStatus.from_api_response`` decode.
+
+    Only the positionally-decoded fields (``is_public`` and the parsed
+    shared-user count) are returned — enough to assert parity against the
+    ``safe_index`` migration without re-deriving the URL/access logic, which
+    flows deterministically from ``is_public``.
+    """
+    users: list[Any] = []
+    if data and isinstance(data[0], list):
+        for user_data in data[0]:
+            if isinstance(user_data, list):
+                users.append(user_data)
+
+    is_public = False
+    public_block = data[1] if len(data) > 1 and isinstance(data[1], list) else None
+    if public_block:
+        is_public = bool(public_block[0])
+
+    return {"is_public": is_public, "user_count": len(users)}
+
+
+# Inputs spanning present / empty / too-short / malformed shapes. The
+# ``safe_index`` migration must decode each identically to the legacy logic
+# above — soft reads stay soft (each ``safe_index`` sits after the guard that
+# proves its slot present, so it never raises on these).
+_SHARED_USER_DIFFERENTIAL_INPUTS: list[Any] = [
+    ["user@example.com", 3, [], ["Name", "https://avatar"]],  # full
+    ["user@example.com", 2, []],  # minimal (no user_info slot)
+    ["user@example.com", 3, [], ["Just Name"]],  # partial user_info (no avatar)
+    ["user@example.com", 99, []],  # unknown permission
+    ["user@example.com", {"k": 1}, []],  # malformed (unhashable) permission
+    [],  # empty
+    [None, 2],  # null email slot
+    [12345, 2],  # malformed (non-str) email slot
+    ["only-email"],  # too-short (no permission slot)
+    ["e", 2, [], []],  # empty user_info list
+    ["e", 2, [], "not-a-list"],  # slot 3 present but non-list
+]
+
+_SHARE_STATUS_DIFFERENTIAL_INPUTS: list[Any] = [
+    [[["owner@example.com", 1, [], ["Owner", "a"]]], [True], 1000],  # public, 1 user
+    [[["o@e.com", 1, []], ["e@e.com", 2, []]], [False], 1000],  # private, 2 users
+    [[], [False], 1000],  # empty users
+    [[], [], 1000],  # empty is_public block
+    [[], [True], 1000],  # public, no users
+    [],  # fully empty payload
+    [[]],  # only users slot present (too-short)
+    ["not-a-list", [True]],  # users slot non-list
+    [[], "not-a-list", 1000],  # is_public slot non-list
+    [[None, "x"], [True]],  # a non-list user entry is skipped
+]
+
+
+class TestSharingDecodeDifferential:
+    """``safe_index`` migration preserves the legacy positional-decode semantics."""
+
+    @pytest.mark.parametrize("data", _SHARED_USER_DIFFERENTIAL_INPUTS)
+    def test_shared_user_matches_legacy(self, data: Any) -> None:
+        legacy = _legacy_shared_user_from_api_response(data)
+        actual = SharedUser.from_api_response(data)
+        assert actual.email == legacy["email"]
+        assert actual.permission == legacy["permission"]
+        assert actual.display_name == legacy["display_name"]
+        assert actual.avatar_url == legacy["avatar_url"]
+
+    @pytest.mark.parametrize("data", _SHARE_STATUS_DIFFERENTIAL_INPUTS)
+    def test_share_status_matches_legacy(self, data: Any) -> None:
+        legacy = _legacy_share_status_from_api_response(data, "nb_diff")
+        actual = ShareStatus.from_api_response(data, "nb_diff")
+        assert actual.is_public == legacy["is_public"]
+        assert len(actual.shared_users) == legacy["user_count"]
+
+
 class TestShareEnums:
     """Tests for share-related enums."""
 
@@ -183,87 +324,91 @@ class TestSharingAPIValidation:
     @pytest.mark.asyncio
     async def test_add_user_rejects_owner_permission(self):
         """Test that add_user rejects OWNER permission."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from notebooklm._sharing import SharingAPI
+        from tests._fixtures.fake_core import make_fake_core
 
-        mock_core = MagicMock()
-        mock_core.rpc_call = AsyncMock()
+        mock_core = make_fake_core(rpc_call=AsyncMock())
         api = SharingAPI(mock_core)
 
         with pytest.raises(ValueError, match="Cannot assign OWNER permission"):
             await api.add_user("nb_123", "test@example.com", SharePermission.OWNER)
 
         # Verify no RPC call was made
-        mock_core.rpc_call.assert_not_called()
+        mock_core.rpc_executor.rpc_call.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_user_rejects_remove_permission(self):
         """Test that add_user rejects _REMOVE permission."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from notebooklm._sharing import SharingAPI
+        from tests._fixtures.fake_core import make_fake_core
 
-        mock_core = MagicMock()
-        mock_core.rpc_call = AsyncMock()
+        mock_core = make_fake_core(rpc_call=AsyncMock())
         api = SharingAPI(mock_core)
 
         with pytest.raises(ValueError, match="Use remove_user"):
             await api.add_user("nb_123", "test@example.com", SharePermission._REMOVE)
 
-        mock_core.rpc_call.assert_not_called()
+        mock_core.rpc_executor.rpc_call.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_user_accepts_editor_permission(self):
         """Test that add_user accepts EDITOR permission."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from notebooklm._sharing import SharingAPI
+        from tests._fixtures.fake_core import make_fake_core
 
-        mock_core = MagicMock()
         # Return empty list for share call, then mock get_status
-        mock_core.rpc_call = AsyncMock(
-            side_effect=[
-                [],  # SHARE_NOTEBOOK response
-                [  # GET_SHARE_STATUS response
-                    [["test@example.com", 2, [], ["Test", "https://avatar"]]],
-                    [False],
-                    1000,
-                ],
-            ]
+        mock_core = make_fake_core(
+            rpc_call=AsyncMock(
+                side_effect=[
+                    [],  # SHARE_NOTEBOOK response
+                    [  # GET_SHARE_STATUS response
+                        [["test@example.com", 2, [], ["Test", "https://avatar"]]],
+                        [False],
+                        1000,
+                    ],
+                ]
+            )
         )
         api = SharingAPI(mock_core)
 
         status = await api.add_user("nb_123", "test@example.com", SharePermission.EDITOR)
 
-        assert mock_core.rpc_call.call_count == 2
+        assert mock_core.rpc_executor.rpc_call.call_count == 2
         assert len(status.shared_users) == 1
         assert status.shared_users[0].permission == SharePermission.EDITOR
 
     @pytest.mark.asyncio
     async def test_add_user_accepts_viewer_permission(self):
         """Test that add_user accepts VIEWER permission (default)."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from notebooklm._sharing import SharingAPI
+        from tests._fixtures.fake_core import make_fake_core
 
-        mock_core = MagicMock()
-        mock_core.rpc_call = AsyncMock(
-            side_effect=[
-                [],  # SHARE_NOTEBOOK response
-                [  # GET_SHARE_STATUS response
-                    [["test@example.com", 3, [], ["Test", "https://avatar"]]],
-                    [False],
-                    1000,
-                ],
-            ]
+        mock_core = make_fake_core(
+            rpc_call=AsyncMock(
+                side_effect=[
+                    [],  # SHARE_NOTEBOOK response
+                    [  # GET_SHARE_STATUS response
+                        [["test@example.com", 3, [], ["Test", "https://avatar"]]],
+                        [False],
+                        1000,
+                    ],
+                ]
+            )
         )
         api = SharingAPI(mock_core)
 
         # Use default permission (VIEWER)
         status = await api.add_user("nb_123", "test@example.com")
 
-        assert mock_core.rpc_call.call_count == 2
+        assert mock_core.rpc_executor.rpc_call.call_count == 2
         assert status.shared_users[0].permission == SharePermission.VIEWER
 
 

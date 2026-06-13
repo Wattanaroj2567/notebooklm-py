@@ -35,12 +35,14 @@
 
 📥 **Downloads & Export** - Download all generated artifacts locally (MP3, MP4, PDF, PNG, CSV, JSON, Markdown). Export to Google Docs/Sheets. **Features the web UI doesn't offer**: batch downloads, quiz/flashcard export in multiple formats, mind map JSON extraction.
 
-## Three Ways to Use
+## Ways to Use
 
 | Method | Best For |
 |--------|----------|
 | **Python API** | Application integration, async workflows, custom pipelines |
 | **CLI** | Shell scripts, quick tasks, CI/CD automation |
+| **MCP Server** | Exposing NotebookLM tools to Claude Desktop/Code, Cursor, Windsurf, and other MCP clients |
+| **REST Server** | Local automation over guarded HTTP routes without spawning a CLI process per call |
 | **Agent Integration** | Claude Code, Codex, LLM agents, natural language automation |
 
 ## Features
@@ -52,6 +54,8 @@
 | **Notebooks** | Create, list, rename, delete |
 | **Sources** | URLs, YouTube, files (PDF, text, Markdown, Word, EPUB, audio, video, images), Google Drive, pasted text; refresh, get guide/fulltext |
 | **Chat** | Questions, conversation history, custom personas |
+| **Notes** | Create, list, rename, delete, save chat answers, save conversation history |
+| **Source Labels** | AI-generated or manual topic labels; add/remove source membership; filter sources by label |
 | **Research** | Web and Drive research agents (fast/deep modes) with auto-import |
 | **Sharing** | Public/private links, user permissions (viewer/editor), view level control |
 
@@ -67,7 +71,7 @@
 | **Flashcards** | Configurable quantity and difficulty | JSON, Markdown, HTML |
 | **Report** | Briefing doc, study guide, blog post, or custom prompt | Markdown |
 | **Data Table** | Custom structure via natural language | CSV |
-| **Mind Map** | Interactive hierarchical visualization | JSON |
+| **Mind Map** | Hierarchical node tree — **two kinds**: note-backed JSON or the newer interactive studio map (`--kind` / `MindMapKind`) | JSON |
 
 ### Beyond the Web UI
 
@@ -90,19 +94,27 @@ These features are available via API/CLI but not exposed in NotebookLM's web int
 
 The full install guide — six personas (agent, end-user, library, headless, contributor, power-user), optional extras matrix, platform notes — lives in **[docs/installation.md](docs/installation.md)**.
 
-**Quickest start** (CLI users and AI agents):
+**Quickest start** (CLI users and AI agents) — install the CLI with `uv tool` (recommended) or `pipx`:
 
 ```bash
-pip install "notebooklm-py[browser]"   # core + Playwright
-playwright install chromium             # ~170 MB; no progress bar — be patient (30–90 s)
-notebooklm login                        # opens browser for Google sign-in
-notebooklm auth check --test --json     # verify: expect "status": "ok"
+uv tool install "notebooklm-py[browser]"   # or: pipx install "notebooklm-py[browser]"
+notebooklm login                           # first run auto-downloads Chromium (~170 MB), then Google sign-in
+notebooklm auth check --test --json        # verify: expect "status": "ok"
+```
+
+**Why `uv tool` / `pipx`?** They install the CLI into its own isolated environment and put `notebooklm` on your `PATH` — no dependency clashes with other tools, a one-line upgrade (`uv tool upgrade notebooklm-py`) or uninstall, and, crucially, they work on modern macOS (Homebrew Python) and Debian/Ubuntu where a system-wide `pip install` is blocked with `error: externally-managed-environment` ([PEP 668](https://peps.python.org/pep-0668/)). No `uv` yet? `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv` / `winget install astral-sh.uv`).
+
+**Prefer plain `pip`?** It works the same **inside a virtualenv** (and directly on Windows, where Python isn't externally-managed):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install "notebooklm-py[browser]"
 ```
 
 **As a library** (embedded in your app — no Playwright, no Chromium):
 
 ```bash
-pip install notebooklm-py               # ~10 MB; ship a pre-acquired storage_state.json
+uv add notebooklm-py                    # or, inside a virtualenv: pip install notebooklm-py
 ```
 
 If `playwright install chromium` fails on Linux with `TypeError: onExit is not a function`, see the [Linux workaround](docs/troubleshooting.md#linux). **Contributors:** see [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -147,7 +159,7 @@ notebooklm generate quiz --difficulty hard
 notebooklm generate flashcards --quantity more
 notebooklm generate slide-deck
 notebooklm generate infographic --orientation portrait
-notebooklm generate mind-map
+notebooklm generate mind-map                       # interactive studio map (default); --kind note-backed for the JSON tree
 notebooklm generate data-table "compare key concepts"
 
 # 5. Download artifacts
@@ -186,10 +198,10 @@ Use `--prompt-file PATH` with `ask`, prompt-based `generate` commands, and `sour
 
 ```python
 import asyncio
-from notebooklm import NotebookLMClient
+from notebooklm import NotebookLMClient, MindMapKind
 
 async def main():
-    async with await NotebookLMClient.from_storage() as client:
+    async with NotebookLMClient.from_storage() as client:
         # Create notebook and add sources
         nb = await client.notebooks.create("Research")
         await client.sources.add_url(nb.id, "https://example.com", wait=True)
@@ -208,8 +220,10 @@ async def main():
         await client.artifacts.wait_for_completion(nb.id, status.task_id)
         await client.artifacts.download_quiz(nb.id, "quiz.json", output_format="json")
 
-        # Generate mind map and export
-        result = await client.artifacts.generate_mind_map(nb.id)
+        # Generate a mind map via the unified client.mind_maps API (issue #1256) —
+        # two kinds: the newer MindMapKind.INTERACTIVE studio map (shown; polled to
+        # completion by default) or MindMapKind.NOTE_BACKED JSON. Both export via:
+        await client.mind_maps.generate(nb.id, kind=MindMapKind.INTERACTIVE)
         await client.artifacts.download_mind_map(nb.id, "mindmap.json")
 
 asyncio.run(main())
@@ -238,13 +252,17 @@ Fetches the canonical [SKILL.md](SKILL.md) directly from GitHub.
 
 - **[CLI Reference](docs/cli-reference.md)** - Complete command documentation
 - **[Python API](docs/python-api.md)** - Full API reference
+- **[MCP Guide](docs/mcp-guide.md)** - MCP server setup, transports, and tool reference
+- **[REST API Server](docs/installation.md#rest-api-server)** - Experimental localhost FastAPI server
 - **[Configuration](docs/configuration.md)** - Storage and settings
 - **[Release Guide](docs/releasing.md)** - Release checklist and packaging verification
 - **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
 - **[API Stability](docs/stability.md)** - Versioning policy and stability guarantees
+- **[Upgrading to v0.8.0](docs/upgrading-to-0.8.0.md)** - Breaking-change migration guide for the v0.8.0 error-and-return contract
 
 ### For Contributors
 
+- **[Architecture](docs/architecture.md)** - Architectural overview and design principles
 - **[Development Guide](docs/development.md)** - Architecture, testing, and releasing
 - **[RPC Development](docs/rpc-development.md)** - Protocol capture and debugging
 - **[RPC Reference](docs/rpc-reference.md)** - Payload structures

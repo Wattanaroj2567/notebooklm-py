@@ -19,6 +19,7 @@ auth-failure test by invoking ``main()`` with a missing storage env var.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -96,6 +97,12 @@ def _result(
         # issues. Pin both phrasings (decoder.py:117 and :470).
         "Parse error: API rate limit exceeded. Please wait before retrying.",
         "Parse error: API rate limit or quota exceeded. Please wait before retrying.",
+        # ``httpx.ReadTimeout`` with an empty message stringifies to the
+        # class name (see issue #864 fallback in make_rpc_request) and is
+        # a Google-side flake that passes on retry — see #1004 and the
+        # 2026-05-20 occurrence. Classifying it as transient prevents
+        # auto-opening dup issues for single-run timeouts.
+        "ReadTimeout",
     ],
 )
 def test_transient_markers_match(message: str) -> None:
@@ -118,6 +125,22 @@ def test_non_transient_markers_do_not_match(message: str | None) -> None:
     assert is_transient_error(message) is False
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Only ``httpx.ReadTimeout`` is treated as a Google-side flake.
+        # Connect/Write/Pool timeouts point at client- or network-side
+        # problems (DNS, broken proxy, exhausted connection pool) and
+        # should keep tripping the canary so they get investigated.
+        "ConnectTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+    ],
+)
+def test_non_readtimeout_timeouts_stay_non_transient(message: str) -> None:
+    assert is_transient_error(message) is False
+
+
 # ---------------------------------------------------------------------------
 # partition_errors
 # ---------------------------------------------------------------------------
@@ -137,11 +160,21 @@ def test_partition_errors_separates_transient_from_real() -> None:
             CheckStatus.ERROR,
             error="Parse error: API rate limit or quota exceeded. Please wait before retrying.",
         ),
+        # ``httpx.ReadTimeout("")`` surfaces as the bare class name via the
+        # str-or-classname fallback in make_rpc_request (issue #864).
+        # Treated as transient per issue #1004 — a single-run Google-side
+        # timeout should not auto-open a non-transient issue.
+        _result("read_timeout", CheckStatus.ERROR, error="ReadTimeout"),
         _result("mismatch", CheckStatus.MISMATCH),
     ]
     non_transient, transient = partition_errors(results)
     assert [r.method.name for r in non_transient] == ["timeout", "parse"]
-    assert [r.method.name for r in transient] == ["rate", "quota", "ratelimit_leak"]
+    assert [r.method.name for r in transient] == [
+        "rate",
+        "quota",
+        "ratelimit_leak",
+        "read_timeout",
+    ]
 
 
 @pytest.mark.asyncio
@@ -224,6 +257,101 @@ async def test_make_rpc_request_uses_flat_cookie_header_and_auth_route() -> None
     assert "authuser" not in default_query
 
 
+# Regression fixtures for issue #864: ``httpx.ReadTimeout`` raised from
+# anyio's bare ``TimeoutError()`` has ``str(e) == ""``. Without the
+# class-name fallback the empty error string is swallowed by ``if error:``
+# checks and mislabeled as "Empty response from server". Each call site
+# that consumes ``make_rpc_request`` gets its own regression test below.
+
+
+class _TimingOutClient:
+    async def post(self, url: str, *, content: str, headers: dict[str, str]) -> httpx.Response:
+        raise httpx.ReadTimeout("")
+
+
+@pytest.fixture
+def timing_out_auth() -> check_rpc_health.AuthTokens:
+    return check_rpc_health.AuthTokens(
+        cookies={"SID": "sid"},
+        csrf_token="csrf",
+        session_id="session",
+    )
+
+
+@pytest.mark.asyncio
+async def test_make_rpc_request_surfaces_class_name_for_empty_message_errors(
+    timing_out_auth: check_rpc_health.AuthTokens,
+) -> None:
+    response_text, error = await make_rpc_request(
+        _TimingOutClient(),
+        timing_out_auth,
+        check_rpc_health.RPCMethod.GET_SUGGESTED_REPORTS,
+        [[2], "nb"],
+    )
+    assert response_text is None
+    assert error == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_make_rpc_call_propagates_empty_message_errors_without_relabeling(
+    timing_out_auth: check_rpc_health.AuthTokens,
+) -> None:
+    found_ids, error = await check_rpc_health.make_rpc_call(
+        _TimingOutClient(),
+        timing_out_auth,
+        check_rpc_health.RPCMethod.GET_SUGGESTED_REPORTS,
+        [[2], "nb"],
+    )
+    assert found_ids == []
+    assert error == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_test_rpc_method_with_data_propagates_empty_message_errors(
+    timing_out_auth: check_rpc_health.AuthTokens,
+) -> None:
+    result, data = await check_rpc_health.test_rpc_method_with_data(
+        _TimingOutClient(),
+        timing_out_auth,
+        check_rpc_health.RPCMethod.CREATE_NOTEBOOK,
+        ["Title"],
+    )
+    assert data is None
+    assert result.status is CheckStatus.ERROR
+    assert result.error == "ReadTimeout"
+
+
+@pytest.mark.asyncio
+async def test_check_method_propagates_empty_message_errors(
+    timing_out_auth: check_rpc_health.AuthTokens,
+) -> None:
+    # ``check_method`` is the third call site that consumes the
+    # ``(found_ids, error)`` tuple. Pin its behavior so the
+    # class-name fallback can't silently regress only here.
+    result = await check_rpc_health.check_method(
+        _TimingOutClient(),
+        timing_out_auth,
+        check_rpc_health.RPCMethod.GET_SOURCE,
+        notebook_id="nb",
+    )
+    assert result.status is CheckStatus.ERROR
+    assert result.error == "ReadTimeout"
+
+
+def test_is_transient_error_classifies_readtimeout_as_transient() -> None:
+    # Pinned policy (see scripts/check_rpc_health.py docstring + the
+    # comment on TRANSIENT_ERROR_MARKERS): ``httpx.ReadTimeout`` against
+    # Google's RPC endpoints is a server-side flake that passes on retry,
+    # so it is filtered out of the auto-open issue path (#1004). Other
+    # timeouts (Connect/Write/Pool) stay non-transient because they
+    # point at client- or network-side problems worth surfacing. If this
+    # policy ever changes, update this test deliberately — don't drop it.
+    assert is_transient_error("ReadTimeout") is True
+    assert is_transient_error("ConnectTimeout") is False
+    assert is_transient_error("WriteTimeout") is False
+    assert is_transient_error("PoolTimeout") is False
+
+
 @pytest.mark.asyncio
 async def test_setup_temp_resources_uses_canonical_create_notebook_payload(
     monkeypatch: pytest.MonkeyPatch,
@@ -265,7 +393,11 @@ async def test_setup_temp_resources_uses_canonical_create_notebook_payload(
     assert captured["method"] is check_rpc_health.RPCMethod.CREATE_NOTEBOOK
     assert captured["source_path"] == "/"
     assert captured["params"][0].startswith("RPC-Health-Check-")
-    assert captured["params"][1:] == [None, None, [2], [1]]
+    assert captured["params"][1:] == [
+        None,
+        None,
+        [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+    ]
     assert results[0].status == CheckStatus.ERROR
     assert temp.notebook_id is None
 
@@ -433,6 +565,139 @@ def test_print_summary_lists_affected_methods_on_exit_three(
     assert "timeout" in affected and "parse" in affected
     # …and the transient one is NOT listed as an affected method.
     assert "rate" not in affected
+
+
+# ---------------------------------------------------------------------------
+# check_chat_query: GenerateFreeFormStreamed (PATH_NOT_METHOD) drift probe
+#
+# The streamed-chat orchestration RPC has no obfuscated method ID to echo back
+# (it is a hardcoded ``v1`` URL path), so the canary probes its WIRE SHAPE:
+# 200 + a recognizable stream frame -> OK; zero parseable chunks -> ERROR
+# (drift). These tests pin that classification (issue #1492).
+# ---------------------------------------------------------------------------
+
+
+def _chat_auth() -> Any:
+    return check_rpc_health.AuthTokens(
+        cookies={"SID": "sid"},
+        csrf_token="csrf",
+        session_id="session",
+        authuser=2,
+        account_email="bob@example.com",
+    )
+
+
+class _ChatClient:
+    """Minimal httpx-like client returning a fixed response (or raising)."""
+
+    def __init__(self, *, text: str = "", status: int = 200, raises: Exception | None = None):
+        self._text = text
+        self._status = status
+        self._raises = raises
+        self.url: str | None = None
+        self.content: str | None = None
+
+    async def post(self, url: str, *, content: str, headers: dict[str, str]) -> httpx.Response:
+        self.url = url
+        self.content = content
+        if self._raises is not None:
+            raise self._raises
+        return httpx.Response(
+            self._status,
+            text=self._text,
+            request=httpx.Request("POST", url),
+        )
+
+
+def _wrb_fr_body(inner: Any) -> str:
+    """Build an anti-XSSI-prefixed body wrapping one ``wrb.fr`` frame."""
+    frame = json.dumps([["wrb.fr", "GenerateFreeFormStreamed", json.dumps(inner)]])
+    return ")]}'\n" + frame
+
+
+def test_chat_probe_uses_query_endpoint_path() -> None:
+    """The probe's CheckResult is labelled with the streamed-chat path, not an
+    RPCMethod value, and matches the library's ``_QUERY_ENDPOINT_PATH``.
+    """
+    assert check_rpc_health.CHAT_QUERY_PROBE.value == check_rpc_health._QUERY_ENDPOINT_PATH
+    assert "GenerateFreeFormStreamed" in check_rpc_health.CHAT_QUERY_PROBE.value
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_skipped_without_notebook() -> None:
+    result = await check_rpc_health.check_chat_query(_ChatClient(), _chat_auth(), None)
+    assert result.status is CheckStatus.SKIPPED
+    assert result.method.name == "GENERATE_FREE_FORM_STREAMED"
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_ok_on_parseable_frame() -> None:
+    # An empty-list ``wrb.fr`` frame is a recognized (heartbeat) frame: the
+    # wire shape is intact even though there's no answer text. -> OK.
+    client = _ChatClient(text=_wrb_fr_body([]))
+    result = await check_rpc_health.check_chat_query(client, _chat_auth(), "nb_123")
+    assert result.status is CheckStatus.OK
+    # The probe hit the streamed-chat endpoint, not batchexecute.
+    assert "GenerateFreeFormStreamed" in (client.url or "")
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_error_on_zero_parseable_chunks() -> None:
+    # Empty/garbage body -> ChatResponseParseError -> ERROR (this is the
+    # wire-drift signal the chat canary exists to catch).
+    client = _ChatClient(text=")]}'\n\n")
+    result = await check_rpc_health.check_chat_query(client, _chat_auth(), "nb_123")
+    assert result.status is CheckStatus.ERROR
+    assert "Parse error" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_error_on_strict_decode_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Strict positional drift in the wire decoder raises UnknownRPCMethodError
+    # (a DecodingError subclass), NOT ChatResponseParseError. The probe must
+    # CATCH it and return ERROR rather than letting it escape and crash the
+    # canary (#1492 review). This is the drift the chat canary exists to catch.
+    from notebooklm.exceptions import UnknownRPCMethodError
+
+    def _raise_drift(_text: str) -> Any:
+        raise UnknownRPCMethodError("safe_index drift at path ()[0]")
+
+    monkeypatch.setattr(check_rpc_health, "parse_streaming_chat_response", _raise_drift)
+    client = _ChatClient(text=_wrb_fr_body([]))
+    result = await check_rpc_health.check_chat_query(client, _chat_auth(), "nb_123")
+    assert result.status is CheckStatus.ERROR
+    assert "Parse error" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_ok_on_recognized_server_error_frame() -> None:
+    # An ``"er"`` frame is a RECOGNIZED frame (the parser raises ChatError):
+    # the wire contract is intact, the server merely declined. -> OK.
+    body = ")]}'\n" + json.dumps([["er", "GenerateFreeFormStreamed", 7]])
+    client = _ChatClient(text=body)
+    result = await check_rpc_health.check_chat_query(client, _chat_auth(), "nb_123")
+    assert result.status is CheckStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_error_on_http_status() -> None:
+    client = _ChatClient(status=500, text="boom")
+    result = await check_rpc_health.check_chat_query(client, _chat_auth(), "nb_123")
+    assert result.status is CheckStatus.ERROR
+    assert result.error == "HTTP 500"
+
+
+@pytest.mark.asyncio
+async def test_chat_probe_surfaces_class_name_for_empty_message_errors() -> None:
+    # Mirror the make_rpc_request #864 fallback: ``httpx.ReadTimeout("")``
+    # stringifies to "" and must surface as the class name, not be swallowed.
+    client = _ChatClient(raises=httpx.ReadTimeout(""))
+    result = await check_rpc_health.check_chat_query(client, _chat_auth(), "nb_123")
+    assert result.status is CheckStatus.ERROR
+    assert result.error == "ReadTimeout"
+    # And ReadTimeout is classified as transient downstream (does not fail the
+    # canary) — same posture as the method-ID probes.
+    assert is_transient_error(result.error) is True
 
 
 # ---------------------------------------------------------------------------

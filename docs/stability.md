@@ -1,7 +1,7 @@
 # API Stability and Versioning
 
 **Status:** Active
-**Last Updated:** 2026-05-15
+**Last Updated:** 2026-06-11
 
 This document describes the stability guarantees and versioning policy for `notebooklm-py`.
 
@@ -66,27 +66,49 @@ NotebookLMClient.research
 NotebookLMClient.notes
 NotebookLMClient.settings
 NotebookLMClient.sharing
+NotebookLMClient.labels
+NotebookLMClient.mind_maps
 NotebookLMClient.rpc_call()
 
 # Types
-Notebook, Source, Artifact, Note
-GenerationStatus, AskResult
+Notebook, Source, Artifact, Note, Label, MindMap
+GenerationState, GenerationStatus, AskResult
 NotebookDescription, ConversationTurn
 ShareStatus, SharedUser, SourceFulltext
 NotebookMetadata, SourceSummary
 AccountLimits, AccountTier
 ChatReference, ReportSuggestion, SuggestedTopic
+MindMapKind, MindMapResult
+ResearchStart, ResearchStatus, ResearchTask, ResearchSource
+ClientMetricsSnapshot, ConnectionLimits, RpcTelemetryEvent
 
 # Exceptions (all inherit from NotebookLMError)
 NotebookLMError                    # Base exception
+NotFoundError                      # Cross-domain umbrella for *NotFoundError
+WaitTimeoutError                   # Cross-domain umbrella for wait/poll timeouts (also a built-in TimeoutError)
 RPCError, AuthError, RateLimitError, RPCTimeoutError, ServerError
 NetworkError, DecodingError, UnknownRPCMethodError
 ClientError, ConfigurationError, ValidationError
 # Domain-specific
+# Note: *NotFoundError classes mix in RPCError (catchable as either RPCError
+# or the domain base). v0.6.0 restored this symmetry across all three "not
+# found" types — see docs/python-api.md#error-handling for migration prose.
+# Note: *TimeoutError classes mix in WaitTimeoutError (and the built-in
+# TimeoutError). v0.7.0 added the WaitTimeoutError umbrella so `except
+# WaitTimeoutError` catches source/artifact/research wait timeouts uniformly,
+# while `except TimeoutError` keeps working — see docs/python-api.md#waittimeouterror.
 SourceError, SourceAddError, SourceProcessingError, SourceTimeoutError, SourceNotFoundError
 NotebookError, NotebookNotFoundError
-ArtifactError, ArtifactDownloadError, ArtifactNotFoundError, ArtifactNotReadyError, ArtifactParseError
-ChatError
+ArtifactError, ArtifactDownloadError, ArtifactFeatureUnavailableError, ArtifactNotFoundError, ArtifactNotReadyError, ArtifactParseError
+ArtifactTimeoutError, ArtifactPendingTimeoutError, ArtifactInProgressTimeoutError
+ResearchError, ResearchTimeoutError, ResearchTaskMismatchError, AmbiguousResearchTaskError
+# Note: notes.get/update/delete and mind_maps.get/rename/delete now raise
+# their domain *NotFoundError on a missing target; use get_or_none() for
+# warning-free None-on-miss lookups.
+NoteError, NoteNotFoundError
+MindMapError, MindMapNotFoundError
+LabelError, LabelNotFoundError
+ChatError, ChatResponseParseError
 
 # Enums
 AudioFormat, AudioLength
@@ -102,7 +124,20 @@ DriveMimeType, ExportType
 
 # Auth
 AuthTokens
-# (DEFAULT_STORAGE_PATH is deprecated; use notebooklm.paths.get_storage_path())
+notebooklm.paths.get_storage_path()
+
+# Logging and Correlation
+notebooklm.configure_logging
+notebooklm.get_request_id
+notebooklm.set_request_id
+notebooklm.reset_request_id
+notebooklm.correlation_id
+
+# Citation and Research Helpers
+notebooklm.utils.resolve_chat_reference_passage
+notebooklm.research.select_cited_sources
+notebooklm.research.normalize_url
+notebooklm.research.extract_report_urls
 
 # Helpers (cookies extra) - imported from notebooklm.auth
 notebooklm.auth.convert_rookiepy_cookies_to_storage_state  # requires `pip install "notebooklm-py[cookies]"` — see docs/installation.md#optional-extras-matrix
@@ -118,7 +153,7 @@ notebooklm.auth.OPTIONAL_COOKIE_DOMAINS_BY_LABEL
 The following symbols appear in `notebooklm/__all__` so that downstream code can
 import them via `from notebooklm import ...`, but they are **not** covered by
 the stability guarantee above. They support narrow integration use cases
-(typed exception handling, warning filters, deprecated-name shims) and may be
+(typed exception handling and warning filters) and may be
 renamed, narrowed, or removed in a future minor release. Prefer the stable
 surface when possible.
 
@@ -127,23 +162,45 @@ CitedSourceSelection      # Chat citation payload — internal shape, exposed fo
 AuthExtractionError       # Specialized AuthError raised by browser-based login
 NotebookLimitError        # Raised when account notebook quota is exhausted
 UnknownTypeWarning        # Warning category emitted when .kind falls back to UNKNOWN
-StudioContentType         # ⚠️ Deprecated — use ArtifactType (see "Currently Deprecated" below)
 ```
 
 ### Internal (May change without notice)
 
 ```python
 # These are NOT part of the public API:
-notebooklm.rpc.*          # RPC protocol internals, except the documented RPCMethod import path for NotebookLMClient.rpc_call()
-notebooklm._core.*        # Core infrastructure
+notebooklm.rpc.*          # RPC protocol internals, except documented power-user imports
 notebooklm._*.py          # All underscore-prefixed modules
 notebooklm.auth.*         # Auth internals (except documented AuthTokens, cookie conversion, and cookie-domain constants)
 ```
 
-For raw-RPC power-user calls, import the method enum explicitly:
+For raw-RPC power-user calls, import the documented RPC helpers explicitly:
 ```python
-from notebooklm.rpc import RPCMethod
+from notebooklm.rpc import RPCMethod, resolve_rpc_id
 ```
+
+### Strict decoding (the only mode since v0.7.0)
+
+Schema-drift helpers (notably :func:`notebooklm.rpc.safe_index`) **raise**
+:class:`~notebooklm.exceptions.UnknownRPCMethodError` when Google's
+batchexecute response shape does not match what the decoder expects. This is
+now the only behavior: the legacy ``NOTEBOOKLM_STRICT_DECODE=0`` warn-and-
+return-``None`` opt-out was retired in v0.7.0 (it had a one-release
+``DeprecationWarning`` window through v0.5.0/v0.6.0). The env var is now
+ignored.
+
+Stability implications:
+
+- **Exception type is stable.** ``UnknownRPCMethodError`` is a subclass of
+  ``DecodingError`` and ``RPCError`` (both public-API exceptions). Code that
+  already catches ``RPCError`` continues to handle drift correctly.
+- **No silent shape changes.** Methods that previously returned ``None`` /
+  empty values on drift now raise. Callers that treated ``None`` as a valid
+  sentinel must add an ``except UnknownRPCMethodError`` branch.
+
+See [`docs/configuration.md#decoder-strictness`](configuration.md#decoder-strictness)
+for the env-var contract and
+[`docs/adr/0011-schema-validation-policy.md`](adr/0011-schema-validation-policy.md)
+for the design rationale behind the strict-decode policy.
 
 ## Deprecation Policy
 
@@ -154,18 +211,42 @@ from notebooklm.rpc import RPCMethod
 
 ### Currently Deprecated
 
-The following are deprecated and will be removed in **v0.5.0**:
+See [`docs/deprecations.md`](deprecations.md) for the canonical list of
+currently-deprecated APIs and their scheduled removal versions, plus the
+deprecations removed in v0.6.0, v0.7.0, and v0.8.0.
 
-| Deprecated | Replacement | Notes |
-|------------|-------------|-------|
+### Removed in v0.5.0
+
+The following v0.3-era deprecations completed their removal cycle in v0.5.0:
+
+| Removed | Replacement | Notes |
+|---------|-------------|-------|
 | `Source.source_type` | `Source.kind` | Returns `SourceType` str enum |
 | `Artifact.artifact_type` | `Artifact.kind` | Returns `ArtifactType` str enum |
 | `Artifact.variant` | `Artifact.kind` | Use `.is_quiz` / `.is_flashcards` |
 | `SourceFulltext.source_type` | `SourceFulltext.kind` | Returns `SourceType` str enum |
-| `StudioContentType` | `ArtifactType` | Str enum for user-facing code |
-| `DEFAULT_STORAGE_PATH` | `notebooklm.paths.get_storage_path()` | Module-level constant replaced by helper |
+| `notebooklm.StudioContentType` | `ArtifactType` | Str enum for user-facing code |
+| `notebooklm.DEFAULT_STORAGE_PATH` | `notebooklm.paths.get_storage_path()` | Module-level constant replaced by helper |
+| `notebooklm.rpc.types.StudioContentType` | `ArtifactType` | Internal raw code alias removed |
+| `notebooklm.rpc.StudioContentType` | `ArtifactType` | Internal re-export removed |
+| `notebooklm.rpc.RPCMethod.DISCOVER_SOURCES` | none | Unused raw RPC enum member, not exercised by client APIs |
+| `notebooklm.rpc.RPCMethod.QUERY_ENDPOINT` | `notebooklm.rpc.get_query_url()` | Endpoint URL path moved out of the RPC method enum |
+| `notebooklm.cli.language_cmd.save_config` | `_save_config` | Private low-level write primitive only |
 
-> **Note:** These were originally targeted for removal in v0.4.0. The removal was deferred one release to give downstream users more time to migrate. They continue to emit `DeprecationWarning` and will be removed in v0.5.0.
+### Deprecated for a future major release
+
+| Deprecated | Replacement | Notes |
+|------------|-------------|-------|
+| Awaiting `NotebookLMClient.from_storage(...)` | `async with NotebookLMClient.from_storage(...) as client:` | Emits `DeprecationWarning`; scheduled for v1.0 removal |
+
+### Permanent aliases
+
+`RPCError.rpc_id` and `RPCError.code` are permanent backward-compatibility
+aliases for `RPCError.method_id` and `RPCError.rpc_code`. Exception diagnostic
+aliases are exempt from the standard deprecation cycle because removal can mask
+the original exception inside `except` handlers. New code should prefer the
+canonical attribute names, but existing exception handlers may keep using the
+aliases.
 
 ## Migration Guides
 
@@ -175,19 +256,19 @@ Version 0.4.0 is backward compatible with v0.3.x. Notable additions:
 
 - **Multi-account profiles** - Existing single-account setups continue to work as the implicit default profile. Your existing `~/.notebooklm/storage_state.json` is auto-detected — no manual migration is required. New accounts can be added via `notebooklm profile create <name>`.
 - **`[cookies]` optional extra** - To reuse cookies from your existing browser, install with `pip install "notebooklm-py[cookies]"` (requires `rookiepy`; full extras matrix: [docs/installation.md#optional-extras-matrix](installation.md#optional-extras-matrix)).
-- **Deprecation removal deferred** - The deprecated attributes originally scheduled for v0.4.0 (`Source.source_type`, `Artifact.artifact_type`, `Artifact.variant`, `SourceFulltext.source_type`, `StudioContentType`, `DEFAULT_STORAGE_PATH`) will now be removed in v0.5.0. They still emit `DeprecationWarning` — please migrate before v0.5.0.
+- **Deprecation removal deferred** - The deprecated attributes originally scheduled for v0.4.0 (`Source.source_type`, `Artifact.artifact_type`, `Artifact.variant`, `SourceFulltext.source_type`, `StudioContentType`, `DEFAULT_STORAGE_PATH`) were deferred to v0.5.0. In v0.5.0 and later, use the replacements listed in [Removed in v0.5.0](#removed-in-v050).
 
 ### Migrating from v0.2.x to v0.3.0
 
-Version 0.3.0 introduces **deprecated** attributes that emit `DeprecationWarning` when accessed.
-These will be removed in v0.5.0. Update your code now to avoid breakage.
+Version 0.3.0 introduced attributes that were deprecated until their v0.5.0
+removal. The historical migration examples below show the replacement surface.
 
 #### 1. `Source.source_type` → `Source.kind`
 
-**Before (deprecated):**
+**Before (removed in v0.5.0):**
 ```python
-source = await client.sources.list(notebook_id)[0]
-if source.source_type == "pdf":  # ⚠️ Emits DeprecationWarning
+source = (await client.sources.list(notebook_id))[0]
+if source.source_type == "pdf":
     print("This is a PDF")
 ```
 
@@ -195,7 +276,7 @@ if source.source_type == "pdf":  # ⚠️ Emits DeprecationWarning
 ```python
 from notebooklm import SourceType
 
-source = await client.sources.list(notebook_id)[0]
+source = (await client.sources.list(notebook_id))[0]
 
 # Option 1: Use enum comparison (recommended)
 if source.kind == SourceType.PDF:
@@ -211,12 +292,10 @@ if source.kind == "pdf":
 
 #### 2. `Artifact.artifact_type` → `Artifact.kind`
 
-**Before (deprecated):**
+**Before (removed in v0.5.0):**
 ```python
-from notebooklm import StudioContentType  # ⚠️ Emits DeprecationWarning
-
-artifact = await client.artifacts.list(notebook_id)[0]
-if artifact.artifact_type == StudioContentType.AUDIO:  # ⚠️ Emits DeprecationWarning
+artifact = (await client.artifacts.list(notebook_id))[0]
+if artifact.artifact_type == 1:
     print("This is an audio artifact")
 ```
 
@@ -224,7 +303,7 @@ if artifact.artifact_type == StudioContentType.AUDIO:  # ⚠️ Emits Deprecatio
 ```python
 from notebooklm import ArtifactType
 
-artifact = await client.artifacts.list(notebook_id)[0]
+artifact = (await client.artifacts.list(notebook_id))[0]
 
 # Option 1: Use enum comparison (recommended)
 if artifact.kind == ArtifactType.AUDIO:
@@ -240,9 +319,9 @@ if artifact.kind == "audio":
 
 #### 3. `Artifact.variant` → `Artifact.kind` or helpers
 
-**Before (deprecated):**
+**Before (removed in v0.5.0):**
 ```python
-if artifact.artifact_type == 4 and artifact.variant == 2:  # ⚠️ Deprecated
+if artifact.artifact_type == 4 and artifact.variant == 2:
     print("This is a quiz")
 ```
 
@@ -269,14 +348,17 @@ if artifact.is_flashcards:
 
 When Google changes their internal APIs:
 
-1. **Detection**: Automated RPC health check runs nightly (see below)
+1. **Detection**: Automated RPC health check runs nightly for `main`; release
+   branch checks run manually during release prep (see below)
 2. **Investigation**: Identify changed method IDs using browser devtools
 3. **Fix**: Update `rpc/types.py` with new method IDs
 4. **Release**: Push patch release as soon as possible
 
 ### Automated RPC Health Check
 
-A nightly GitHub Action (`rpc-health.yml`) monitors all 35+ RPC methods for ID changes.
+A nightly GitHub Action (`rpc-health.yml`) monitors all 35+ RPC methods for ID
+changes on `main`. Release branches use the same workflow through manual
+dispatch.
 
 **What it verifies:**
 - The RPC method ID we send matches the ID returned in the response envelope
@@ -296,10 +378,7 @@ A nightly GitHub Action (`rpc-health.yml`) monitors all 35+ RPC methods for ID c
 - GitHub Issue auto-created with `bug`, `rpc-breakage`, and `automated` labels
 - Report shows expected vs actual IDs and which `RPCMethod` entries need updating
 
-**Configuration:**
-- `NOTEBOOKLM_RPC_DELAY`: Delay between RPC calls in seconds (default: 1.0)
-
-**Manual trigger:** `gh workflow run rpc-health.yml`
+**Manual trigger:** `gh workflow run rpc-health.yml -f custom_branch=release/vX.Y.Z`
 
 ### How to Report API Breakage
 
@@ -317,13 +396,14 @@ If the library breaks before we release a fix:
 1. Open browser devtools on NotebookLM
 2. Perform the failing operation manually
 3. Find the new RPC method ID in Network tab
-4. Temporarily patch your local copy:
-   ```python
-   # In your code, before using the library
-   from notebooklm.rpc import RPCMethod
-
-   RPCMethod.SOME_METHOD._value_ = "NewMethodId"
+4. Temporarily override the rotated ID without mutating the enum:
+   ```bash
+   export NOTEBOOKLM_RPC_OVERRIDES='{"LIST_NOTEBOOKS": "NewMethodId"}'
    ```
+
+   The override key is the `RPCMethod` enum name. See
+   [configuration.md#environment-variables](configuration.md#environment-variables)
+   for validation and host-allowlist behavior.
 
 ## Upgrade Recommendations
 

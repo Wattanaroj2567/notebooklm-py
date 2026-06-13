@@ -43,6 +43,27 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Public surface (ADR-0012). Underscore-prefixed helpers like
+# ``_read_default_profile`` and ``_reset_config_cache`` remain importable for
+# test fixtures via the standard ``from notebooklm.paths import _foo`` syntax
+# (Python attribute lookup is unaffected by ``__all__``); ``__all__`` only
+# governs ``from notebooklm.paths import *`` and documents the intended
+# public API.
+__all__ = [
+    "get_active_profile",
+    "get_browser_profile_dir",
+    "get_config_path",
+    "get_context_path",
+    "get_home_dir",
+    "get_path_info",
+    "get_profile_dir",
+    "get_storage_path",
+    "list_profiles",
+    "read_default_profile",
+    "resolve_profile",
+    "set_active_profile",
+]
+
 # Module-level active profile, set once at CLI startup via set_active_profile().
 # Library users should pass profile= explicitly to path functions instead.
 _active_profile: str | None = None
@@ -126,7 +147,7 @@ def _read_default_profile() -> str | None:
     """Read default_profile from config.json (cached by mtime).
 
     Standalone config reader in paths.py to avoid circular imports
-    with cli/language.py (which imports from paths.py).
+    with cli/language_cmd.py (which imports from paths.py).
 
     Returns:
         The default profile name, or None if not configured or on any error.

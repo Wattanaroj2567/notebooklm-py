@@ -1,6 +1,6 @@
 [project]
 name = "notebooklm-py"
-version = "0.4.1"
+version = "0.8.0"
 description = "Unofficial Python library for automating Google NotebookLM"
 dynamic = ["readme"]
 requires-python = ">=3.10"
@@ -43,6 +43,18 @@ Issues = "https://github.com/teng-lin/notebooklm-py/issues"
 markdown = ["markdownify>=0.14.1,<2"]
 browser = ["playwright>=1.40.0,<2"]
 cookies = ["rookiepy>=0.1.0,<1"]
+mcp = ["fastmcp>=2.14,<4"]
+# Optional single-tenant REST server (the third _app adapter, after cli/ and
+# mcp/). EXPERIMENTAL: the /v1 surface may change in a minor release; it is
+# excluded from the public-API compatibility gate. python-multipart is REQUIRED
+# for the file-upload route (FastAPI's UploadFile/File fails without it). Pinned
+# compatibly with the base install's httpx<0.29 / anyio<5 (resolved against
+# uv.lock at build time).
+server = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "python-multipart>=0.0.20,<1",
+]
 dev = [
     "pytest>=8.0.0,<10",
     "pytest-asyncio>=0.23.0,<2",
@@ -54,17 +66,19 @@ dev = [
     "python-dotenv>=1.0.0,<2",
     "mypy>=1.0.0,<3",
     "pre-commit>=4.5.1,<5",
-    "ruff==0.15.13",
+    "ruff==0.15.15",
     "tomli>=2.0.0,<3; python_version < '3.11'",  # for tests/unit/test_install_docs.py on Python 3.10 (tomllib is 3.11+)
     "vcrpy>=6.0.0,<9",
     "packaging>=23.0,<27",  # for tests/unit/test_version_gate.py (PEP 440 version parsing)
 ]
 # `all` deliberately excludes `cookies` — rookiepy has install issues on Python 3.13+
 # (see CHANGELOG [0.4.1]). Opt in explicitly via `pip install "notebooklm-py[cookies]"`.
-all = ["notebooklm-py[browser,dev,markdown]"]
+all = ["notebooklm-py[browser,dev,markdown,mcp,server]"]
 
 [project.scripts]
 notebooklm = "notebooklm.notebooklm_cli:main"
+notebooklm-mcp = "notebooklm.mcp.__main__:main"
+notebooklm-server = "notebooklm.server.__main__:main"
 
 [build-system]
 requires = ["hatchling", "hatch-fancy-pypi-readme"]
@@ -97,12 +111,27 @@ replacement = '](https://github.com/teng-lin/notebooklm-py/blob/v$HFPR_VERSION/L
 pattern = '\]\(SKILL\.md\)'
 replacement = '](https://github.com/teng-lin/notebooklm-py/blob/v$HFPR_VERSION/SKILL.md)'
 
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(AGENTS\.md\)'
+replacement = '](https://github.com/teng-lin/notebooklm-py/blob/v$HFPR_VERSION/AGENTS.md)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(CONTRIBUTING\.md\)'
+replacement = '](https://github.com/teng-lin/notebooklm-py/blob/v$HFPR_VERSION/CONTRIBUTING.md)'
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/notebooklm"]
 force-include = {"SKILL.md" = "notebooklm/data/SKILL.md", "AGENTS.md" = "notebooklm/data/CODEX.md"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put the repo root on sys.path so the ``tests`` package is importable as
+# ``tests.*`` under any invocation (plain ``pytest``/``uv run pytest`` does NOT
+# add CWD; only ``python -m pytest`` does). This is what lets test files use
+# fully-qualified ``from tests.integration.conftest import ...`` instead of bare
+# ``from conftest import ...`` (which resolved only via sys.path pollution and
+# broke isolated/xdist runs — issue #1482).
+pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--ignore=tests/e2e"
@@ -117,6 +146,7 @@ markers = [
     "no_keepalive_disable: opt a VCR test out of the global NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1 autouse fixture in tests/integration/conftest.py",
     "allow_no_vcr: opt a tests/integration/ test out of the integration-tree enforcement hook; use for mock-only tests that legitimately live under tests/integration/",
     "characterization: behavior-pinning unit tests that lock in current observable contracts and would be too synthetic to cassette-back",
+    "repo_lint: repo-wide audit/compat checks (cassette shapes, public surface, release gates, doc-sync, CI script audits). Slow; skip locally with `-m \"not repo_lint\"`. CI still runs them by default.",
 ]
 
 [tool.coverage.run]
@@ -140,10 +170,10 @@ fail_under = 90
 # rationale in the commit message.
 [tool.notebooklm.per_file_coverage_floors]
 "src/notebooklm/__main__.py" = 0
-"src/notebooklm/cli/_firefox_containers.py" = 75
-"src/notebooklm/cli/doctor.py" = 63
-"src/notebooklm/cli/profile.py" = 74
-"src/notebooklm/cli/session.py" = 83
+"src/notebooklm/cli/_firefox_containers.py" = 95
+"src/notebooklm/cli/doctor_cmd.py" = 63
+"src/notebooklm/cli/profile_cmd.py" = 74
+"src/notebooklm/cli/session_cmd.py" = 83
 
 [tool.mypy]
 python_version = "3.10"
@@ -154,6 +184,32 @@ check_untyped_defs = true
 ignore_missing_imports = true
 files = ["src/notebooklm"]
 exclude = ["tests/"]
+
+# Public library modules and moved implementation modules that back exported
+# public types are checked more strictly before the package advertises PEP 561
+# typing support via ``notebooklm/py.typed``.
+[[tool.mypy.overrides]]
+module = [
+    "notebooklm",
+    "notebooklm._types.*",
+    "notebooklm.artifacts",
+    "notebooklm.auth",
+    "notebooklm.client",
+    "notebooklm.config",
+    "notebooklm.exceptions",
+    "notebooklm.io",
+    "notebooklm.log",
+    "notebooklm.migration",
+    "notebooklm.paths",
+    "notebooklm.research",
+    "notebooklm.types",
+    "notebooklm.urls",
+    "notebooklm.utils",
+]
+disallow_untyped_defs = true
+disallow_any_generics = true
+warn_return_any = true
+strict_optional = true
 
 # Key check: catch attribute access on wrong types (would have caught our bugs)
 [[tool.mypy.overrides]]

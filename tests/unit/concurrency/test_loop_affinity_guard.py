@@ -2,27 +2,27 @@
 
 The free helper :func:`notebooklm._loop_affinity.assert_bound_loop` is the
 new shared chokepoint that every async entry point on the seam helpers
-(``_core_drain.TransportDrainTracker.drain``,
-``_core_reqid.ReqidCounter.next_reqid``,
-``_core_auth.AuthRefreshCoordinator.await_refresh``,
-``_artifact_polling.ArtifactPollingService.wait_for_completion``,
-``_chat.ChatAPI.ask``) now consults so a cross-loop call surfaces an
+(``_transport_drain.TransportDrainTracker.drain``,
+``_reqid_counter.ReqidCounter.next_reqid``,
+``_runtime.auth.AuthRefreshCoordinator.await_refresh``,
+``_artifact.polling.ArtifactPollingService.wait_for_completion``,
+``_chat.ChatAPI.ask``,
+``_source.upload.SourceUploadPipeline.add_file``) now consults so a cross-loop call surfaces an
 actionable ``RuntimeError`` at the call site rather than hanging on a
 lock bound to a dead loop.
 
-The inline guard at ``_core_transport.py:258-262`` already covers the
-transport-POST path. The new guard extends the same contract to the four
-async entry points that don't pass through that POST path (drain, reqid,
-auth refresh, artifact polling) and to the chat-ask lock that
-``_perform_authed_post`` only catches *after* the per-conversation lock
-acquire — too late.
+The guard in ``RuntimeTransport.perform_authed_post`` already covers the
+transport-POST path. The shared guard extends the same contract to the
+four async entry points that don't pass through that POST path (drain,
+reqid, auth refresh, artifact polling) and to the chat-ask/upload locks
+that the transport path only catches *after* a loop-bound acquire — too late.
 
 Acceptance:
 - ``bound_loop=None`` is a silent no-op (lazy / unopened helpers).
 - ``bound_loop=<current loop>`` is a silent no-op (steady state).
 - ``bound_loop=<a different loop>`` raises ``RuntimeError`` with the same
   diagnostic the transport guard uses.
-- Each of the 5 guarded entry points calls :func:`assert_bound_loop` with
+- Each of the 6 guarded entry points calls :func:`assert_bound_loop` with
   its own bound-loop reference before any awaits that touch loop-bound
   primitives (so cross-loop misuse never hits the lock-wait path).
 """
@@ -35,11 +35,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from notebooklm._artifact_polling import ArtifactPollingService
-from notebooklm._core_auth import AuthRefreshCoordinator
-from notebooklm._core_drain import TransportDrainTracker
-from notebooklm._core_reqid import ReqidCounter
+from notebooklm._artifact.polling import ArtifactPollingService
 from notebooklm._loop_affinity import assert_bound_loop
+from notebooklm._reqid_counter import ReqidCounter
+from notebooklm._runtime.auth import AuthRefreshCoordinator
+from notebooklm._transport_drain import TransportDrainTracker
 
 # ---------------------------------------------------------------------------
 # Free helper — the building block.
@@ -142,13 +142,13 @@ def test_await_refresh_guards_against_cross_loop_call() -> None:
     try:
         coord.set_bound_loop(other_loop)
 
-        # Minimal host mock; ``await_refresh`` only touches
-        # ``host._metrics_obj.record_lock_wait`` on the happy path, which
-        # the cross-loop guard short-circuits before reaching.
-        host = MagicMock()
-
+        # Wave 3b of session-decoupling (Task 1.0): ``await_refresh`` no
+        # longer takes a host parameter — the lock-wait metric is recorded
+        # via the coordinator's own ``metrics`` field (None here, which is
+        # a safe fallback). The cross-loop guard short-circuits before any
+        # metric is recorded either way.
         async def inner() -> None:
-            await coord.await_refresh(host)
+            await coord.await_refresh()
 
         with pytest.raises(RuntimeError, match="different event loop"):
             asyncio.run(inner())
@@ -159,16 +159,17 @@ def test_await_refresh_guards_against_cross_loop_call() -> None:
 def test_wait_for_completion_guards_against_cross_loop_call() -> None:
     """``ArtifactPollingService.wait_for_completion`` must raise on cross-loop misuse.
 
-    The service routes the guard through its capability adapter
-    (``self._capabilities.bound_loop``). A capability fake bound to loop
-    A and a fresh loop B for the call site reproduces the mismatch.
+    The service routes the guard through its capability adapter's
+    ``assert_bound_loop`` method.
     """
     capabilities = MagicMock()
     other_loop = asyncio.new_event_loop()
     try:
-        capabilities.bound_loop = other_loop
+        capabilities.assert_bound_loop = MagicMock(
+            side_effect=RuntimeError("NotebookLM client used from a different event loop")
+        )
 
-        service = ArtifactPollingService(capabilities)
+        service = ArtifactPollingService(loop_guard=capabilities, op_scope=capabilities)
 
         async def _unused_poll(_nb: str, _task: str) -> Any:
             raise AssertionError("poll_status should not run on cross-loop call")
@@ -189,18 +190,30 @@ def test_wait_for_completion_guards_against_cross_loop_call() -> None:
 def test_chat_ask_guards_against_cross_loop_call() -> None:
     """``ChatAPI.ask`` must raise on cross-loop misuse.
 
-    The chat entry consults its core capability's ``bound_loop`` *before*
+    The chat entry calls its ``loop_guard.assert_bound_loop`` *before*
     acquiring the per-conversation lock so a cross-loop follow-up doesn't
     hang on a lock bound to a dead loop.
+
+    Wave 8 of session-decoupling (ADR-0014 Rule 2 Corollary): ``ChatAPI``
+    takes the :class:`LoopGuard` collaborator directly via keyword arg
+    instead of reaching for it through a chat-local runtime composite.
     """
     from notebooklm._chat import ChatAPI
 
-    capabilities = MagicMock()
     other_loop = asyncio.new_event_loop()
     try:
-        capabilities.bound_loop = other_loop
+        loop_guard = MagicMock(
+            assert_bound_loop=MagicMock(
+                side_effect=RuntimeError("NotebookLM client used from a different event loop")
+            )
+        )
 
-        chat = ChatAPI(capabilities)
+        chat = ChatAPI(
+            rpc=MagicMock(),
+            transport=MagicMock(),
+            reqid=MagicMock(),
+            loop_guard=loop_guard,
+        )
 
         async def inner() -> None:
             await chat.ask("nb-id", "question", source_ids=["src-1"])
@@ -209,3 +222,66 @@ def test_chat_ask_guards_against_cross_loop_call() -> None:
             asyncio.run(inner())
     finally:
         other_loop.close()
+
+
+def test_add_file_guards_against_cross_loop_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SourceUploadPipeline.add_file`` must raise on cross-loop misuse.
+
+    Regression guard for audit finding C1: previously the upload pipeline
+    entered ``operation_scope`` and acquired the lazy upload
+    ``asyncio.Semaphore`` *before* any loop check, so a cross-loop
+    ``client.sources.add_file(...)`` could attach the semaphore to the
+    wrong loop before the documented ``RuntimeError`` guard fired.
+
+    The new contract: ``add_file`` calls ``lifecycle.assert_bound_loop()``
+    as its first statement (mirroring
+    ``ArtifactPollingService.wait_for_completion`` and ``ChatAPI.ask``)
+    so cross-loop misuse surfaces a clean ``RuntimeError`` before any
+    loop-bound primitive is touched. :class:`SourceUploadPipeline` takes
+    the lifecycle (``LoopGuard``) collaborator directly via its
+    ``lifecycle`` constructor slot.
+    """
+    from notebooklm._source.upload import SourceUploadPipeline
+
+    lifecycle = MagicMock()
+    lifecycle.assert_bound_loop = MagicMock(
+        side_effect=RuntimeError("NotebookLM client used from a different event loop")
+    )
+    rpc = MagicMock()
+    drain = MagicMock()
+    kernel = MagicMock()
+    auth = MagicMock()
+
+    # Construct the pipeline outside any running loop — its ``__init__`` is
+    # event-loop-agnostic; the cross-loop guard fires inside ``add_file``.
+    pipeline = SourceUploadPipeline(
+        rpc=rpc, drain=drain, lifecycle=lifecycle, kernel=kernel, auth=auth
+    )
+    register_file_source = MagicMock(side_effect=AssertionError("register should not run"))
+    start_resumable_upload = MagicMock(side_effect=AssertionError("start should not run"))
+    upload_file_streaming = MagicMock(side_effect=AssertionError("stream should not run"))
+    monkeypatch.setattr(pipeline, "register_file_source", register_file_source)
+    monkeypatch.setattr(pipeline, "start_resumable_upload", start_resumable_upload)
+    monkeypatch.setattr(pipeline, "upload_file_streaming", upload_file_streaming)
+
+    async def inner() -> None:
+        await pipeline.add_file(
+            "nb-id",
+            "/nonexistent/path/should-never-be-touched.pdf",
+        )
+
+    with pytest.raises(RuntimeError, match="different event loop"):
+        asyncio.run(inner())
+
+    # Confirm the cross-loop guard fired *before* any collaborator was
+    # touched. Three independent witnesses to the contract: the guard
+    # was called once, ``operation_scope`` (the loop-bound async-context
+    # manager the audit specifically calls out) was never entered, upload
+    # collaborators were never touched, and the lazy upload semaphore was
+    # never allocated.
+    lifecycle.assert_bound_loop.assert_called_once()
+    drain.operation_scope.assert_not_called()
+    register_file_source.assert_not_called()
+    start_resumable_upload.assert_not_called()
+    upload_file_streaming.assert_not_called()
+    assert pipeline._upload_semaphore is None

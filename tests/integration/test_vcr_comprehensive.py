@@ -16,19 +16,15 @@ Note: These tests are automatically skipped if cassettes are not available.
 import csv
 import json
 import os
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
-# Add tests directory to path for vcr_config import
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-from conftest import get_vcr_auth, skip_no_cassettes
 from notebooklm import NotebookLMClient, ReportFormat
 from notebooklm.types import Artifact, ArtifactType
-from vcr_config import notebooklm_vcr
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # Skip all tests in this module if cassettes are not available
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
@@ -162,9 +158,9 @@ class TestSourcesAPI:
             guide = await client.sources.get_guide(READONLY_NOTEBOOK_ID, sources[0].id)
         assert guide is not None
         # Verify values are actually populated (catches parsing bugs like issue #70)
-        assert guide["summary"], "Expected non-empty summary from source guide"
-        assert isinstance(guide["keywords"], list)
-        assert len(guide["keywords"]) > 0, "Expected non-empty keywords from source guide"
+        assert guide.summary, "Expected non-empty summary from source guide"
+        assert isinstance(guide.keywords, tuple)
+        assert len(guide.keywords) > 0, "Expected non-empty keywords from source guide"
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -286,6 +282,11 @@ class TestNotesAPI:
                 content="Original content.",
             )
             assert note is not None
+            # v0.8.0 (#1362): update() runs an existence preflight; stub the
+            # just-created note as a hit so the cassette (recorded pre-flip,
+            # without the extra GET_NOTES_AND_MIND_MAPS round-trip) still
+            # replays the create+update interactions only.
+            client.notes.get_or_none = AsyncMock(return_value=note)
             await client.notes.update(
                 MUTABLE_NOTEBOOK_ID,
                 note.id,
@@ -596,6 +597,17 @@ class TestArtifactsGenerateAPI:
             result = await client.artifacts.generate_flashcards(MUTABLE_NOTEBOOK_ID)
         assert result is not None
 
+    @pytest.mark.vcr
+    @pytest.mark.asyncio
+    @notebooklm_vcr.use_cassette("artifacts_retry_failed.yaml")
+    async def test_retry_failed(self):
+        """Retry a failed artifact in place — the same id comes back in_progress."""
+        artifact_id = "11111111-2222-3333-4444-555555555555"
+        async with vcr_client() as client:
+            result = await client.artifacts.retry_failed(MUTABLE_NOTEBOOK_ID, artifact_id)
+        assert result.task_id == artifact_id
+        assert result.status == "in_progress"
+
 
 # =============================================================================
 # Chat API
@@ -807,8 +819,8 @@ class TestSourcesAdditionalAPI:
             if not url_source:
                 pytest.skip("No WEB_PAGE source available for refresh")
             result = await client.sources.refresh(MUTABLE_NOTEBOOK_ID, url_source.id)
-        # refresh() returns True if initiated successfully (no exception)
-        assert result is True, "refresh() should return True on success"
+        # v0.8.0 (#1290): refresh() returns None on success (no exception)
+        assert result is None, "refresh() should return None on success"
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -844,7 +856,7 @@ class TestSourcesAdditionalAPI:
             assert source is not None
             # Delete it
             result = await client.sources.delete(MUTABLE_NOTEBOOK_ID, source.id)
-        assert result is True
+        assert result is None
 
 
 # =============================================================================
@@ -878,7 +890,7 @@ class TestNotebooksAdditionalAPI:
             assert notebook is not None
             # Delete it
             result = await client.notebooks.delete(notebook.id)
-        assert result is True
+        assert result is None
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -914,7 +926,7 @@ class TestNotesAdditionalAPI:
             assert note is not None
             # Delete it
             result = await client.notes.delete(MUTABLE_NOTEBOOK_ID, note.id)
-        assert result is True
+        assert result is None
 
 
 # =============================================================================
@@ -937,10 +949,18 @@ class TestArtifactsAdditionalAPI:
                 pytest.skip("No artifacts available")
             artifact = artifacts[0]
             original_title = artifact.title
-            # Rename
-            await client.artifacts.rename(MUTABLE_NOTEBOOK_ID, artifact.id, "VCR Renamed Artifact")
-            # Restore original name
-            await client.artifacts.rename(MUTABLE_NOTEBOOK_ID, artifact.id, original_title)
+            # v0.8.0 (#1362): return_object=False now runs the existence
+            # preflight too. Stub it as a hit (the artifact came from the list
+            # above, so it exists) so no extra LIST_ARTIFACTS round-trip fires
+            # and the existing cassette (rename RPC only) keeps replaying.
+            client.artifacts._listing.get_studio_only = AsyncMock(return_value=artifact)
+            # Rename, then restore the original name.
+            await client.artifacts.rename(
+                MUTABLE_NOTEBOOK_ID, artifact.id, "VCR Renamed Artifact", return_object=False
+            )
+            await client.artifacts.rename(
+                MUTABLE_NOTEBOOK_ID, artifact.id, original_title, return_object=False
+            )
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -955,7 +975,7 @@ class TestArtifactsAdditionalAPI:
             # Delete the first one
             artifact_id = artifacts[0].id
             deleted = await client.artifacts.delete(MUTABLE_NOTEBOOK_ID, artifact_id)
-        assert deleted is True
+        assert deleted is None
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -997,8 +1017,8 @@ class TestResearchAPI:
                 mode="fast",
             )
         assert result is not None
-        assert "task_id" in result
-        assert result["mode"] == "fast"
+        assert result.task_id
+        assert result.mode == "fast"
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -1007,16 +1027,22 @@ class TestResearchAPI:
         """Poll research status."""
         async with vcr_client() as client:
             # Start research first
-            await client.research.start(
+            start_result = await client.research.start(
                 MUTABLE_NOTEBOOK_ID,
                 query="Machine learning fundamentals",
                 source="web",
                 mode="fast",
             )
+            if not start_result or not start_result.task_id:
+                pytest.skip("Could not start research")
+
             # Poll for results
-            result = await client.research.poll(MUTABLE_NOTEBOOK_ID)
+            result = await client.research.poll(
+                MUTABLE_NOTEBOOK_ID,
+                task_id=start_result.task_id,
+            )
         assert result is not None
-        assert "status" in result
+        assert result.status
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -1031,19 +1057,22 @@ class TestResearchAPI:
                 source="web",
                 mode="fast",
             )
-            if not start_result:
+            if not start_result or not start_result.task_id:
                 pytest.skip("Could not start research")
 
             # Poll until we have sources (with timeout via cassette)
-            poll_result = await client.research.poll(MUTABLE_NOTEBOOK_ID)
-            if not poll_result.get("sources"):
+            poll_result = await client.research.poll(
+                MUTABLE_NOTEBOOK_ID,
+                task_id=start_result.task_id,
+            )
+            if not poll_result.sources:
                 pytest.skip("No research sources found")
 
             # Import first source
             imported = await client.research.import_sources(
                 MUTABLE_NOTEBOOK_ID,
-                start_result["task_id"],
-                poll_result["sources"][:1],
+                start_result.task_id,
+                poll_result.sources[:1],
             )
         assert isinstance(imported, list)
 
@@ -1060,5 +1089,5 @@ class TestResearchAPI:
                 mode="deep",
             )
         assert result is not None
-        assert "task_id" in result
-        assert result["mode"] == "deep"
+        assert result.task_id
+        assert result.mode == "deep"

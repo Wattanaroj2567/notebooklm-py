@@ -2,23 +2,35 @@
 
 from __future__ import annotations
 
-import sys
+import logging
+import reprlib
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from ..rpc.types import ArtifactStatus, ArtifactTypeCode, artifact_status_to_str
-from .common import UnknownTypeWarning, _deprecated_property_warning_state
-from .common import _datetime_from_timestamp as _common_datetime_from_timestamp
+from .._row_adapters.artifacts import ArtifactRow
+from .._row_adapters.notes import NoteRow
+from ..rpc.types import (
+    FLASHCARDS_VARIANT,
+    INTERACTIVE_MIND_MAP_VARIANT,
+    QUIZ_VARIANT,
+    ArtifactStatus,
+    ArtifactTypeCode,
+    artifact_status_to_str,
+)
+from .common import UnknownTypeWarning
+
+logger = logging.getLogger(__name__)
 
 
 class ArtifactType(str, Enum):
     """User-facing artifact types.
 
     This is a str enum that hides internal variant complexity. For example,
-    quizzes and flashcards are both type 4 internally but distinguished by variant.
+    quizzes, flashcards, and interactive mind maps are all type 4 internally,
+    distinguished by variant.
 
     Comparisons work with both enum members and strings:
         artifact.kind == ArtifactType.AUDIO  # True
@@ -51,38 +63,34 @@ _ARTIFACT_TYPE_CODE_MAP: dict[int, ArtifactType] = {
 }
 
 
-def _artifact_warning_state() -> set[tuple[int, int | None]]:
-    public_types = sys.modules.get("notebooklm.types")
-    if public_types is not None:
-        public_state = getattr(public_types, "_warned_artifact_types", None)
-        if isinstance(public_state, set):
-            return public_state
-    return _warned_artifact_types
-
-
 def _map_artifact_kind(artifact_type: int, variant: int | None) -> ArtifactType:
     """Convert internal artifact type and variant to user-facing ArtifactType.
 
     Args:
-        artifact_type: ArtifactTypeCode integer value from API.
-        variant: Optional variant code (e.g., for quiz vs flashcards).
+        artifact_type: Raw ArtifactTypeCode integer from LIST_ARTIFACTS, or the
+            library's synthetic note-backed mind-map code.
+        variant: Optional variant code (e.g., for quiz vs flashcards vs
+            interactive mind map).
 
     Returns:
         ArtifactType enum member. Returns UNKNOWN for unrecognized types.
     """
-    # Handle QUIZ/FLASHCARDS distinction.
+    # Resolve the type-4 family (QUIZ / FLASHCARDS / interactive mind map) by variant.
     if artifact_type == ArtifactTypeCode.QUIZ.value:
-        if variant == 1:
+        if variant == FLASHCARDS_VARIANT:
             return ArtifactType.FLASHCARDS
-        elif variant == 2:
+        elif variant == QUIZ_VARIANT:
             return ArtifactType.QUIZ
+        elif variant == INTERACTIVE_MIND_MAP_VARIANT:
+            # Interactive mind map: a studio artifact in the type-4 family,
+            # distinct from the note-backed mind map (synthetic type 5).
+            return ArtifactType.MIND_MAP
         else:
             key = (artifact_type, variant)
-            warned_artifact_types = _artifact_warning_state()
-            if key not in warned_artifact_types:
-                warned_artifact_types.add(key)
+            if key not in _warned_artifact_types:
+                _warned_artifact_types.add(key)
                 warnings.warn(
-                    f"Unknown QUIZ variant {variant}. "
+                    f"Unknown type-4 (quiz / flashcards / mind-map) variant {variant}. "
                     "Consider updating notebooklm-py to the latest version.",
                     UnknownTypeWarning,
                     stacklevel=3,
@@ -92,9 +100,8 @@ def _map_artifact_kind(artifact_type: int, variant: int | None) -> ArtifactType:
     result = _ARTIFACT_TYPE_CODE_MAP.get(artifact_type)
     if result is None:
         key = (artifact_type, variant)
-        warned_artifact_types = _artifact_warning_state()
-        if key not in warned_artifact_types:
-            warned_artifact_types.add(key)
+        if key not in _warned_artifact_types:
+            _warned_artifact_types.add(key)
             warnings.warn(
                 f"Unknown artifact type {artifact_type}. "
                 "Consider updating notebooklm-py to the latest version.",
@@ -105,101 +112,34 @@ def _map_artifact_kind(artifact_type: int, variant: int | None) -> ArtifactType:
     return result
 
 
-def _datetime_from_timestamp(value: Any) -> datetime | None:
-    """Convert an API seconds timestamp to ``datetime``, returning ``None`` if invalid."""
-    return _common_datetime_from_timestamp(value, datetime_type=datetime)
-
-
 def _is_valid_artifact_url(value: Any) -> bool:
     """Return True when ``value`` looks like a downloadable artifact URL."""
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
 
 def _extract_audio_artifact_url(data: list[Any]) -> str | None:
-    if len(data) <= 6 or not isinstance(data[6], list) or len(data[6]) <= 5:
-        return None
-
-    media_list = data[6][5]
-    if not isinstance(media_list, list):
-        return None
-
-    for item in media_list:
-        if (
-            isinstance(item, list)
-            and len(item) > 2
-            and item[2] == "audio/mp4"
-            and _is_valid_artifact_url(item[0])
-        ):
-            return item[0]
-
-    for item in media_list:
-        if isinstance(item, list) and item and _is_valid_artifact_url(item[0]):
-            return item[0]
-
-    return None
+    return ArtifactRow(data).artifact_url(ArtifactTypeCode.AUDIO.value, suppress_drift=True)
 
 
 def _extract_video_artifact_url(data: list[Any]) -> str | None:
-    if len(data) <= 8 or not isinstance(data[8], list):
-        return None
-
-    fallback_url = None
-    for media_list in data[8]:
-        if not isinstance(media_list, list):
-            continue
-        for item in media_list:
-            if not isinstance(item, list) or not item or not _is_valid_artifact_url(item[0]):
-                continue
-            if fallback_url is None:
-                fallback_url = item[0]
-            if len(item) > 2 and item[2] == "video/mp4":
-                if len(item) > 1 and item[1] == 4:
-                    return item[0]
-                fallback_url = item[0]
-
-    return fallback_url
+    return ArtifactRow(data).artifact_url(ArtifactTypeCode.VIDEO.value, suppress_drift=True)
 
 
 def _extract_infographic_artifact_url(data: list[Any]) -> str | None:
-    for item in data:
-        if not isinstance(item, list) or len(item) <= 2:
-            continue
-        content = item[2]
-        if not isinstance(content, list) or not content:
-            continue
-        first_content = content[0]
-        if not isinstance(first_content, list) or len(first_content) <= 1:
-            continue
-        img_data = first_content[1]
-        if isinstance(img_data, list) and img_data and _is_valid_artifact_url(img_data[0]):
-            return img_data[0]
-    return None
+    return ArtifactRow(data).artifact_url(ArtifactTypeCode.INFOGRAPHIC.value, suppress_drift=True)
 
 
 def _extract_slide_deck_artifact_url(data: list[Any]) -> str | None:
     """Extract the slide-deck PDF URL. The PPTX URL at ``data[16][4]`` is not
     surfaced — callers wanting PPTX should use ``download_slide_deck(output_format="pptx")``."""
-    if (
-        len(data) > 16
-        and isinstance(data[16], list)
-        and len(data[16]) > 3
-        and _is_valid_artifact_url(data[16][3])
-    ):
-        return data[16][3]
-    return None
+    return ArtifactRow(data).artifact_url(ArtifactTypeCode.SLIDE_DECK.value, suppress_drift=True)
 
 
 def _extract_artifact_url(data: list[Any], artifact_type: int | None) -> str | None:
     """Extract a public download URL from known artifact response shapes."""
-    if artifact_type == ArtifactTypeCode.AUDIO.value:
-        return _extract_audio_artifact_url(data)
-    if artifact_type == ArtifactTypeCode.VIDEO.value:
-        return _extract_video_artifact_url(data)
-    if artifact_type == ArtifactTypeCode.INFOGRAPHIC.value:
-        return _extract_infographic_artifact_url(data)
-    if artifact_type == ArtifactTypeCode.SLIDE_DECK.value:
-        return _extract_slide_deck_artifact_url(data)
-    return None
+    if artifact_type is None:
+        return None
+    return ArtifactRow(data).artifact_url(artifact_type, suppress_drift=True)
 
 
 @dataclass
@@ -231,7 +171,9 @@ class Artifact:
     status: int  # 1=processing, 2=pending, 3=completed, 4=failed
     created_at: datetime | None = None
     url: str | None = None
-    _variant: int | None = field(default=None, repr=False)  # For type 4: 1=flashcards, 2=quiz
+    _variant: int | None = field(
+        default=None, repr=False
+    )  # For type 4: 1=flashcards, 2=quiz, 4=interactive_mind_map
 
     @property
     def kind(self) -> ArtifactType:
@@ -243,83 +185,36 @@ class Artifact:
         """
         return _map_artifact_kind(self._artifact_type, self._variant)
 
-    @property
-    def artifact_type(self) -> int:
-        """Deprecated: Use .kind instead.
-
-        Returns the raw integer type code for backward compatibility.
-
-        .. deprecated:: 0.3.0
-            Use the ``.kind`` property which returns an ``ArtifactType`` enum.
-            Will be removed in v0.5.0.
-        """
-        _warned = _deprecated_property_warning_state()
-        if "Artifact.artifact_type" not in _warned:
-            _warned.add("Artifact.artifact_type")
-            warnings.warn(
-                "Artifact.artifact_type is deprecated, use .kind instead. "
-                "Will be removed in v0.5.0.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return self._artifact_type
-
-    @property
-    def variant(self) -> int | None:
-        """Deprecated: Use .kind, .is_quiz, or .is_flashcards instead.
-
-        Returns the variant code for type 4 artifacts (1=flashcards, 2=quiz).
-
-        .. deprecated:: 0.3.0
-            Use ``.kind == ArtifactType.QUIZ`` or ``.is_quiz`` / ``.is_flashcards``.
-            Will be removed in v0.5.0.
-        """
-        _warned = _deprecated_property_warning_state()
-        if "Artifact.variant" not in _warned:
-            _warned.add("Artifact.variant")
-            warnings.warn(
-                "Artifact.variant is deprecated. Use .kind, .is_quiz, or .is_flashcards "
-                "instead. Will be removed in v0.5.0.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        return self._variant
-
     @classmethod
     def from_api_response(cls, data: list[Any]) -> Artifact:
         """Parse artifact from API response.
 
-        Structure: [id, title, type, ..., status, ..., metadata, ...]
-        Position 9 contains options with variant code at [9][1][0]:
-          - For type 4: 1=flashcards, 2=quiz
+        Position knowledge for ``id`` / ``title`` / ``type`` / ``status``
+        / ``variant`` / ``timestamp`` lives in
+        :class:`notebooklm._row_adapters.artifacts.ArtifactRow`. This factory wraps
+        the raw row in an adapter and reads through its typed properties,
+        so any wire-shape change touches the adapter constants only.
+
+        URL extraction reads through :class:`ArtifactRow`; the private
+        ``_extract_artifact_url`` helper remains only as a compatibility
+        shim for downstream private imports.
         """
-        artifact_id = data[0] if len(data) > 0 else ""
-        title = data[1] if len(data) > 1 else ""
-        artifact_type = data[2] if len(data) > 2 else 0
-        status = data[4] if len(data) > 4 else 0
-
-        # Extract timestamp from data[15][0]
-        created_at = None
-        if len(data) > 15 and isinstance(data[15], list) and len(data[15]) > 0:
-            created_at = _datetime_from_timestamp(data[15][0])
-
-        # Extract variant code from data[9][1][0] for quiz/flashcard distinction
-        variant = None
-        if len(data) > 9 and isinstance(data[9], list) and len(data[9]) > 1:
-            options = data[9][1]
-            if isinstance(options, list) and len(options) > 0:
-                variant = options[0]
-
-        url = _extract_artifact_url(data, artifact_type if isinstance(artifact_type, int) else None)
+        row = ArtifactRow(data)
+        artifact_type = row.type_code
+        # ``row.type_code`` is statically typed ``int`` and normalises
+        # non-ints to ``0``; ``row.artifact_url`` then falls through to
+        # ``None`` for unrecognised codes — no separate ``isinstance``
+        # guard is needed here.
+        url = row.artifact_url(artifact_type, suppress_drift=True)
 
         return cls(
-            id=str(artifact_id),
-            title=str(title),
+            id=row.id,
+            title=row.title,
             _artifact_type=artifact_type,
-            status=status,
-            created_at=created_at,
+            status=row.status,
+            created_at=row.created_at,
             url=url,
-            _variant=variant,
+            _variant=row.variant,
         )
 
     @classmethod
@@ -340,35 +235,45 @@ class Artifact:
 
         Deleted/cleared mind map: ["id", None, 2]
 
+        Mind-map rows ARE note-system rows (they come from
+        ``GET_NOTES_AND_MIND_MAPS``), so the id slot, the title, and the
+        deleted-tombstone predicate are read through
+        :class:`notebooklm._row_adapters.notes.NoteRow` — position knowledge
+        lives in the adapter, not here. A ``None`` content slot *without* the
+        recognised ``[id, None, 2]`` tombstone is sentinel drift (a deleted
+        mind map would otherwise silently leak as live): it logs a WARNING and
+        conservatively keeps the historical treat-as-live fallthrough.
+
         Returns:
-            Artifact object, or None if deleted (status=2).
+            Artifact object, or None for the note-system delete tombstone
+            ``[id, None, 2]``.
         """
         if not isinstance(data, list) or len(data) < 1:
             return None
 
-        mind_map_id = data[0] if len(data) > 0 else ""
+        row = NoteRow(data)
 
-        # Check for deleted status (item[1] is None with status=2)
-        if len(data) >= 3 and data[1] is None and data[2] == 2:
-            return None  # Deleted, don't include
+        # Deleted tombstone ([id, None, 2]): excluded from listings.
+        if row.is_deleted:
+            return None
+        if row.has_unrecognized_tombstone:
+            logger.warning(
+                "Mind-map row %s has a null content slot without the "
+                "soft-delete sentinel (tombstone drift? a deleted mind map "
+                "may be leaking as live): %s",
+                row.id,
+                reprlib.repr(data),
+            )
 
-        # Extract title and timestamp from nested structure
-        title = ""
-        created_at = None
-
-        if len(data) > 1 and isinstance(data[1], list):
-            inner = data[1]
-            # Title is at position [4]
-            if len(inner) > 4 and isinstance(inner[4], str):
-                title = inner[4]
-            # Timestamp is at [2][2][0]
-            if len(inner) > 2 and isinstance(inner[2], list) and len(inner[2]) > 2:
-                ts_data = inner[2][2]
-                if isinstance(ts_data, list) and len(ts_data) > 0:
-                    created_at = _datetime_from_timestamp(ts_data[0])
+        # Title and the creation timestamp both come through the adapter:
+        # the timestamp slot (``row[1][2][2][0]``) is the SAME one ``NoteRow``
+        # decodes for the note path (issue #1529), so the position knowledge
+        # lives in one place rather than re-open-coding the inner descent here.
+        title = row.title
+        created_at = row.created_at
 
         return cls(
-            id=str(mind_map_id),
+            id=row.id,
             title=title,
             _artifact_type=ArtifactTypeCode.MIND_MAP.value,
             status=3,  # Mind maps are always "completed" once created
@@ -408,19 +313,52 @@ class Artifact:
     @property
     def is_quiz(self) -> bool:
         """Check if this is a quiz (type 4, variant 2)."""
-        return self._artifact_type == ArtifactTypeCode.QUIZ.value and self._variant == 2
+        return self._artifact_type == ArtifactTypeCode.QUIZ.value and self._variant == QUIZ_VARIANT
 
     @property
     def is_flashcards(self) -> bool:
         """Check if this is flashcards (type 4, variant 1)."""
-        return self._artifact_type == ArtifactTypeCode.QUIZ.value and self._variant == 1
+        return (
+            self._artifact_type == ArtifactTypeCode.QUIZ.value
+            and self._variant == FLASHCARDS_VARIANT
+        )
+
+    @property
+    def is_interactive_mind_map(self) -> bool:
+        """Whether this is an interactive (studio-artifact) mind map.
+
+        Interactive mind maps are studio artifacts in the type-4 family
+        (``type 4 / variant 4``), as opposed to note-backed mind maps which
+        the library surfaces with the synthetic type code 5. Both report
+        ``kind == ArtifactType.MIND_MAP``; this distinguishes the backing.
+        """
+        return (
+            self._artifact_type == ArtifactTypeCode.QUIZ.value
+            and self._variant == INTERACTIVE_MIND_MAP_VARIANT
+        )
+
+    @property
+    def is_unclassified_type4(self) -> bool:
+        """Whether this is a type-4 artifact whose variant slot is not yet populated.
+
+        A just-created interactive mind map (or quiz/flashcards) is a type-4
+        (QUIZ-family) artifact, but the variant code at ``[9][1][0]`` may read
+        ``None`` for a brief window after creation before the options block
+        fills in. During that window the row is neither classifiable as
+        interactive-mind-map nor quiz/flashcards. Callers that resolved a
+        concrete id (e.g. ``MindMapsAPI._find_interactive`` after
+        ``CREATE_ARTIFACT``) use this to id-match the settling artifact rather
+        than degrading to a placeholder (issue #1270).
+        """
+        return self._artifact_type == ArtifactTypeCode.QUIZ.value and self._variant is None
 
     @property
     def report_subtype(self) -> str | None:
         """Get the report subtype for type 2 artifacts.
 
         Returns:
-            'briefing_doc', 'study_guide', 'blog_post', or None if not a report.
+            'briefing_doc', 'study_guide', 'blog_post', 'report', or None if
+            not a report.
         """
         if self._artifact_type != ArtifactTypeCode.REPORT.value:
             return None
@@ -434,6 +372,62 @@ class Artifact:
         return "report"
 
 
+class GenerationState(str, Enum):
+    """The status string of an artifact generation task.
+
+    A ``str`` enum so existing string comparisons (``status == "completed"``),
+    membership checks, ``json.dumps``, ``f"{status}"``, and ``str(status)`` all
+    keep working unchanged. Member names map 1:1 onto the historical status
+    strings emitted by the poll/wait loops.
+    """
+
+    # poll-set: emitted by poll_status() / the generation parsers
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    NOT_FOUND = "not_found"
+    UNKNOWN = "unknown"
+    # wait-only: emitted by wait_for_completion() on a sustained delisting
+    REMOVED = "removed"
+
+    def __str__(self) -> str:
+        # Keep str(member) == member.value (e.g. "completed", not
+        # "GenerationState.COMPLETED") so display/serialization is unchanged.
+        return self.value
+
+    def __repr__(self) -> str:
+        # Keep repr(member) == repr(member.value) so console.print(status)
+        # of a GenerationStatus dataclass renders identically to the old
+        # plain-string field.
+        return repr(self.value)
+
+
+def _status_from_code(
+    code: int | None, *, none_status: GenerationState = GenerationState.PENDING
+) -> GenerationState:
+    """Map an API status code to a :class:`GenerationState` member.
+
+    ``None`` (no status reported yet) maps to ``none_status`` (``PENDING`` by
+    default). Any recognized code maps via :func:`artifact_status_to_str`;
+    unrecognized codes funnel to ``GenerationState.UNKNOWN``.
+
+    The range pin in ``tests/unit/test_generation_state.py`` proves that every
+    string ``artifact_status_to_str`` can return is a defined member today, so
+    the ``GenerationState(...)`` call cannot raise. The ``ValueError`` guard is
+    pure defense-in-depth against future schema drift (a new entry added to
+    ``_ARTIFACT_STATUS_MAP`` without a matching member): rather than blowing up
+    a poll loop, an unmapped string degrades to ``UNKNOWN``, mirroring
+    ``artifact_status_to_str``'s own "unknown for unrecognized codes" contract.
+    """
+    if code is None:
+        return none_status
+    try:
+        return GenerationState(artifact_status_to_str(code))
+    except ValueError:  # pragma: no cover - unreachable today (range pin), future-drift guard
+        return GenerationState.UNKNOWN
+
+
 @dataclass
 class GenerationStatus:
     """Status of an artifact generation task.
@@ -445,7 +439,10 @@ class GenerationStatus:
     """
 
     task_id: str  # Same as artifact_id - used for polling and becomes Artifact.id
-    status: str  # "pending", "in_progress", "completed", "failed", "not_found"
+    # "pending", "in_progress", "completed", "failed", "not_found", "removed", "unknown".
+    # Typed as GenerationState, but stays raw-string-permissive: instances built
+    # with a plain str keep working (the .is_* predicates compare with ==).
+    status: GenerationState
     url: str | None = None
     error: str | None = None
     error_code: str | None = None  # e.g., "USER_DISPLAYABLE_ERROR" for rate limits
@@ -483,18 +480,38 @@ class GenerationStatus:
         daily-quota rejection).
 
         ``wait_for_completion`` treats a sustained run of ``not_found``
-        responses as a failure — see its ``max_not_found`` parameter.
+        responses as a *removal* — see its ``max_not_found`` parameter and
+        :attr:`is_removed`.
         """
         return self.status == "not_found"
+
+    @property
+    def is_removed(self) -> bool:
+        """Check if the artifact was delisted by the server.
+
+        This status is set by ``wait_for_completion()`` when an artifact
+        disappears from the listing for a sustained run of polls (see its
+        ``max_not_found`` parameter). It is deliberately *distinct* from
+        :attr:`is_failed`: a ``failed`` artifact still exists in the listing
+        with a terminal FAILED status, whereas a ``removed`` artifact vanished
+        from the listing entirely — typically after a daily-quota rejection,
+        but possibly a transient list omission. Conflating the two would mask
+        a genuine terminal failure as a transient hiccup, or vice versa, so
+        callers that need to react differently can branch on this property.
+        """
+        return self.status == "removed"
 
     @property
     def is_rate_limited(self) -> bool:
         """Check if generation failed due to rate limiting or quota exceeded.
 
         Returns True when the API rejected the request, typically due to
-        too many requests or quota exhaustion.
+        too many requests or quota exhaustion. A ``removed`` status (the
+        artifact was delisted, often after a quota rejection) is treated the
+        same as a ``failed`` status here so that rate-limit retry policies
+        keep working when the server silently drops the artifact.
         """
-        if not self.is_failed:
+        if not (self.is_failed or self.is_removed):
             return False
 
         # Prefer structured error code when available

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from notebooklm._source_content import SourceContentRenderer
+from notebooklm._source.content import SourceContentRenderer
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import SourceNotFoundError
 
@@ -20,7 +20,7 @@ class RecordingRpc:
         self.response = response
         self.calls: list[dict[str, Any]] = []
 
-    async def __call__(
+    async def rpc_call(
         self,
         method: RPCMethod,
         params: list[Any],
@@ -29,6 +29,7 @@ class RecordingRpc:
         _is_retry: bool = False,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ) -> Any:
         self.calls.append(
             {
@@ -175,6 +176,61 @@ async def test_missing_source_raises_not_found() -> None:
 
 
 @pytest.mark.asyncio
+async def test_malformed_type_code_warns_and_degrades_to_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A present-but-non-int ``metadata[4]`` degrades to ``None`` LOUDLY (#1485).
+
+    Historically the slot was read with no validation at all, so a malformed
+    value flowed straight into ``SourceFulltext._type_code``. The read now
+    goes through ``SourceRow.type_code`` (int-validated); the malformed case
+    warns with a bounded payload preview.
+    """
+    renderer = SourceContentRenderer(
+        RecordingRpc(
+            [
+                ["src_bad", "Article", [None, None, None, None, "not-an-int"]],
+                None,
+                None,
+                [[["Body."]]],
+            ]
+        ),
+        logger=SOURCE_LOGGER,
+    )
+    caplog.set_level("WARNING", logger="notebooklm._sources")
+
+    fulltext = await renderer.get_fulltext("nb_1", "src_bad")
+
+    assert fulltext._type_code is None
+    assert fulltext.content == "Body."
+    assert "type-code slot malformed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        [None, None],  # too short to carry the type-code slot (absence)
+        [None, None, None, None, None],  # null type-code slot (absence)
+    ],
+)
+async def test_absent_type_code_stays_silent(
+    metadata: list[Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """An absent / ``None`` type-code slot keeps the silent ``None`` default."""
+    renderer = SourceContentRenderer(
+        RecordingRpc([["src_short", "Article", metadata], None, None, [[["Body."]]]]),
+        logger=SOURCE_LOGGER,
+    )
+    caplog.set_level("WARNING", logger="notebooklm._sources")
+
+    fulltext = await renderer.get_fulltext("nb_1", "src_short")
+
+    assert fulltext._type_code is None
+    assert "type-code slot malformed" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_url_and_type_parsing_uses_shared_metadata_rules() -> None:
     renderer = SourceContentRenderer(
         RecordingRpc(
@@ -229,7 +285,17 @@ async def test_get_guide_uses_exact_rpc_shape_and_parses_summary_keywords() -> N
 
     guide = await renderer.get_guide("nb_1", "src_1")
 
-    assert guide == {"summary": "Summary", "keywords": ["keyword1", "keyword2"]}
+    # Typed return; attribute access is the only way (keywords is a tuple).
+    assert guide.summary == "Summary"
+    assert guide.keywords == ("keyword1", "keyword2")
+    # The dict-subscript back-compat bridge was dropped in v0.8.0 (#1251): the
+    # dataclass is now attribute-only, so subscript raises a plain TypeError.
+    with pytest.raises(TypeError, match="not subscriptable"):
+        guide["summary"]  # type: ignore[index]
+    assert guide.to_public_dict() == {
+        "summary": "Summary",
+        "keywords": ["keyword1", "keyword2"],
+    }
     assert rpc.calls == [
         {
             "method": RPCMethod.GET_SOURCE_GUIDE,
@@ -258,6 +324,8 @@ async def test_get_guide_shape_variants_return_stable_defaults(response: Any) ->
 
     guide = await renderer.get_guide("nb_1", "src_1")
 
-    assert set(guide) == {"summary", "keywords"}
-    assert isinstance(guide["summary"], str)
-    assert isinstance(guide["keywords"], list)
+    # Attribute-only typed return (#1251): the historical key set lives in the
+    # to_public_dict() JSON shape, not on the dataclass's (removed) mapping API.
+    assert set(guide.to_public_dict()) == {"summary", "keywords"}
+    assert isinstance(guide.summary, str)
+    assert isinstance(guide.keywords, tuple)

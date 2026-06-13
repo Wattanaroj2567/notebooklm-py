@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from notebooklm._source_listing import SourceLister
+from notebooklm._source.listing import SourceLister
 from notebooklm.exceptions import RPCError
 from notebooklm.rpc import RPCMethod
 from notebooklm.rpc.types import SourceStatus
@@ -18,7 +18,7 @@ class RecordingRpc:
         self.response = response
         self.calls: list[tuple[RPCMethod, list[Any], str | None]] = []
 
-    async def __call__(
+    async def rpc_call(
         self,
         method: RPCMethod,
         params: list[Any],
@@ -27,6 +27,7 @@ class RecordingRpc:
         _is_retry: bool = False,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ) -> Any:
         self.calls.append((method, params, source_path))
         return self.response
@@ -74,17 +75,21 @@ async def test_list_uses_exact_get_notebook_rpc_shape() -> None:
         ([["Notebook", "not-a-list"]], "Sources data for nb_123 is not a list"),
     ],
 )
-async def test_malformed_payloads_log_and_return_empty(
+async def test_malformed_payloads_log_and_raise(
     payload: Any,
     message: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Strict decoding is the only mode (the ``NOTEBOOKLM_STRICT_DECODE=0``
+    # soft-mode opt-out was retired in v0.7.0): a malformed payload always logs
+    # the diagnostic warning AND raises, rather than silently returning ``[]``
+    # (issue #1159).
     lister = SourceLister(RecordingRpc(payload))
     caplog.set_level("WARNING", logger="notebooklm._sources")
 
-    sources = await lister.list("nb_123")
+    with pytest.raises(RPCError):
+        await lister.list("nb_123")
 
-    assert sources == []
     assert message in caplog.text
     assert caplog.records[0].name == "notebooklm._sources"
 
@@ -97,7 +102,7 @@ async def test_malformed_payloads_log_and_return_empty(
         ([], "API response structure changed"),
         (["notebook"], "API response structure changed"),
         ([["Notebook"]], "API response structure changed"),
-        ([["Notebook", None]], "sources data is NoneType, not list"),
+        ([["Notebook", "not-a-list"]], "sources data is str, not list"),
     ],
 )
 async def test_strict_mode_raises_rpc_error_for_malformed_payloads(
@@ -108,6 +113,56 @@ async def test_strict_mode_raises_rpc_error_for_malformed_payloads(
 
     with pytest.raises(RPCError, match=message):
         await lister.list("nb_123", strict=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (None, "API response structure changed"),
+        ([], "API response structure changed"),
+        (["notebook"], "API response structure changed"),
+        ([["Notebook"]], "API response structure changed"),
+        ([["Notebook", "not-a-list"]], "sources data is str, not list"),
+    ],
+)
+async def test_malformed_payloads_raise_by_default_under_strict_decode(
+    payload: Any,
+    message: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for issue #1159: with strict-decode at its default (ON), a
+    # malformed/error-shaped response must raise rather than silently return
+    # an empty list, even without an explicit ``strict=True``.
+    monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
+    lister = SourceLister(RecordingRpc(payload))
+    caplog.set_level("WARNING", logger="notebooklm._sources")
+
+    with pytest.raises(RPCError, match=message):
+        await lister.list("nb_123")
+
+    # The drift WARNING on the historical "SourcesAPI.list:" prefix must still
+    # fire in strict mode so log-based monitoring keeps its breadcrumb.
+    assert "SourcesAPI.list:" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+async def test_null_sources_slot_is_empty_notebook_not_malformed(
+    strict: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A genuinely empty notebook elides the sources slot as ``None`` (see
+    # tests/cassettes/notebook_zero_sources.yaml). Per issue #1159 this is a
+    # valid empty state and must return ``[]`` regardless of strict mode,
+    # never raising or warning.
+    monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
+    lister = SourceLister(
+        RecordingRpc([["Notebook Title", None, "nb_123", "", None, [1, False], None, None, None]])
+    )
+
+    assert await lister.list("nb_123", strict=strict) == []
 
 
 @pytest.mark.asyncio

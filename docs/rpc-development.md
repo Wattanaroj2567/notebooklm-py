@@ -1,9 +1,11 @@
 # RPC Development Guide
 
 **Status:** Active
-**Last Updated:** 2026-05-14
+**Last Updated:** 2026-06-11
 
 This guide covers everything about NotebookLM's RPC protocol: capturing calls, debugging issues, and implementing new methods.
+
+See also: [Python API Reference](python-api.md)
 
 ---
 
@@ -34,7 +36,14 @@ NotebookLM uses Google's `batchexecute` RPC protocol.
 ### Source of Truth
 
 - **RPC method IDs:** `src/notebooklm/rpc/types.py`
-- **Payload structures:** `docs/rpc-reference.md`
+- **Payload builders:** the owning implementation modules, for example
+  `_notebooks.py::build_create_notebook_params`,
+  `_source/upload_payloads.py`, `_source/add.py`, `_label/params.py`, and
+  `_artifact/payloads.py`
+- **Golden payload tests:** `tests/unit/test_rpc_golden_payloads.py` and
+  feature-specific unit tests such as `tests/unit/test_label_params.py`
+- **Human reference:** `docs/rpc-reference.md`, updated after the builder and
+  tests land
 
 ---
 
@@ -103,7 +112,7 @@ async def setup_capture_session():
     page = browser.pages[0] if browser.pages else await browser.new_page()
     captured_rpcs = []
 
-    async def handle_request(request):
+    def handle_request(request):
         if "batchexecute" in request.url:
             post_data = request.post_data
             if post_data and "f.req" in post_data:
@@ -250,12 +259,11 @@ Use Chrome DevTools or Playwright (see above).
 Document each position in the params array:
 
 ```python
-# Example: ADD_SOURCE for URL
+# Example: ADD_SOURCE for URL after the Gemini-3.5 wire-shape migration
 params = [
-    [[None, None, [url], None, None, None, None, None]],  # 0: Source data
-    notebook_id,   # 1: Notebook ID
-    [2],           # 2: Fixed flag
-    None,          # 3: Optional settings
+    [[None, None, [url], None, None, None, None, None, None, None, 1]],
+    notebook_id,
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
 ]
 ```
 
@@ -290,7 +298,7 @@ async def new_method(self, notebook_id: str, param: str) -> SomeResult:
         [2],             # Position 2: Fixed flag
     ]
 
-    result = await self._core.rpc_call(
+    result = await self._rpc.rpc_call(
         RPCMethod.NEW_METHOD,
         params,
         source_path=f"/notebook/{notebook_id}",
@@ -320,21 +328,22 @@ class SomeResult:
 def test_encode_new_method():
     params = ["value", "notebook_id", [2]]
     result = encode_rpc_request(RPCMethod.NEW_METHOD, params)
-    assert "AbCdEf" in result
+    assert result[0][0][0] == "AbCdEf"
 ```
 
-**Integration test** (`tests/integration/`):
+**Unit test with a fake RPC executor** (`tests/unit/`):
 ```python
 @pytest.mark.asyncio
 async def test_new_method(mock_client):
     mock_response = ["result_id", "Result Title"]
-    with patch('notebooklm._core.ClientCore.rpc_call', new_callable=AsyncMock) as mock:
+    with patch('notebooklm._rpc_executor.RpcExecutor.rpc_call', new_callable=AsyncMock) as mock:
         mock.return_value = mock_response
         result = await mock_client.some_api.new_method("nb_id", "param")
         assert result.id == "result_id"
 ```
 
-**E2E test** (`tests/e2e/`):
+**VCR-backed integration test** (`tests/integration/`) or authenticated E2E
+test (`tests/e2e/`):
 ```python
 @pytest.mark.e2e
 @pytest.mark.asyncio
@@ -392,10 +401,10 @@ Some methods require `source_path` for routing:
 
 ```python
 # May fail without source_path
-await self._core.rpc_call(RPCMethod.X, params)
+await self._rpc.rpc_call(RPCMethod.X, params)
 
 # Correct
-await self._core.rpc_call(
+await self._rpc.rpc_call(
     RPCMethod.X,
     params,
     source_path=f"/notebook/{notebook_id}",
@@ -407,7 +416,7 @@ await self._core.rpc_call(
 API returns nested arrays. Print raw response first:
 
 ```python
-result = await self._core.rpc_call(...)
+result = await self._rpc.rpc_call(...)
 print(f"DEBUG: {result}")  # See actual structure
 ```
 
@@ -467,20 +476,26 @@ Document:
 ### Validation
 
 ```python
-async def validate_rpc_call(rpc_id: str, params: list, expected_action: str):
+async def validate_root_rpc_call(method_name: str, params: list):
     from notebooklm import NotebookLMClient
+    from notebooklm.rpc import RPCMethod
 
-    async with await NotebookLMClient.from_storage() as client:
-        result = await client._rpc_call(RPCMethod(rpc_id), params)
+    async with NotebookLMClient.from_storage() as client:
+        # Public raw calls use the default root source path. For notebook-scoped
+        # calls that need source_path="/notebook/<id>", prefer the typed
+        # namespace API or a focused internal test around RpcExecutor.
+        result = await client.rpc_call(RPCMethod[method_name], params)
 
-    assert result is not None, f"RPC {rpc_id} returned None"
-    return {"rpc_id": rpc_id, "action": expected_action, "status": "verified"}
+    assert result is not None, f"RPC {method_name} returned None"
+    return {"method": method_name, "status": "verified"}
 ```
 
 ## RPC Health Check Triage Policy
 
-The `rpc-health.yml` workflow runs daily (07:00 UTC) and opens an issue on any
-detected RPC ID mismatch, auth failure, or non-transient RPC error:
+The `rpc-health.yml` workflow runs daily for `main` (07:00 UTC). Release branch
+health checks are manual via `custom_branch=release/vX.Y.Z`. The workflow opens
+an issue on any detected RPC ID mismatch, auth failure, or non-transient RPC
+error:
 
 - **RPC ID mismatch** issues (exit code 1): labeled `bug, rpc-breakage, automated`.
 - **Auth failure** issues (exit code 2): labeled `bug, automated` (no `rpc-breakage`
@@ -490,7 +505,8 @@ detected RPC ID mismatch, auth failure, or non-transient RPC error:
   the rate-limit / `RESOURCE_EXHAUSTED` filter (timeouts, parse failures,
   unexpected HTTP errors). The issue body lists the affected method IDs
   extracted from the report, so triage can start without re-running the check.
-  See `.github/workflows/rpc-health.yml:76-109` for the body-assembly step.
+  See the `Extract failing methods for ERROR issue` step in
+  `.github/workflows/rpc-health.yml` for the body-assembly logic.
 
 Routing:
 

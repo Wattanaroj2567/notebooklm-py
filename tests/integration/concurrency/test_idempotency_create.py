@@ -2,7 +2,7 @@
 
 Audit item #2 (`thread-safety-concurrency-audit.md` §2):
 Pre-fix, mutating create RPCs (CREATE_NOTEBOOK, ADD_SOURCE) ran inside
-`_perform_authed_post`'s transport retry loop, so a 5xx / network blip
+the shared transport retry loop, so a 5xx / network blip
 between server-side commit and client-side response triggered a naive
 re-POST that duplicated the resource.
 
@@ -26,7 +26,7 @@ Test plan:
 5. sources.add_url (YouTube) — idempotent on 5xx retry
 6. sources.add_text — raises NonIdempotentRetryError when idempotent=True
 7. sources.add_text — default behavior unchanged
-8. disable_internal_retries — propagates through to _perform_authed_post
+8. disable_internal_retries — propagates through to RuntimeTransport.perform_authed_post
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import json
 import httpx
 import pytest
 
+import notebooklm._runtime.helpers as _runtime_helpers
 from notebooklm import (
     NonIdempotentRetryError,
     NotebookLMClient,
@@ -43,6 +44,7 @@ from notebooklm import (
     ServerError,
 )
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
 
 # mock-transport idempotency tests; no HTTP, no cassette. Opt out
 # of the tier-enforcement hook in tests/integration/conftest.py.
@@ -129,7 +131,7 @@ def _make_client_with_transport(
     """Construct a ``NotebookLMClient`` whose underlying httpx client
     uses the supplied mock transport.
 
-    Bypasses the full ``ClientCore.open()`` path (which would try to
+    Bypasses the full ``ClientLifecycle.open()`` path (which would try to
     construct a real ``httpx.AsyncClient`` with cookies + connection
     pool) by stubbing in a pre-built ``AsyncClient`` wired to the
     ``transport`` argument.
@@ -138,11 +140,14 @@ def _make_client_with_transport(
         auth_tokens,
         server_error_max_retries=server_error_max_retries,
     )
-    client._core._http_client = httpx.AsyncClient(
-        transport=transport,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        },
+    install_http_client_for_test(
+        client._collaborators.kernel,
+        httpx.AsyncClient(
+            transport=transport,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+        ),
     )
     return client
 
@@ -200,7 +205,7 @@ async def test_notebooks_create_idempotent_on_5xx_retry(auth_tokens) -> None:
     try:
         notebook = await client.notebooks.create(title)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert notebook.id == nb_id_new
     assert notebook.title == title
@@ -242,7 +247,7 @@ async def test_notebooks_create_re_creates_when_probe_finds_nothing(auth_tokens)
     try:
         notebook = await client.notebooks.create(title)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert notebook.id == nb_id_new
     # Two CREATE_NOTEBOOK calls: original (502) + retry (200)
@@ -281,7 +286,7 @@ async def test_notebooks_create_raises_on_ambiguous_probe(auth_tokens) -> None:
         with pytest.raises(RPCError, match="disambiguate"):
             await client.notebooks.create(title)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +323,7 @@ async def test_sources_add_url_idempotent_on_5xx_retry(auth_tokens) -> None:
     try:
         source = await client.sources.add_url(notebook_id, url)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     assert source.url == url
@@ -358,7 +363,7 @@ async def test_sources_add_youtube_idempotent_on_5xx_retry(auth_tokens) -> None:
     try:
         source = await client.sources.add_url(notebook_id, url)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     assert source.url == url
@@ -390,7 +395,7 @@ async def test_sources_add_text_raises_when_idempotent_True(auth_tokens) -> None
         with pytest.raises(NonIdempotentRetryError, match="add_text cannot be marked idempotent"):
             await client.sources.add_text("nb_test", "Title", "Content", idempotent=True)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert not seen_request, "add_text(idempotent=True) must raise before issuing any RPC"
 
@@ -425,7 +430,7 @@ async def test_sources_add_text_default_behavior_unchanged(auth_tokens) -> None:
     try:
         source = await client.sources.add_text(notebook_id, title, "the body")
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     assert add_count == 1, f"expected exactly 1 ADD_SOURCE call, got {add_count}"
@@ -448,8 +453,9 @@ async def test_disable_internal_retries_propagates_to_perform_authed_post(
         (initial + 2 retries) before raising.
       - ``disable_internal_retries=True`` issues exactly 1 POST.
 
-    Patches ``asyncio.sleep`` to a no-op so the test doesn't pay the
-    exponential-backoff wall time on the default-retries path.
+    Swaps the retry seam's ``asyncio.sleep`` for a no-op so the test doesn't
+    pay the exponential-backoff wall time on the default-retries path, and
+    asserts that seam was actually exercised.
     """
     request_count = 0
 
@@ -461,17 +467,25 @@ async def test_disable_internal_retries_propagates_to_perform_authed_post(
     transport = httpx.MockTransport(handler)
 
     # Skip backoff sleeps — only the *count* of retries matters here.
+    sleep_calls = 0
+
     async def _no_sleep(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
         return None
 
-    monkeypatch.setattr("notebooklm._core.asyncio.sleep", _no_sleep)
+    # Object-form patch against a locally-imported seam alias (ADR-0007 Form 2):
+    # ``resolve_sleep`` re-reads ``asyncio.sleep`` from the ``_runtime.helpers``
+    # module global on every call, so swapping ``sleep`` on that module's
+    # ``asyncio`` reference is what the retry loop observes.
+    monkeypatch.setattr(_runtime_helpers.asyncio, "sleep", _no_sleep)
 
     # --- with disable_internal_retries=True: exactly 1 POST ------------
     client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
     try:
         request_count = 0
         with pytest.raises(ServerError):
-            await client._core.rpc_call(
+            await client._rpc_executor.rpc_call(
                 RPCMethod.LIST_NOTEBOOKS,
                 [None, 1, None, [2]],
                 disable_internal_retries=True,
@@ -480,18 +494,27 @@ async def test_disable_internal_retries_propagates_to_perform_authed_post(
             f"with disable_internal_retries=True expected 1 POST, got {request_count}"
         )
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # --- without the flag: default retry loop fires ---------------------
     client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
     try:
         request_count = 0
         with pytest.raises(ServerError):
-            await client._core.rpc_call(
+            await client._rpc_executor.rpc_call(
                 RPCMethod.LIST_NOTEBOOKS,
                 [None, 1, None, [2]],
             )
         # initial + 2 retries = 3 POSTs
         assert request_count == 3, f"with default retries expected 3 POSTs, got {request_count}"
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
+
+    # Bite-check: the patched seam must actually have been exercised. The
+    # default-retries path fires one backoff sleep per retry (2 retries), so a
+    # wrong-namespace patch that silently no-ops would leave ``sleep_calls`` at
+    # zero and fail here rather than passing on stale behaviour.
+    assert sleep_calls >= 2, (
+        f"patched asyncio.sleep seam was not exercised (sleep_calls={sleep_calls}); "
+        "the Form-2 object-form patch did not land on the live retry seam"
+    )

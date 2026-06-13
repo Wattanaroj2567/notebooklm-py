@@ -3,9 +3,9 @@
 Covers the --profile flag added in issue #339 without spinning up the full
 E2E suite (which requires real auth).
 
-The E2E conftest is loaded by file path because `tests/` is not a Python
-package (no `__init__.py`), so a normal `from tests.e2e import conftest`
-import would fail under pytest.
+The E2E conftest is loaded by file path so these unit tests can execute a fresh
+copy of the hook module without invoking pytest's conftest discovery or the
+authenticated E2E suite.
 """
 
 from __future__ import annotations
@@ -14,6 +14,10 @@ import importlib.util
 import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+import pytest
+
+from notebooklm.exceptions import RateLimitError
 
 CONFTEST_PATH = Path(__file__).resolve().parents[1] / "e2e" / "conftest.py"
 
@@ -28,6 +32,43 @@ def _load_e2e_conftest() -> ModuleType:
 
 def _make_config(profile: str | None) -> SimpleNamespace:
     return SimpleNamespace(getoption=lambda name: profile if name == "--profile" else None)
+
+
+class _FakeItem:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.markers: list[object] = []
+
+    def add_marker(self, marker: object) -> None:
+        self.markers.append(marker)
+
+
+class TestE2EMarkerContract:
+    """E2E files are marked before pytest applies -m deselection."""
+
+    def test_item_under_e2e_directory_gets_e2e_marker(self):
+        conftest = _load_e2e_conftest()
+        item = _FakeItem(conftest.E2E_TEST_DIR / "test_chat.py")
+
+        conftest.pytest_itemcollected(item)
+
+        assert [marker.name for marker in item.markers] == ["e2e"]
+
+    def test_item_outside_e2e_directory_is_not_marked(self):
+        conftest = _load_e2e_conftest()
+        item = _FakeItem(Path(__file__))
+
+        conftest.pytest_itemcollected(item)
+
+        assert item.markers == []
+
+    def test_path_helper_uses_resolved_containment(self):
+        conftest = _load_e2e_conftest()
+
+        assert conftest._is_path_under(
+            conftest.E2E_TEST_DIR / "test_chat.py", conftest.E2E_TEST_DIR
+        )
+        assert not conftest._is_path_under(Path(__file__), conftest.E2E_TEST_DIR)
 
 
 class TestProfileOptionLifecycle:
@@ -164,3 +205,69 @@ class TestRateLimitSkipSummary:
         # Still emits the pytest section locally — just no GH-specific bits.
         assert any(call[0] == "sep" for call in tr._writes)
         assert capsys.readouterr().out == ""
+
+
+class TestGenerationRateLimitSkip:
+    """_install_generation_rate_limit_skip turns typed RateLimitError into skips.
+
+    The RPC layer raises RateLimitError from generate_* before any
+    GenerationStatus exists, so assert_generation_started's is_rate_limited
+    path never runs. Only the typed RateLimitError may skip; every other
+    exception must propagate (no-xfail-live-service-errors policy).
+    """
+
+    @staticmethod
+    def _make_client():
+        class FakeArtifacts:
+            async def generate_audio(self, notebook_id):
+                raise RateLimitError(
+                    "API rate limit or quota exceeded. Please wait before retrying."
+                )
+
+            async def generate_video(self, notebook_id):
+                return f"video:{notebook_id}"
+
+            async def revise_slide(self, notebook_id):
+                raise ValueError("not a rate limit")
+
+            async def delete(self, notebook_id, artifact_id):
+                raise RateLimitError("should never be wrapped")
+
+        return SimpleNamespace(artifacts=FakeArtifacts())
+
+    async def test_rate_limit_error_becomes_skip(self):
+        conftest = _load_e2e_conftest()
+        client = self._make_client()
+        conftest._install_generation_rate_limit_skip(client)
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            await client.artifacts.generate_audio("nb-1")
+
+        # Reason must match _RATE_LIMIT_PHRASES so pytest_terminal_summary
+        # surfaces the skip in the rate-limit section + GH annotations.
+        reason = str(excinfo.value).lower()
+        assert any(phrase in reason for phrase in conftest._RATE_LIMIT_PHRASES)
+
+    async def test_other_exceptions_propagate(self):
+        conftest = _load_e2e_conftest()
+        client = self._make_client()
+        conftest._install_generation_rate_limit_skip(client)
+
+        with pytest.raises(ValueError, match="not a rate limit"):
+            await client.artifacts.revise_slide("nb-1")
+
+    async def test_successful_calls_pass_through_per_method(self):
+        # Closure safety: each wrapped name must bind its own original.
+        conftest = _load_e2e_conftest()
+        client = self._make_client()
+        conftest._install_generation_rate_limit_skip(client)
+
+        assert await client.artifacts.generate_video("nb-1") == "video:nb-1"
+
+    async def test_non_generation_methods_are_not_wrapped(self):
+        conftest = _load_e2e_conftest()
+        client = self._make_client()
+        conftest._install_generation_rate_limit_skip(client)
+
+        with pytest.raises(RateLimitError):
+            await client.artifacts.delete("nb-1", "art-1")

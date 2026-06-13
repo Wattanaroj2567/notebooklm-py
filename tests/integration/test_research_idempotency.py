@@ -40,6 +40,7 @@ import pytest
 from notebooklm import NotebookLMClient, ServerError
 from notebooklm._idempotency import IDEMPOTENCY_REGISTRY, IdempotencyPolicy
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
 
 # Mock-transport tests; no HTTP / no cassette. Opt out of the
 # tier-enforcement hook in tests/integration/conftest.py.
@@ -69,11 +70,14 @@ def _make_client_with_transport(
         auth_tokens,
         server_error_max_retries=server_error_max_retries,
     )
-    client._core._http_client = httpx.AsyncClient(
-        transport=transport,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        },
+    install_http_client_for_test(
+        client._collaborators.kernel,
+        httpx.AsyncClient(
+            transport=transport,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+        ),
     )
     return client
 
@@ -160,7 +164,7 @@ async def test_start_fast_research_no_inner_retry_on_5xx(auth_tokens) -> None:
         with pytest.raises(ServerError):
             await client.research.start(notebook_id, "what is quantum computing?")
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # NON_IDEMPOTENT_NO_RETRY forces effective_disable_internal_retries=True
     # so the inner retry loop does not fire — exactly ONE POST.
@@ -192,7 +196,7 @@ async def test_start_deep_research_no_inner_retry_on_5xx(auth_tokens) -> None:
         with pytest.raises(ServerError):
             await client.research.start(notebook_id, "deep dive query", mode="deep")
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert request_count == 1, (
         f"expected exactly 1 START_DEEP_RESEARCH (NON_IDEMPOTENT_NO_RETRY), got {request_count}"
@@ -228,7 +232,7 @@ async def test_import_research_no_inner_retry_on_5xx(auth_tokens) -> None:
         with pytest.raises(ServerError):
             await client.research.import_sources(notebook_id, task_id, sources)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert request_count == 1, (
         f"expected exactly 1 IMPORT_RESEARCH (NON_IDEMPOTENT_NO_RETRY), got {request_count}"
@@ -268,8 +272,8 @@ async def test_start_fast_research_happy_path_one_post(auth_tokens) -> None:
     try:
         result = await client.research.start(notebook_id, "test query")
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert result is not None
-    assert result["task_id"] == "task_xyz"
+    assert result.task_id == "task_xyz"
     assert request_count == 1

@@ -4,7 +4,7 @@ This module provides the NotebookLMClient class, a modern async client
 for interacting with Google NotebookLM using undocumented RPC APIs.
 
 Example:
-    async with await NotebookLMClient.from_storage() as client:
+    async with NotebookLMClient.from_storage() as client:
         # List notebooks
         notebooks = await client.notebooks.list()
 
@@ -21,10 +21,9 @@ Example:
 
 from __future__ import annotations
 
-import dataclasses
+import asyncio
 import logging
-import os
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -35,22 +34,49 @@ if TYPE_CHECKING:
     from .rpc import RPCMethod
     from .types import ClientMetricsSnapshot, ConnectionLimits, RpcTelemetryEvent
 
+# The construction wiring lives in ``_client_assembly`` (the seam shared
+# with the canonical test factory), but the names below stay runtime
+# imports on purpose:
+#
+# - the feature-API / collaborator types annotate the class-level
+#   attribute block, and keeping them importable at runtime keeps
+#   ``typing.get_type_hints(NotebookLMClient)`` working for downstream
+#   introspection;
+# - this module's attribute surface (``notebooklm.client.SourcesAPI``
+#   etc.) predates the assembly split and is kept byte-compatible so
+#   external tooling/imports against it don't break. The F401-suppressed
+#   names are exactly the previously-importable names the annotations no
+#   longer reference.
 from ._artifacts import ArtifactsAPI
 from ._auth.session import refresh_auth_session
 from ._chat import ChatAPI
-from ._core import (
+from ._client_assembly import _assemble_client
+from ._client_composed import ClientComposed
+from ._client_seams import ClientSeams
+from ._client_seams import resolve_client_seams as resolve_client_seams  # noqa: F401
+from ._deprecation import warn_deprecated
+from ._env import get_base_url as get_base_url
+from ._labels import LabelsAPI
+from ._mind_map import NoteBackedMindMapService as NoteBackedMindMapService  # noqa: F401
+from ._mind_maps_api import MindMapsAPI
+from ._note_service import NoteService as NoteService  # noqa: F401
+from ._notebooks import NotebooksAPI
+from ._notes import NotesAPI
+from ._research import ResearchAPI
+from ._rpc_executor import RpcExecutor
+from ._runtime.config import (
+    DEFAULT_CHAT_TIMEOUT,
     DEFAULT_KEEPALIVE_MIN_INTERVAL,
     DEFAULT_MAX_CONCURRENT_RPCS,
     DEFAULT_MAX_CONCURRENT_UPLOADS,
     DEFAULT_TIMEOUT,
-    ClientCore,
 )
-from ._env import get_base_url as get_base_url
-from ._notebooks import NotebooksAPI
-from ._notes import NotesAPI
-from ._research import ResearchAPI
+from ._runtime.init import RuntimeCollaborators
+from ._runtime.init import compose_client_internals as compose_client_internals  # noqa: F401
+from ._runtime.lifecycle import CookieRotator, CookieSaver
 from ._settings import SettingsAPI
 from ._sharing import SharingAPI
+from ._source.upload import SourceUploadPipeline
 from ._sources import SourcesAPI
 from ._url_utils import is_google_auth_redirect as is_google_auth_redirect
 from .auth import AuthTokens
@@ -73,12 +99,14 @@ class NotebookLMClient:
     - chat: Ask questions and manage conversations
     - research: Start research sessions and import sources
     - notes: Create and manage user notes
+    - mind_maps: Generate and manage note-backed and interactive mind maps
     - settings: Manage user settings (output language, etc.)
     - sharing: Manage notebook sharing and permissions
+    - labels: AI-group sources into topic labels (auto-label / reorganize)
 
     Usage:
-        # Create from saved authentication
-        async with await NotebookLMClient.from_storage() as client:
+        # Create from saved authentication (canonical idiom)
+        async with NotebookLMClient.from_storage() as client:
             notebooks = await client.notebooks.list()
 
         # Create from AuthTokens directly
@@ -93,10 +121,36 @@ class NotebookLMClient:
         chat: ChatAPI for conversations
         research: ResearchAPI for web/drive research
         notes: NotesAPI for user notes
+        mind_maps: MindMapsAPI for note-backed and interactive mind maps
         settings: SettingsAPI for user settings
         sharing: SharingAPI for notebook sharing
+        labels: LabelsAPI for source labels (topic grouping)
         auth: The AuthTokens used for authentication
     """
+
+    # Constructor-set attribute surface. Declared here (annotation-only;
+    # no runtime effect) because the assignments live in the shared
+    # assembly seam :func:`notebooklm._client_assembly._assemble_client`,
+    # not in ``__init__`` — see the delegation comment there. Keep this
+    # block in sync with ``_assemble_client``; the parity gate
+    # ``tests/_guardrails/test_client_factory_parity.py`` pins the
+    # runtime attribute surface itself.
+    _auth: AuthTokens
+    _seams: ClientSeams
+    _composed: ClientComposed
+    _collaborators: RuntimeCollaborators
+    _rpc_executor: RpcExecutor
+    _source_uploader: SourceUploadPipeline
+    sources: SourcesAPI
+    notebooks: NotebooksAPI
+    artifacts: ArtifactsAPI
+    chat: ChatAPI
+    notes: NotesAPI
+    mind_maps: MindMapsAPI
+    research: ResearchAPI
+    settings: SettingsAPI
+    sharing: SharingAPI
+    labels: LabelsAPI
 
     def __init__(
         self,
@@ -112,12 +166,19 @@ class NotebookLMClient:
         max_concurrent_rpcs: int | None = DEFAULT_MAX_CONCURRENT_RPCS,
         upload_timeout: httpx.Timeout | None = None,
         on_rpc_event: Callable[[RpcTelemetryEvent], object] | None = None,
+        cookie_saver: CookieSaver | None = None,
+        cookie_rotator: CookieRotator | None = None,
+        chat_timeout: float | None = DEFAULT_CHAT_TIMEOUT,
     ):
         """Initialize the NotebookLM client.
 
         Args:
             auth: Authentication tokens from browser login.
             timeout: HTTP request timeout in seconds. Defaults to 30 seconds.
+            chat_timeout: Per-read HTTP timeout in seconds for
+                ``client.chat.ask``. Defaults to 180 seconds because shared
+                notebooks can be slow to send the first streamed byte. Pass
+                ``None`` to inherit the normal client timeout for chat.
             storage_path: Path to the storage state file for loading download cookies.
             keepalive: Optional interval in seconds for a background task that
                 pokes ``accounts.google.com`` while the client is open, eliciting
@@ -135,12 +196,13 @@ class NotebookLMClient:
                 Sleeps for ``Retry-After`` when the server provides a
                 parseable header; otherwise falls back to capped exponential
                 backoff ``min(2 ** attempt, 30)`` seconds with ±20% jitter.
-                See :class:`ClientCore` for full sleep semantics.
+                See the retry middleware docs for full sleep semantics.
             server_error_max_retries: Max automatic retries for retryable
                 transient failures: HTTP 5xx and network-layer
                 ``httpx.RequestError`` (timeouts, connect errors). Defaults to
-                ``3``. Uses exponential backoff ``min(2 ** attempt, 30)``
-                seconds. Set to ``0`` to disable.
+                ``3``. Uses capped exponential backoff
+                ``min(2 ** attempt, 30)`` seconds with ±20% jitter and a 0.1s
+                floor. Set to ``0`` to disable.
             limits: HTTP connection-pool tuning (``ConnectionLimits``). ``None``
                 (default) uses ``ConnectionLimits()`` defaults sized for typical
                 batchexecute fan-out (max_connections=100,
@@ -192,99 +254,76 @@ class NotebookLMClient:
                 backend-agnostic ``RpcTelemetryEvent`` so applications can
                 forward telemetry to logging, Prometheus, OpenTelemetry, or
                 another metrics backend without this package depending on one.
+            cookie_saver: Optional injectable seam overriding
+                the on-disk cookie writer used on close / refresh / keepalive.
+                ``None`` (default) preserves the current behavior of resolving
+                ``notebooklm._auth.storage.save_cookies_to_storage`` via a
+                late-bound wrapper. Must be sync (``def``, not ``async def``)
+                — it runs inside ``asyncio.to_thread``. Custom callables
+                bypass the late-bind hop entirely.
+            cookie_rotator: Optional injectable seam
+                overriding the keepalive-loop cookie rotator. ``None``
+                (default) preserves the current behavior of resolving
+                ``notebooklm._auth.keepalive._rotate_cookies`` via a
+                late-bound wrapper. Must be async — it is awaited from
+                the keepalive loop.
         """
-        # Normalize the effective storage path onto the auth object so every
-        # downstream code path (refresh_auth, ClientCore.close on-close save,
-        # the keepalive loop) writes to the same file. Without this, an
-        # explicit ``storage_path=`` kwarg only reaches the keepalive loop
-        # while ``auth.storage_path is None`` causes refresh and on-close
-        # saves to silently skip persistence. ``dataclasses.replace`` instead
-        # of in-place mutation so a caller reusing ``AuthTokens`` across
-        # multiple clients (with different storage paths) doesn't see one
-        # client's path leak into another.
-        if storage_path is not None and auth.storage_path != storage_path:
-            auth = dataclasses.replace(auth, storage_path=storage_path)
-
-        # Canonicalize the keepalive storage path so different representations
-        # of the same physical file (relative vs absolute, ``~`` shorthand,
-        # symlink components) hash to the same key in the in-process rotation
-        # dedupe (``_get_poke_lock`` / ``_try_claim_rotation`` /
-        # ``_rotation_lock_path`` in auth.py). The auth refresh path already
-        # canonicalizes at ``auth.py:_fetch_tokens_with_refresh`` via
-        # ``Path(p).expanduser().resolve()``; this mirrors it so two clients
-        # pointing at the same file via different path syntaxes share one
-        # ``_LAST_POKE_ATTEMPT_MONOTONIC`` entry instead of bypassing dedupe
-        # and firing duplicate ``RotateCookies`` POSTs.
-        # NOTE: the public ``storage_path`` argument and ``auth.storage_path``
-        # are intentionally left as the caller provided them — only the
-        # internal-derived ``ClientCore._keepalive_storage_path`` is
-        # canonicalized.
-        keepalive_storage_path: Path | None = auth.storage_path
-        if keepalive_storage_path is not None:
-            keepalive_storage_path = Path(keepalive_storage_path).expanduser().resolve()
-
-        # Cross-validate the RPC throttle against the underlying httpx pool
-        # before ``ClientCore`` swallows the ``limits=None`` sentinel into
-        # its own ``ConnectionLimits()`` synthesis.
-        # Performed here so the constraint is enforced uniformly regardless
-        # of whether the caller passed an explicit ``ConnectionLimits``
-        # instance or relied on the default — ``ClientCore.__init__`` can't
-        # see the caller's intent once the default has been substituted.
-        # Skip when either side opts out (``max_concurrent_rpcs is None``
-        # means "no gate"; we deliberately don't second-guess the caller's
-        # external-throttle setup).
-        if max_concurrent_rpcs is not None:
-            from .types import ConnectionLimits
-
-            effective_limits = limits if limits is not None else ConnectionLimits()
-            if max_concurrent_rpcs > effective_limits.max_connections:
-                raise ValueError(
-                    "max_concurrent_rpcs must be <= limits.max_connections "
-                    f"(got max_concurrent_rpcs={max_concurrent_rpcs}, "
-                    f"max_connections={effective_limits.max_connections}). "
-                    "A semaphore wider than the connection pool surfaces "
-                    "saturation as opaque httpx.PoolTimeout instead of "
-                    "clean back-pressure."
-                )
-
-        # Pass refresh_auth as callback for automatic retry on auth failures
-        # Note: refresh_auth calls update_auth_headers internally
-        self._core = ClientCore(
-            auth,
+        # The full assembly lives in ``notebooklm._client_assembly`` —
+        # one private seam shared with the canonical test factory
+        # (``tests/_helpers/client_factory.build_client_shell_for_tests``)
+        # so the two construction paths cannot drift (incidents #1196 /
+        # #1225). Set EVERY constructor-time attribute inside
+        # ``_assemble_client``, never here after the delegation call —
+        # the parity gate
+        # ``tests/_guardrails/test_client_factory_parity.py`` fails
+        # otherwise. The test-only seam kwargs (``decode_response`` /
+        # ``sleep`` / ``is_auth_error`` / ``async_client_factory``) stay
+        # off this public constructor by design.
+        _assemble_client(
+            self,
+            auth=auth,
             timeout=timeout,
-            refresh_callback=self.refresh_auth,
+            storage_path=storage_path,
             keepalive=keepalive,
             keepalive_min_interval=keepalive_min_interval,
-            keepalive_storage_path=keepalive_storage_path,
             rate_limit_max_retries=rate_limit_max_retries,
             server_error_max_retries=server_error_max_retries,
             limits=limits,
             max_concurrent_uploads=max_concurrent_uploads,
             max_concurrent_rpcs=max_concurrent_rpcs,
+            upload_timeout=upload_timeout,
             on_rpc_event=on_rpc_event,
+            cookie_saver=cookie_saver,
+            cookie_rotator=cookie_rotator,
+            chat_timeout=chat_timeout,
         )
-
-        # After D2 cutover, sub-clients consume ``ClientCore`` directly,
-        # typed against their per-sub-client narrow Protocol (defined
-        # co-located in each sub-client file).
-        self.sources = SourcesAPI(self._core, upload_timeout=upload_timeout)
-        self.notebooks = NotebooksAPI(self._core, sources_api=self.sources)
-        self.artifacts = ArtifactsAPI(self._core, storage_path=storage_path)
-        self.notes = NotesAPI(self._core)
-        self.chat = ChatAPI(self._core)
-        self.research = ResearchAPI(self._core)
-        self.settings = SettingsAPI(self._core)
-        self.sharing = SharingAPI(self._core)
 
     @property
     def auth(self) -> AuthTokens:
-        """Get the authentication tokens."""
-        return self._core.auth
+        """Get the authentication tokens.
+
+        ADR-0016's Auth Instance Invariant requires every reference across
+        the live object graph to alias the same mutable
+        :class:`AuthTokens` object set in :meth:`__init__`, so the public
+        ``client.auth`` identity and behavior are unchanged.
+        """
+        return self._auth
 
     async def __aenter__(self) -> NotebookLMClient:
         """Open the client connection."""
         logger.debug("Opening NotebookLM client")
-        await self._core.open()
+        # Preserve the historical fail-fast check that composition is complete.
+        _ = self._composed.transport
+        await self._collaborators.lifecycle.open(
+            auth=self._auth,
+            drain_tracker=self._collaborators.drain_tracker,
+            auth_coord=self._collaborators.auth_coord,
+            reqid=self._collaborators.reqid,
+            cookie_persistence=self._collaborators.cookie_persistence,
+            composed=self._composed,
+            uploader=self._source_uploader,
+            chat=self.chat,
+        )
         return self
 
     async def __aexit__(
@@ -315,8 +354,13 @@ class NotebookLMClient:
             raise
 
     async def drain(self, timeout: float | None = None) -> None:
-        """Stop accepting new operations and wait for in-flight operations to finish."""
-        await self._core.drain(timeout=timeout)
+        """Stop accepting new operations and wait for in-flight operations to finish.
+
+        Delegates directly to the :class:`TransportDrainTracker` that
+        owns the in-flight counter; the public client-side behavior
+        (drain semantics and timeout propagation) is unchanged.
+        """
+        await self._collaborators.drain_tracker.drain(timeout=timeout)
 
     async def close(
         self,
@@ -338,72 +382,198 @@ class NotebookLMClient:
         relying on fire-and-forget close semantics (e.g. via
         ``__aexit__``) will now block briefly on the drain step; pass
         ``drain=False`` explicitly to restore the old behavior.
+
+        Cancellation-safety contract (audit finding I12):
+
+        If the caller's task is cancelled while ``close(drain=True)`` is
+        still waiting on ``drain()`` (e.g. ``asyncio.wait_for`` deadline,
+        manual ``task.cancel()``), the underlying transport is STILL torn
+        down before the cancellation propagates. The drain await
+        explicitly catches ``CancelledError`` and schedules
+        lifecycle close through ``asyncio.shield`` — the shield wraps
+        the inner close in a ``Task`` that survives the outer
+        cancellation, so the ``Kernel.aclose()`` it drives runs to
+        completion in the background. On the normal-success and
+        ``TimeoutError`` paths the same shielded close call runs inline.
+        ``ValueError`` (and any other unexpected exception) from
+        ``drain()`` propagates without an implicit close, matching the
+        pre-I12 caller-error semantics asserted by
+        ``test_close_with_invalid_drain_does_not_close_transport``.
+
+        Practical guarantee:
+
+        - **Normal-success and drain-timeout paths**: on return,
+          ``is_connected is False`` and the underlying
+          ``httpx.AsyncClient`` is closed synchronously.
+        - **Cancel-during-drain path** (single cancellation): the
+          shielded lifecycle close runs to completion synchronously
+          before ``CancelledError`` is re-raised — Python does not
+          re-raise ``CancelledError`` to the same task without an
+          explicit re-cancel, so the await on the shielded Task
+          blocks normally. On return, ``is_connected is False`` and
+          the transport is closed.
+        - **Cancel-during-drain path** (re-cancellation while awaiting
+          the shielded close): the shielded lifecycle close Task is
+          isolated from the second cancel by ``asyncio.shield`` and
+          continues running in the background; the second cancel
+          surfaces in the awaiter, is suppressed, and the *original*
+          ``CancelledError`` is re-raised. ``is_connected`` settles to
+          ``False`` once the background Task lands (callers can
+          ``await asyncio.sleep(0)`` or poll to observe it).
+
+        There is no path that leaves a live transport behind.
+
+        Drain-hook ordering (issue #1161): feature-owned cancel hooks
+        (e.g. ``artifacts.polls``) run BEFORE the drain wait, not just in
+        the shielded lifecycle close below. In-flight artifact polls wrap
+        themselves in ``TransportDrainTracker.operation_scope`` (see
+        :meth:`notebooklm._artifact.polling.ArtifactPollingService._run_poll_loop_in_scope`),
+        which increments the same in-flight counter ``drain()`` waits on.
+        Without firing the cancel hooks first, ``drain()`` would block on a
+        poll that the cancel hook is supposed to short-circuit — up to the
+        poll's own 300s timeout. Running the hooks first lets ``drain()``
+        observe a cancelled-then-settled count instead of parking on it. The
+        lifecycle close below still re-runs the hooks; for the only
+        production hook (``artifacts.polls``) that re-run is a cheap no-op
+        because already-settled poll tasks are filtered out of
+        :meth:`notebooklm._polling_registry.PollRegistry.active_tasks`.
+
+        Note: the cancel-hook fire is NOT bounded by ``drain_timeout`` — that
+        deadline budgets the drain *wait*. The production poll-cancel hook
+        settles near-instantly (it cancels its tasks and awaits the
+        cancellation gather), so this is a non-issue in practice; a custom
+        feature hook that blocks indefinitely could still extend shutdown,
+        and such hooks should bound their own work.
         """
         if drain:
+            drain_timeout_exc: TimeoutError | None = None
             try:
+                # Fire feature-owned cancel hooks BEFORE the drain wait (see
+                # the "Drain-hook ordering" section of the docstring above for
+                # why). Awaited inside this ``try`` so a *caller* CancelledError
+                # arriving during the hook fire still routes through the I12
+                # shielded-close path below; ``run_drain_hooks`` itself never
+                # re-raises (it gathers with ``return_exceptions=True``).
+                await self._collaborators.drain_tracker.run_drain_hooks()
                 await self.drain(timeout=drain_timeout)
-            except TimeoutError as drain_exc:
+            except TimeoutError as exc:
+                # Drain deadline missed. Hold onto the exception and
+                # fall through to the shielded close below so callers
+                # see both the timeout signal AND a torn-down transport.
+                drain_timeout_exc = exc
+            except asyncio.CancelledError:
+                # Cancellation-safety contract (audit finding I12): if
+                # the caller's task is cancelled while drain() is
+                # waiting (e.g. ``asyncio.wait_for`` deadline, manual
+                # ``task.cancel()``), we MUST still tear down the
+                # transport before letting the cancel propagate. On a
+                # single cancellation this shielded await runs to
+                # completion synchronously (Python does not re-raise
+                # CancelledError without an explicit re-cancel). If a
+                # SECOND cancel arrives while we're parked here,
+                # ``asyncio.shield`` isolates the inner lifecycle close
+                # Task so it continues in the background; the second
+                # cancel hits the awaiter and is swallowed below so the
+                # original CancelledError surfaces unchanged.
                 try:
-                    await self._core.close()
-                except Exception as close_exc:
+                    await asyncio.shield(
+                        self._collaborators.lifecycle.close(
+                            auth_coord=self._collaborators.auth_coord,
+                            drain_tracker=self._collaborators.drain_tracker,
+                            cookie_persistence=self._collaborators.cookie_persistence,
+                        )
+                    )
+                except (Exception, asyncio.CancelledError):
+                    # Swallow regular close failures and any re-cancel
+                    # propagated through the shield await so the
+                    # original CancelledError below is the one that
+                    # reaches the caller. The inner shielded Task
+                    # continues to run regardless.
+                    # NOTE: deliberately NOT catching ``BaseException`` —
+                    # ``KeyboardInterrupt`` and ``SystemExit`` are
+                    # process-exit signals that must propagate unchanged.
+                    pass
+                raise
+            # Any other exception from drain (e.g. ``ValueError`` for a
+            # caller-provided invalid deadline) propagates here without
+            # an implicit close — matches pre-I12 caller-error semantics
+            # asserted by
+            # ``test_close_with_invalid_drain_does_not_close_transport``.
+
+            try:
+                await asyncio.shield(
+                    self._collaborators.lifecycle.close(
+                        auth_coord=self._collaborators.auth_coord,
+                        drain_tracker=self._collaborators.drain_tracker,
+                        cookie_persistence=self._collaborators.cookie_persistence,
+                    )
+                )
+            except Exception as close_exc:
+                if drain_timeout_exc is not None:
                     logger.warning(
-                        "Suppressing close() error after drain timeout to preserve timeout "
-                        "signal: %s",
+                        "Suppressing close() error after drain timeout to "
+                        "preserve timeout signal: %s",
                         close_exc,
                     )
-                    raise drain_exc from close_exc
+                    raise drain_timeout_exc from close_exc
                 raise
-            else:
-                await self._core.close()
-                return
-        await self._core.close()
+            if drain_timeout_exc is not None:
+                raise drain_timeout_exc
+            return
+        await self._collaborators.lifecycle.close(
+            auth_coord=self._collaborators.auth_coord,
+            drain_tracker=self._collaborators.drain_tracker,
+            cookie_persistence=self._collaborators.cookie_persistence,
+        )
 
     def metrics_snapshot(self) -> ClientMetricsSnapshot:
-        """Return cumulative observability counters for this client."""
-        return self._core.metrics_snapshot()
+        """Return cumulative observability counters for this client.
+
+        Reads from the collaborator bundle stored by :meth:`__init__` from
+        the composition root's :class:`ClientInternals`.
+        """
+        return self._collaborators.metrics.snapshot()
 
     async def rpc_call(
         self,
         method: RPCMethod,
         params: list[Any],
-        source_path: str = "/",
         allow_null: bool = False,
-        _is_retry: bool = False,
         *,
         disable_internal_retries: bool = False,
-        operation_variant: str | None = None,
     ) -> Any:
         """Make a raw NotebookLM RPC call.
 
         This is the public escape hatch for advanced callers who need an
         undocumented RPC before a typed API exists. Prefer the namespaced APIs
         (``client.notebooks``, ``client.sources``, etc.) when possible. Import
-        ``RPCMethod`` from ``notebooklm.rpc``. The ``_is_retry`` parameter is
-        exposed only to mirror ``ClientCore.rpc_call`` exactly; callers should
-        leave it at the default unless they are intentionally reproducing core
-        retry behavior.
+        ``RPCMethod`` from ``notebooklm.rpc``.
 
-        The optional ``operation_variant`` selects a method-variant-specific
-        policy in the mutating-RPC idempotency registry. Most callers should
-        leave it ``None`` (the default) — Wave 2 will add variant entries.
+        The wrapper forwards to :meth:`RpcExecutor.rpc_call` on the
+        executor that was bound during :meth:`__init__` (and that every
+        feature API shares). Internal call sites that need to bind the
+        underlying internal-only parameters do so against the executor
+        surface directly, not via this public wrapper.
+
+        .. versionchanged:: 0.6.0
+            The deprecated keyword arguments previously documented here
+            were removed (see :doc:`/deprecations`). The default-shape
+            call (``client.rpc_call(method, params)``) is unchanged.
         """
-        return await self._core.rpc_call(
+        return await self._rpc_executor.rpc_call(
             method=method,
             params=params,
-            source_path=source_path,
             allow_null=allow_null,
-            _is_retry=_is_retry,
             disable_internal_retries=disable_internal_retries,
-            operation_variant=operation_variant,
         )
 
     @property
     def is_connected(self) -> bool:
         """Check if the client is connected."""
-        return self._core.is_open
+        return self._collaborators.lifecycle.is_open()
 
     @classmethod
-    async def from_storage(
+    def from_storage(
         cls,
         path: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
@@ -417,11 +587,21 @@ class NotebookLMClient:
         max_concurrent_rpcs: int | None = DEFAULT_MAX_CONCURRENT_RPCS,
         upload_timeout: httpx.Timeout | None = None,
         on_rpc_event: Callable[[RpcTelemetryEvent], object] | None = None,
-    ) -> NotebookLMClient:
+        chat_timeout: float | None = DEFAULT_CHAT_TIMEOUT,
+    ) -> _FromStorageContext:
         """Create a client from Playwright storage state file.
 
         This is the recommended way to create a client for programmatic use.
         Handles all authentication setup automatically.
+
+        The returned object supports two usage patterns:
+
+        - **Canonical (recommended):** use as an async context manager — no
+          ``await`` on ``from_storage`` itself. The auth load and session open
+          happen on ``__aenter__``.
+        - **Legacy (deprecated, removed in v1.0):** await the call to obtain a
+          built-but-unentered ``NotebookLMClient``. Awaiting emits a
+          ``DeprecationWarning`` pointing at the v1.0 removal.
 
         Args:
             path: Path to storage_state.json. If provided, takes precedence over profile.
@@ -456,6 +636,9 @@ class NotebookLMClient:
                 and the rationale (the gate sits below the connection
                 pool so back-pressure surfaces cleanly instead of as
                 opaque ``httpx.PoolTimeout``).
+            chat_timeout: Per-read HTTP timeout in seconds for
+                ``client.chat.ask``. Defaults to 180 seconds. Pass ``None``
+                to inherit ``timeout`` for chat.
             upload_timeout: Optional override for the ``httpx.Timeout`` used
                 by the resumable-upload start handshake and the finalize
                 POST. ``None`` (default) preserves the original hardcoded
@@ -465,33 +648,32 @@ class NotebookLMClient:
                 logical RPC succeeds or fails.
 
         Returns:
-            NotebookLMClient instance (not yet connected).
+            ``_FromStorageContext`` — an awaitable async-context-manager
+            wrapper. ``await``-ing it (legacy path) returns a
+            ``NotebookLMClient`` instance. ``async with``-ing it (canonical
+            path) yields a ``NotebookLMClient`` that is already connected.
 
         Example:
-            async with await NotebookLMClient.from_storage() as client:
+            # Canonical idiom — no `await` on `from_storage`.
+            async with NotebookLMClient.from_storage() as client:
                 notebooks = await client.notebooks.list()
 
             # Use a specific profile
-            async with await NotebookLMClient.from_storage(profile="work") as client:
+            async with NotebookLMClient.from_storage(profile="work") as client:
                 notebooks = await client.notebooks.list()
 
             # Long-lived client with periodic keepalive (e.g. an agent worker)
-            async with await NotebookLMClient.from_storage(keepalive=600) as client:
+            async with NotebookLMClient.from_storage(keepalive=600) as client:
                 ...
-        """
-        storage_path = Path(path) if path else None
-        auth = await AuthTokens.from_storage(storage_path, profile=profile)
-        # Always resolve the storage path so downstream cookie loading
-        # (e.g. artifact downloads) uses the correct file, whether the
-        # caller provided an explicit path, a named profile, or neither.
-        if storage_path is None and not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
-            from .paths import get_storage_path
 
-            storage_path = get_storage_path(profile)
-        return cls(
-            auth,
+            # Legacy form (deprecated, removed in v1.0):
+            # async with await NotebookLMClient.from_storage() as client: ...
+        """
+        return _FromStorageContext(
+            cls,
+            path=path,
             timeout=timeout,
-            storage_path=storage_path,
+            profile=profile,
             keepalive=keepalive,
             keepalive_min_interval=keepalive_min_interval,
             rate_limit_max_retries=rate_limit_max_retries,
@@ -499,20 +681,178 @@ class NotebookLMClient:
             limits=limits,
             max_concurrent_uploads=max_concurrent_uploads,
             max_concurrent_rpcs=max_concurrent_rpcs,
+            chat_timeout=chat_timeout,
             upload_timeout=upload_timeout,
             on_rpc_event=on_rpc_event,
         )
 
-    async def refresh_auth(self) -> AuthTokens:
+    async def refresh_auth(self, *, allow_headless: bool = False) -> AuthTokens:
         """Refresh authentication tokens by fetching the NotebookLM homepage.
 
         This helps prevent 'Session Expired' errors by obtaining a fresh CSRF
         token (SNlM0e) and session ID (FdrFJe).
 
+        This call site uses explicit collaborators sourced from
+        ``self._auth`` and ``self._collaborators``. The five kwargs mirror
+        the :func:`refresh_auth_session` signature: ``auth`` is the
+        client-owned :class:`AuthTokens` instance (the Auth Instance
+        Invariant guarantees this is the same object every auth consumer
+        observes), and the remaining four come from the collaborator
+        bundle the composition root produced
+        (:func:`notebooklm._runtime.init.compose_client_internals`). The
+        ``tests/_helpers/client_factory.build_client_shell_for_tests``
+        helper wires ``_auth`` and ``_collaborators`` through the same
+        :func:`notebooklm._client_assembly._assemble_client` seam this
+        constructor delegates to, so test shells observe the same
+        resolution path.
+
+        Args:
+            allow_headless: Opt in to **layer-3 headless re-auth** when the
+                first-party NotebookLM cookies are fully dead (the homepage GET
+                302s to the Google login page) and neither L1 token refresh nor
+                L2 ``RotateCookies`` rotation can help. When ``True``, an
+                unattended **headless** browser is driven against the persistent
+                login profile to silently re-mint cookies from a still-live
+                Google session, then this refresh retries once. Defaults to
+                ``False`` — the locked design decision is that L3 NEVER fires by
+                default; with no opt-in and no profile the behavior is
+                byte-identical to before. (A *mid-RPC* auto-fire is separately
+                gated on ``NOTEBOOKLM_HEADLESS_REAUTH=1``.)
+
+                SECURITY: the persistent profile is an account-equivalent
+                credential (a live Google session). L3 is local-unattended-only
+                and must NOT be the auth path for a remote / hosted MCP server.
+
         Returns:
             Updated AuthTokens.
 
         Raises:
-            ValueError: If token extraction fails (page structure may have changed).
+            ValueError: If token extraction fails (page structure may have
+                changed), or if cookies are dead and L3 is unavailable / also
+                fails (the persisted profile's Google session is expired too).
         """
-        return await refresh_auth_session(self._core)
+        return await refresh_auth_session(
+            auth=self._auth,
+            kernel=self._collaborators.kernel,
+            auth_coord=self._collaborators.auth_coord,
+            lifecycle=self._collaborators.lifecycle,
+            cookie_persistence=self._collaborators.cookie_persistence,
+            allow_headless=allow_headless,
+        )
+
+
+class _FromStorageContext:
+    """Awaitable async-context-manager wrapper for ``NotebookLMClient.from_storage``.
+
+    Supports two usage patterns so users get a friendly fix-it path off the
+    historical ``async with await`` double-keyword trap:
+
+    Canonical (recommended):
+        async with NotebookLMClient.from_storage(...) as client:
+            ...
+
+    Legacy (deprecated, removed in v1.0):
+        async with await NotebookLMClient.from_storage(...) as client:
+            ...
+        # or:
+        client = await NotebookLMClient.from_storage(...)
+
+    The legacy ``__await__`` path emits a ``DeprecationWarning`` naming the
+    v1.0 removal so existing call sites have a clear migration target. The
+    new ``__aenter__`` path emits no warning.
+
+    Auth load and storage-path resolution are deferred until the first use
+    (``__aenter__`` or ``__await__``) — constructing the wrapper itself does
+    no I/O.
+    """
+
+    __slots__ = ("_cls", "_kwargs", "_client", "_owns_close")
+
+    def __init__(
+        self,
+        cls: type[NotebookLMClient],
+        **kwargs: Any,
+    ) -> None:
+        self._cls = cls
+        self._kwargs = kwargs
+        self._client: NotebookLMClient | None = None
+        self._owns_close = False
+
+    async def _build(self) -> NotebookLMClient:
+        """Load auth and instantiate the client (no session open).
+
+        Idempotent on success: subsequent calls return the cached
+        instance so awaiting the wrapper and then entering it as a
+        context manager — or vice versa — never re-runs the auth load.
+
+        Partial failure: if ``AuthTokens.from_storage(...)`` succeeds
+        but the ``NotebookLMClient(...)`` constructor raises, the cache
+        stays unset and a retry re-runs the auth load. That's
+        intentional — the constructor only raises on programmer error
+        (cross-validated kwargs) so the extra I/O on retry is
+        acceptable.
+        """
+        if self._client is not None:
+            return self._client
+
+        kwargs = self._kwargs
+        path = kwargs["path"]
+        profile = kwargs["profile"]
+
+        auth = await AuthTokens.from_storage(Path(path) if path else None, profile=profile)
+        storage_path = auth.storage_path
+
+        self._client = self._cls(
+            auth,
+            timeout=kwargs["timeout"],
+            storage_path=storage_path,
+            keepalive=kwargs["keepalive"],
+            keepalive_min_interval=kwargs["keepalive_min_interval"],
+            rate_limit_max_retries=kwargs["rate_limit_max_retries"],
+            server_error_max_retries=kwargs["server_error_max_retries"],
+            limits=kwargs["limits"],
+            max_concurrent_uploads=kwargs["max_concurrent_uploads"],
+            max_concurrent_rpcs=kwargs["max_concurrent_rpcs"],
+            chat_timeout=kwargs["chat_timeout"],
+            upload_timeout=kwargs["upload_timeout"],
+            on_rpc_event=kwargs["on_rpc_event"],
+        )
+        return self._client
+
+    def __await__(self) -> Generator[Any, None, NotebookLMClient]:
+        """Legacy await path — returns a built-but-unentered client.
+
+        Emits ``DeprecationWarning`` (removed in v1.0). Prefer the
+        ``async with NotebookLMClient.from_storage(...) as client:`` idiom.
+        """
+        warn_deprecated(
+            "Awaiting NotebookLMClient.from_storage(...) is deprecated; use "
+            "`async with NotebookLMClient.from_storage(...) as client:` "
+            "instead. The await form will be removed in v1.0.",
+            removal="1.0",
+            stacklevel=3,
+        )
+        return self._build().__await__()
+
+    async def __aenter__(self) -> NotebookLMClient:
+        """Canonical path — build the client and enter its session."""
+        client = await self._build()
+        await client.__aenter__()
+        self._owns_close = True
+        return client
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Tear down the client we opened in ``__aenter__``.
+
+        Only closes when ``__aenter__`` ran successfully — re-entering via the
+        legacy ``async with await ...`` path opens the client through
+        ``NotebookLMClient.__aenter__`` directly, so ``_FromStorageContext``
+        is not in that chain and never tries to close someone else's client.
+        """
+        if self._owns_close and self._client is not None:
+            await self._client.__aexit__(exc_type, exc_val, exc_tb)

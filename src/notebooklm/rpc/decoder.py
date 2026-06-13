@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import threading
 from enum import IntEnum
 from typing import Any
 
@@ -38,9 +39,47 @@ __all__ = [
     "extract_rpc_result",
     "decode_response",
     "safe_index",
+    "byte_count_mismatch_total",
+    "reset_byte_count_mismatch_total",
 ]
 
 logger = logging.getLogger(__name__)
+
+# Number of times ``parse_chunked_response`` has observed a declared byte-count
+# that did not match the UTF-8 byte length of the following payload. The
+# tolerant parse is *not* affected (mismatches are expected on live multi-chunk
+# streams; see ``parse_chunked_response``'s Note: block), but a monotonically
+# rising counter is the cheapest drift signal: a sudden jump means Google
+# changed the framing unit or the proxy stopped preserving counts. Read-only
+# for callers; reset only via ``reset_byte_count_mismatch_total`` (tests).
+_BYTE_COUNT_MISMATCH_TOTAL = 0
+
+# Guards every read/increment/reset of ``_BYTE_COUNT_MISMATCH_TOTAL``. The
+# counter is mutated from ``parse_chunked_response``, which can run on worker
+# threads (``run_in_executor`` / ``ThreadPoolExecutor``) or from several
+# per-thread ``NotebookLMClient`` instances at once. ``x += 1`` is a
+# read-modify-write over multiple bytecodes, so the GIL does not make it
+# atomic — without this lock increments could be lost and the counter read by
+# ``byte_count_mismatch_total`` could be stale.
+_BYTE_COUNT_MISMATCH_LOCK = threading.Lock()
+
+
+def byte_count_mismatch_total() -> int:
+    """Return the process-wide byte-count-mismatch counter.
+
+    Exposed for drift dashboards / telemetry probes that want to alert on a
+    sudden rise without re-parsing logs. The value only ever increases within
+    a process; ``reset_byte_count_mismatch_total`` exists for test isolation.
+    """
+    with _BYTE_COUNT_MISMATCH_LOCK:
+        return _BYTE_COUNT_MISMATCH_TOTAL
+
+
+def reset_byte_count_mismatch_total() -> None:
+    """Reset the byte-count-mismatch counter (test isolation only)."""
+    global _BYTE_COUNT_MISMATCH_TOTAL
+    with _BYTE_COUNT_MISMATCH_LOCK:
+        _BYTE_COUNT_MISMATCH_TOTAL = 0
 
 
 class RPCErrorCode(IntEnum):
@@ -85,7 +124,7 @@ _GRPC_STATUS_MESSAGES: dict[int, str] = {
 }
 
 # Hint appended to NOT_FOUND / PERMISSION_DENIED messages. Deliberately avoids
-# the substrings checked by AUTH_ERROR_PATTERNS in _core.py so these errors
+# the substrings checked by AUTH_ERROR_PATTERNS in _runtime/helpers.py so these errors
 # don't incorrectly trigger the auth-refresh retry path.
 _ACCOUNT_MISMATCH_HINT = (
     " If you have multiple Google accounts signed in, this is commonly an "
@@ -185,7 +224,8 @@ def parse_chunked_response(response: str) -> list[Any]:
         List of parsed JSON chunks
 
     Raises:
-        RPCError: If more than 10% of response records are malformed, indicating API issues.
+        RPCError: If more than 10% of payload, framing, or aggregate response
+            records are malformed, indicating API issues.
 
     Note:
         Malformed chunks are skipped with a warning logged. A byte-count line
@@ -194,16 +234,27 @@ def parse_chunked_response(response: str) -> list[Any]:
         valid JSON, because recorded and proxy-transformed streams may not
         preserve Google's original byte count and live Google responses use a
         different unit (likely UTF-16 code units) than ``len(s.encode("utf-8"))``.
-        A JSONDecodeError on the payload still emits a WARNING on the
-        subsequent parse-failure path. If the malformed-record rate exceeds
-        10%, raises RPCError as this likely indicates API changes.
+        Because a mismatch is the *expected* case on healthy live streams, it is
+        deliberately NOT a WARNING: it only increments the process-wide
+        ``byte_count_mismatch_total`` counter, which is the honest drift signal
+        (telemetry alerts on a sudden *rate-of-change*, not on the existence of
+        mismatches). A JSONDecodeError on the payload still emits a WARNING on the
+        subsequent parse-failure path. If the malformed-payload rate exceeds
+        10%, raises RPCError as this likely indicates API changes. Framing and
+        mixed payload/framing corruption keep their own strict guards without
+        letting byte-count records dilute the payload-specific threshold.
     """
+    global _BYTE_COUNT_MISMATCH_TOTAL
+
     if not response or not response.strip():
         return []
 
     chunks = []
-    skipped_count = 0
-    total_records = 0
+    malformed_payload_records = 0
+    payload_records = 0
+    malformed_framing_records = 0
+    framing_records = 0
+    response_records = 0
     lines = [line.removesuffix("\r") for line in response.strip().split("\n")]
 
     i = 0
@@ -218,16 +269,18 @@ def parse_chunked_response(response: str) -> list[Any]:
         # Try to parse as byte count
         try:
             byte_count = int(line)
-            total_records += 1
+            framing_records += 1
+            response_records += 1
             i += 1
 
             # Next line should be JSON payload
             if i >= len(lines):
-                skipped_count += 1
+                malformed_framing_records += 1
                 logger.warning("Skipping byte-count line %d without payload", i)
                 continue
 
             json_str = lines[i]
+            payload_records += 1
             actual_byte_count = len(json_str.encode("utf-8"))
             if actual_byte_count != byte_count:
                 # DEBUG (not WARNING): live multi-chunk responses trip this on
@@ -240,13 +293,20 @@ def parse_chunked_response(response: str) -> list[Any]:
                     actual_byte_count,
                     _truncate_response_preview(json_str),
                 )
+                # Surface the mismatch as a drift signal without escalating to a
+                # WARNING (which would fire on essentially every multi-chunk
+                # response): bump only the process-wide counter. Telemetry probes
+                # alert on a sudden *rate-of-change* via
+                # ``byte_count_mismatch_total()``.
+                with _BYTE_COUNT_MISMATCH_LOCK:
+                    _BYTE_COUNT_MISMATCH_TOTAL += 1
 
             try:
                 chunk = json.loads(json_str)
                 chunks.append(chunk)
             except json.JSONDecodeError as e:
                 # Skip malformed chunks but warn
-                skipped_count += 1
+                malformed_payload_records += 1
                 logger.warning(
                     "Skipping malformed chunk at line %d: %s. Preview: %s",
                     i + 1,
@@ -256,13 +316,14 @@ def parse_chunked_response(response: str) -> list[Any]:
             i += 1
         except ValueError:
             # Not a byte count, try to parse as JSON directly
-            total_records += 1
+            payload_records += 1
+            response_records += 1
             try:
                 chunk = json.loads(line)
                 chunks.append(chunk)
             except json.JSONDecodeError as e:
                 # Skip non-JSON lines but warn
-                skipped_count += 1
+                malformed_payload_records += 1
                 logger.warning(
                     "Skipping non-JSON line at %d: %s. Preview: %s",
                     i + 1,
@@ -271,21 +332,53 @@ def parse_chunked_response(response: str) -> list[Any]:
                 )
             i += 1
 
+    payload_error_rate = malformed_payload_records / payload_records if payload_records else 0
+    framing_error_rate = malformed_framing_records / framing_records if framing_records else 0
+    malformed_records = malformed_payload_records + malformed_framing_records
+    response_error_rate = malformed_records / response_records if response_records else 0
+
     # Fail if error rate is too high (indicates API problems)
-    if skipped_count > 0:
-        error_rate = skipped_count / total_records if total_records else 0
-        if error_rate > 0.1:  # More than 10% malformed
-            raise RPCError(
-                f"Response parsing failed: {skipped_count} of {total_records} response records "
-                f"malformed. "
-                f"This may indicate API changes or data corruption.",
-                raw_response=response,
-            )
-        # Non-critical but warn user results may be incomplete
+    if payload_error_rate > 0.1:  # More than 10% malformed
+        raise RPCError(
+            f"Response parsing failed: {malformed_payload_records} of "
+            f"{payload_records} payload records "
+            f"malformed. "
+            f"This may indicate API changes or data corruption.",
+            raw_response=response,
+        )
+
+    if framing_error_rate > 0.1:  # More than 10% malformed
+        raise RPCError(
+            f"Response parsing failed: {malformed_framing_records} of "
+            f"{framing_records} framing records malformed. "
+            f"This may indicate API changes or data corruption.",
+            raw_response=response,
+        )
+
+    # Preserve the legacy aggregate strictness after payload/framing-specific
+    # checks so mixed corruption does not become more permissive.
+    if response_error_rate > 0.1:  # More than 10% malformed
+        raise RPCError(
+            f"Response parsing failed: {malformed_records} of "
+            f"{response_records} response records malformed. "
+            f"This may indicate API changes or data corruption.",
+            raw_response=response,
+        )
+
+    if malformed_payload_records > 0:
         logger.warning(
-            "Parsed response but skipped %d malformed chunks (%d%%). Results may be incomplete.",
-            skipped_count,
-            int(error_rate * 100),
+            "Parsed response but skipped %d malformed payload chunks (%d%%). "
+            "Results may be incomplete.",
+            malformed_payload_records,
+            int(payload_error_rate * 100),
+        )
+
+    if malformed_framing_records > 0:
+        logger.warning(
+            "Parsed response but skipped %d malformed framing records (%d%%). "
+            "Results may be incomplete.",
+            malformed_framing_records,
+            int(framing_error_rate * 100),
         )
 
     return chunks
@@ -310,7 +403,7 @@ def collect_rpc_ids(chunks: list[Any]) -> list[str]:
             continue
 
         # Preserve the truthy short-circuit on an empty chunk so safe_index
-        # (which would raise under NOTEBOOKLM_STRICT_DECODE=1) is only called
+        # (which raises on shape drift under strict decoding) is only called
         # when the index is structurally valid.
         if not chunk:
             continue
@@ -370,8 +463,8 @@ def _find_wrb_status(chunks: list[Any], rpc_id: str) -> tuple[int, str] | None:
     for chunk in chunks:
         if not isinstance(chunk, list):
             continue
-        # Skip empty chunks before safe_index, which would raise under
-        # NOTEBOOKLM_STRICT_DECODE=1 on an out-of-bounds descent.
+        # Skip empty chunks before safe_index, which raises on shape drift
+        # under strict decoding on an out-of-bounds descent.
         if not chunk:
             continue
         first = safe_index(chunk, 0, method_id=rpc_id, source=source)
@@ -415,15 +508,55 @@ def _contains_user_displayable_error(obj: Any) -> bool:
     return False
 
 
+def _extract_user_displayable_status(error_info: Any) -> tuple[int, str] | None:
+    """Extract the leading gRPC status from a UserDisplayableError block."""
+    if not isinstance(error_info, list) or not error_info:
+        return None
+    code = error_info[0]
+    if type(code) is not int or code not in _GRPC_STATUS_MESSAGES:
+        return None
+    return code, _GRPC_STATUS_MESSAGES[code]
+
+
+def _user_displayable_error_message(error_info: Any) -> str:
+    """Build a non-sensitive diagnostic for a user-displayable rejection."""
+    message = "API rate limit or quota exceeded. Please wait before retrying."
+    status = _extract_user_displayable_status(error_info)
+    if status is None:
+        return message
+    code, label = status
+    return f"{message} Upstream status code {code} ({label})."
+
+
+_SENTINEL_NO_RESULT = object()
+
+
 def extract_rpc_result(chunks: list[Any], rpc_id: str) -> Any:
-    """Extract result data for a specific RPC ID from chunks."""
+    """Extract result data for a specific RPC ID from chunks.
+
+    In ``rt=c`` streamed mode the backend can emit more than one ``wrb.fr``
+    frame for a single ``rpc_id`` (e.g. a null placeholder frame followed by
+    the final populated frame). We iterate every frame and return the result
+    of the **last non-null** ``wrb.fr`` frame for ``rpc_id`` so the placeholder
+    does not shadow the real payload. ``er`` frames and embedded
+    ``UserDisplayableError`` markers still raise immediately — those are
+    terminal signals, not placeholders to be superseded.
+
+    For single-frame responses, the first and last usable frame are identical,
+    so behaviour is unchanged; multi-frame golden fixtures pin the
+    "last non-null frame wins" behavior.
+    """
     source = "decoder.extract_rpc_result"
+    # Track the last usable result so a later populated frame wins over an
+    # earlier null placeholder. ``_SENTINEL_NO_RESULT`` distinguishes "no
+    # wrb.fr frame seen yet" from "the last frame genuinely carried null".
+    last_result: Any = _SENTINEL_NO_RESULT
     for chunk in chunks:
         if not isinstance(chunk, list):
             continue
 
-        # Skip empty chunks before safe_index, which would raise under
-        # NOTEBOOKLM_STRICT_DECODE=1 on an out-of-bounds descent.
+        # Skip empty chunks before safe_index, which raises on shape drift
+        # under strict decoding on an out-of-bounds descent.
         if not chunk:
             continue
         first = safe_index(chunk, 0, method_id=rpc_id, source=source)
@@ -467,19 +600,29 @@ def extract_rpc_result(chunks: list[Any], rpc_id: str) -> Any:
                     error_info = safe_index(item, 5, method_id=rpc_id, source=source)
                     if error_info is not None and _contains_user_displayable_error(error_info):
                         raise RateLimitError(
-                            "API rate limit or quota exceeded. Please wait before retrying.",
+                            _user_displayable_error_message(error_info),
                             method_id=rpc_id,
                             rpc_code="USER_DISPLAYABLE_ERROR",
                         )
 
                 if isinstance(result_data, str):
                     try:
-                        return json.loads(result_data)
+                        parsed: Any = json.loads(result_data)
                     except json.JSONDecodeError:
-                        return result_data
-                return result_data
+                        parsed = result_data
+                else:
+                    parsed = result_data
 
-    return None
+                # Prefer a later populated frame over an earlier null
+                # placeholder; only let a null frame overwrite a previous
+                # usable result when nothing better followed (it won't, since
+                # we never downgrade a non-null result back to null).
+                if parsed is not None or last_result is _SENTINEL_NO_RESULT:
+                    last_result = parsed
+
+    if last_result is _SENTINEL_NO_RESULT:
+        return None
+    return last_result
 
 
 def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) -> Any:
@@ -529,7 +672,13 @@ def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) ->
             e.raw_response = _truncate_response_preview(response_preview)
         raise
 
-    if result is None and not allow_null:
+    if result is None:
+        # An *absent* RPC ID is categorically different from a *present-but-null*
+        # result. The drift detector — the strongest signal that Google changed a
+        # method ID or served an anti-bot/redirect wall instead of real RPC data —
+        # must fire even when ``allow_null=True``; ``allow_null`` only sanctions a
+        # ``wrb.fr`` frame that genuinely carried a null payload, not a response
+        # that never contained the requested ID at all.
         if found_ids and rpc_id not in found_ids:
             # Method ID likely changed - provide actionable error
             raise UnknownRPCMethodError(
@@ -541,48 +690,60 @@ def decode_response(raw_response: str, rpc_id: str, allow_null: bool = False) ->
                 raw_response=response_preview,
             )
 
-        if rpc_id in found_ids:
-            # RPC ID was found but extract_rpc_result returned None
-            # This means wrb.fr had null result_data without UserDisplayableError.
-            # Enrich the message if the server attached a bare status code at
-            # index 5 (issues #114 / #294 showed GET_NOTEBOOK returning [5]).
-            status = _find_wrb_status(chunks, rpc_id)
-            if status is not None:
-                code, label = status
-                message = f"RPC {rpc_id} returned null result with status code {code} ({label})."
-                # Route NOT_FOUND (5) / PERMISSION_DENIED (7) through ClientError
-                # so _core.is_auth_error does not misclassify them as auth
-                # failures and trigger a spurious token-refresh retry. The
-                # account-routing hint is only relevant for these two codes —
-                # other codes (e.g. INTERNAL 13) get a plain message.
-                if code in (5, 7):
-                    raise ClientError(
-                        message + _ACCOUNT_MISMATCH_HINT,
-                        method_id=rpc_id,
-                        rpc_code=code,
-                        found_ids=found_ids,
-                        raw_response=response_preview,
-                    )
-                raise RPCError(
-                    message,
+        if not found_ids:
+            # No RPC data found at all — the response carried no recognizable RPC
+            # frames (e.g. an anti-bot/redirect HTML page). This is never a benign
+            # null, so raise regardless of ``allow_null``.
+            raise RPCError(
+                f"No result found for RPC ID: {rpc_id} "
+                f"(response contained no RPC data — {len(chunks)} chunks parsed)",
+                method_id=rpc_id,
+                raw_response=response_preview,
+            )
+
+        # ``rpc_id`` is present in ``found_ids`` but ``extract_rpc_result`` returned
+        # None — the requested frame carried a genuinely null payload. Honor
+        # ``allow_null`` here and return None for callers that opt in.
+        if allow_null:
+            return None
+
+        # RPC ID was found but extract_rpc_result returned None.
+        # This means wrb.fr had null result_data without UserDisplayableError.
+        # Enrich the message if the server attached a bare status code at
+        # index 5 (issues #114 / #294 showed GET_NOTEBOOK returning [5]).
+        status = _find_wrb_status(chunks, rpc_id)
+        # The base ``RPCError.__str__`` does not surface ``found_ids``, so embed
+        # it in the message text too — otherwise the strongest debugging signal
+        # is silently dropped from plain logs and tracebacks for these branches.
+        found_ids_suffix = f" Found IDs: {found_ids}."
+        if status is not None:
+            code, label = status
+            message = f"RPC {rpc_id} returned null result with status code {code} ({label})."
+            # Route NOT_FOUND (5) / PERMISSION_DENIED (7) through ClientError
+            # so is_auth_error does not misclassify them as auth
+            # failures and trigger a spurious token-refresh retry. The
+            # account-routing hint is only relevant for these two codes —
+            # other codes (e.g. INTERNAL 13) get a plain message.
+            if code in (5, 7):
+                raise ClientError(
+                    message + found_ids_suffix + _ACCOUNT_MISMATCH_HINT,
                     method_id=rpc_id,
                     rpc_code=code,
                     found_ids=found_ids,
                     raw_response=response_preview,
                 )
             raise RPCError(
-                f"RPC {rpc_id} returned null result data "
-                f"(possible server error or parameter mismatch)",
+                message + found_ids_suffix,
                 method_id=rpc_id,
+                rpc_code=code,
                 found_ids=found_ids,
                 raw_response=response_preview,
             )
-
-        # No RPC data found at all (found_ids is empty; non-empty cases handled above)
         raise RPCError(
-            f"No result found for RPC ID: {rpc_id} "
-            f"(response contained no RPC data — {len(chunks)} chunks parsed)",
+            f"RPC {rpc_id} returned null result data "
+            f"(possible server error or parameter mismatch).{found_ids_suffix}",
             method_id=rpc_id,
+            found_ids=found_ids,
             raw_response=response_preview,
         )
 

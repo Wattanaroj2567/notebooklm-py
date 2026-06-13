@@ -1,7 +1,7 @@
 """Variant-keyed idempotency tests for ADD_SOURCE + ADD_SOURCE_FILE.
 
 Tier 9 Wave 2 (P0-3-sources, P1-2-sources): the previous behavior in
-``_source_add.py``/``_source_upload.py`` relied on the inner transport
+``_source/add.py``/``_source/upload.py`` relied on the inner transport
 retry loop to handle 5xx for mutating create RPCs, which could duplicate
 sources when the server already committed the write before returning the
 5xx. The fix is two-fold:
@@ -49,10 +49,12 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+import notebooklm._runtime.helpers as _runtime_helpers
 from notebooklm import NotebookLMClient
 from notebooklm._idempotency import IDEMPOTENCY_REGISTRY, IdempotencyPolicy
 from notebooklm.exceptions import NetworkError, NotebookLMError
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
 
 # Mock-transport idempotency tests; no HTTP, no cassette. Opt out of the
 # tier-enforcement hook in tests/integration/conftest.py.
@@ -104,18 +106,21 @@ def _make_client_with_transport(
     Mirrors the helper used in tests/integration/concurrency/
     test_idempotency_create.py: stub in a pre-built httpx.AsyncClient
     wired to the supplied mock transport, bypassing the full
-    ClientCore.open() path that would otherwise build a real connection
+    ``ClientLifecycle.open()`` path that would otherwise build a real connection
     pool.
     """
     client = NotebookLMClient(
         auth_tokens,
         server_error_max_retries=server_error_max_retries,
     )
-    client._core._http_client = httpx.AsyncClient(
-        transport=transport,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        },
+    install_http_client_for_test(
+        client._collaborators.kernel,
+        httpx.AsyncClient(
+            transport=transport,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+        ),
     )
     return client
 
@@ -168,7 +173,7 @@ async def test_add_url_probe_short_circuits_when_first_response_lost(auth_tokens
     try:
         source = await client.sources.add_url(notebook_id, url)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     assert source.url == url
@@ -220,7 +225,7 @@ async def test_add_drive_probe_short_circuits_when_first_response_lost(auth_toke
     try:
         source = await client.sources.add_drive(notebook_id, file_id, title)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     assert file_id in (source.url or "")
@@ -263,7 +268,7 @@ async def test_add_drive_probe_matches_segment_at_end_of_url(auth_tokens) -> Non
     try:
         source = await client.sources.add_drive(notebook_id, file_id, title)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     assert add_count == 1, f"expected 1 ADD_SOURCE, got {add_count}"
@@ -332,7 +337,7 @@ async def test_add_drive_probe_does_not_substring_match_unrelated_file_id(
         with pytest.raises(ServerError):
             await client.sources.add_drive(notebook_id, target_file_id, title)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # The probe must NOT have spuriously matched the unrelated Drive
     # source — instead the wrapper retried, exhausted, and re-raised.
@@ -402,19 +407,19 @@ async def test_register_file_source_probe_short_circuits_when_first_response_los
         # exercises only the ADD_SOURCE_FILE register step's idempotency.
         with (
             patch.object(
-                client.sources,
-                "_start_resumable_upload",
+                client.sources._uploader,
+                "start_resumable_upload",
                 AsyncMock(return_value="https://upload.example/scotty"),
             ),
             patch.object(
-                client.sources,
-                "_upload_file_streaming",
+                client.sources._uploader,
+                "upload_file_streaming",
                 AsyncMock(return_value=None),
             ),
         ):
             source = await client.sources.add_file(notebook_id, test_file)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     assert source.id == src_id
     # Exactly ONE ADD_SOURCE_FILE register request (no naive re-POST)
@@ -480,20 +485,20 @@ async def test_register_file_source_does_not_match_pre_existing_filename(
     try:
         with (
             patch.object(
-                client.sources,
-                "_start_resumable_upload",
+                client.sources._uploader,
+                "start_resumable_upload",
                 AsyncMock(return_value="https://upload.example/scotty"),
             ),
             patch.object(
-                client.sources,
-                "_upload_file_streaming",
+                client.sources._uploader,
+                "upload_file_streaming",
                 AsyncMock(return_value=None),
             ),
             pytest.raises(ServerError),
         ):
             await client.sources.add_file(notebook_id, test_file)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # The pre-existing source's id was never returned — instead, the
     # original transport error propagated after retries were exhausted.
@@ -557,20 +562,20 @@ async def test_register_file_source_baseline_unavailable_raises_on_ambiguity(
     try:
         with (
             patch.object(
-                client.sources,
-                "_start_resumable_upload",
+                client.sources._uploader,
+                "start_resumable_upload",
                 AsyncMock(return_value="https://upload.example/scotty"),
             ),
             patch.object(
-                client.sources,
-                "_upload_file_streaming",
+                client.sources._uploader,
+                "upload_file_streaming",
                 AsyncMock(return_value=None),
             ),
             pytest.raises(NotebookLMError, match="baseline snapshot was unavailable"),
         ):
             await client.sources.add_file(notebook_id, test_file)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # Pre-existing source's id was NOT silently returned — instead the
     # baseline-unavailable ambiguity guard fired.
@@ -624,7 +629,19 @@ async def test_add_text_no_probe_no_retry_under_5xx(
     async def _no_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr("notebooklm._core.asyncio.sleep", _no_sleep)
+    # Object-form patch against the locally-imported seam alias (ADR-0007
+    # Form 2): mutate the ``asyncio`` module reference that
+    # ``_runtime.helpers`` reads, instead of a string-target patch. This is a
+    # *defensive* shim — under the correct NON_IDEMPOTENT_NO_RETRY behavior
+    # ``add_text`` never retries, so ``asyncio.sleep`` is never reached; the
+    # patch only bounds wall-time if a regression re-enables retries. Because
+    # the green path never sleeps, the seam-binding itself is asserted
+    # (``resolve_sleep`` is the production read path) rather than call count.
+    monkeypatch.setattr(_runtime_helpers.asyncio, "sleep", _no_sleep)
+    assert _runtime_helpers.resolve_sleep(None) is _no_sleep, (
+        "object-form patch must target the seam production reads via "
+        "resolve_sleep(None); a wrong-namespace alias would silently no-op"
+    )
 
     transport = httpx.MockTransport(handler)
     client = _make_client_with_transport(transport, auth_tokens)
@@ -632,7 +649,7 @@ async def test_add_text_no_probe_no_retry_under_5xx(
         with pytest.raises(NotebookLMError):
             await client.sources.add_text(notebook_id, title, content)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # Exactly ONE ADD_SOURCE attempt: no retry loop, no probe.
     assert add_count == 1, (
@@ -686,7 +703,7 @@ async def test_add_url_probe_network_error_propagates(auth_tokens) -> None:
         with pytest.raises(NetworkError, match="probe synthetic connection error"):
             await client.sources.add_url(notebook_id, url)
     finally:
-        await client._core._http_client.aclose()
+        await client._collaborators.kernel.get_http_client().aclose()
 
     # Probe was attempted (the original create failed with 502, then the
     # probe was issued and raised).

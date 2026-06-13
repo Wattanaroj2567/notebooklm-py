@@ -8,7 +8,7 @@ Notebook lifecycle:
 - Auto-created on first run if NOTEBOOKLM_GENERATION_NOTEBOOK_ID not set
 - Artifacts/notes cleaned BEFORE tests to ensure clean state
 - In CI (CI=true): notebook deleted after tests to avoid orphans
-- Locally: notebook persists for verification, ID stored in NOTEBOOKLM_HOME
+- Locally: notebook persists for verification, ID stored in the active profile cache
 """
 
 import pytest
@@ -380,10 +380,9 @@ class TestMindMapGeneration:
 
         result = await client.artifacts.generate_mind_map(generation_notebook_id)
         assert result is not None
-        assert "mind_map" in result
-        assert "note_id" in result
+        assert result.note_id is not None
         # Verify mind map structure
-        mind_map = result["mind_map"]
+        mind_map = result.mind_map
         assert isinstance(mind_map, dict)
         assert "name" in mind_map
         assert "children" in mind_map

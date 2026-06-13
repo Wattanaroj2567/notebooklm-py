@@ -8,8 +8,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
-from ._source_listing import RpcCall as SourceListingRpcCall
-from ._source_listing import SourceLister as SourceListingService
+from ._runtime.contracts import RpcCaller
+from ._source.listing import SourceLister as SourceListingService
 from .types import Notebook, NotebookMetadata, Source, SourceSummary
 
 # Preserve the historical warning channel from NotebooksAPI.get_metadata().
@@ -17,18 +17,33 @@ logger = logging.getLogger("notebooklm._notebooks")
 
 
 class NotebookSourceLister(Protocol):
-    """Structural source-listing dependency needed by notebook metadata."""
+    """Structural source-listing dependency shared across feature APIs.
+
+    Consumed by :class:`NotebookMetadataService` for metadata composition
+    and by :meth:`ResearchAPI.import_sources_with_verification` for
+    snapshot/probe around ``IMPORT_RESEARCH`` (issue #315). Implementations
+    are constructed via :func:`create_default_source_lister` from a
+    ``RpcCaller`` object, so feature APIs don't need to depend on
+    ``SourcesAPI`` itself.
+    """
 
     async def list(self, notebook_id: str, *, strict: bool = False) -> builtins.list[Source]:
         """List sources for a notebook."""
 
 
+class NotebookSourceIdProvider(Protocol):
+    """Structural source-id dependency needed by chat and artifact generation."""
+
+    async def get_source_ids(self, notebook_id: str) -> builtins.list[str]:
+        """Return source IDs for a notebook."""
+
+
 NotebookGetter = Callable[[str], Awaitable[Notebook]]
 
 
-def create_default_source_lister(rpc_call: SourceListingRpcCall) -> NotebookSourceLister:
+def create_default_source_lister(rpc: RpcCaller) -> NotebookSourceLister:
     """Build the direct-construction source lister without constructing SourcesAPI."""
-    return SourceListingService(rpc_call)
+    return SourceListingService(rpc)
 
 
 class NotebookMetadataService:
@@ -71,6 +86,7 @@ class NotebookMetadataService:
 
 __all__ = [
     "NotebookMetadataService",
+    "NotebookSourceIdProvider",
     "NotebookSourceLister",
     "create_default_source_lister",
 ]

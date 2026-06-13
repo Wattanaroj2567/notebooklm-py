@@ -3,7 +3,7 @@
 Example usage:
     from notebooklm import NotebookLMClient
 
-    async with await NotebookLMClient.from_storage() as client:
+    async with NotebookLMClient.from_storage() as client:
         notebooks = await client.notebooks.list()
         await client.sources.add_url(notebook_id, "https://example.com")
         result = await client.chat.ask(notebook_id, "What is this about?")
@@ -54,12 +54,17 @@ from .client import NotebookLMClient
 
 # Public API: Exceptions (centralized in exceptions.py)
 from .exceptions import (
+    AmbiguousResearchTaskError,  # Domain: Research
     # Domain: Artifacts
     ArtifactDownloadError,
     ArtifactError,
+    ArtifactFeatureUnavailableError,
+    ArtifactInProgressTimeoutError,
     ArtifactNotFoundError,
     ArtifactNotReadyError,
     ArtifactParseError,
+    ArtifactPendingTimeoutError,
+    ArtifactTimeoutError,
     # RPC Protocol
     AuthError,
     AuthExtractionError,
@@ -70,6 +75,11 @@ from .exceptions import (
     # Validation/Config
     ConfigurationError,
     DecodingError,
+    # Domain: Source labels
+    LabelError,
+    LabelNotFoundError,
+    MindMapError,
+    MindMapNotFoundError,
     # Network
     NetworkError,
     # Idempotency
@@ -80,9 +90,14 @@ from .exceptions import (
     # Base
     NotebookLMError,
     NotebookNotFoundError,
+    NoteError,
+    NoteNotFoundError,
+    # Cross-domain umbrellas
+    NotFoundError,
     RateLimitError,
-    # Domain: Research
+    ResearchError,
     ResearchTaskMismatchError,
+    ResearchTimeoutError,
     RPCError,
     RPCResponseTooLargeError,
     RPCTimeoutError,
@@ -95,6 +110,8 @@ from .exceptions import (
     SourceTimeoutError,
     UnknownRPCMethodError,
     ValidationError,
+    # Cross-domain umbrellas (wait/poll timeouts)
+    WaitTimeoutError,
 )
 
 # Public API: Types and dataclasses
@@ -116,10 +133,15 @@ from .types import (
     ConversationTurn,
     DriveMimeType,
     ExportType,
+    GenerationState,
     GenerationStatus,
     InfographicDetail,
     InfographicOrientation,
     InfographicStyle,
+    Label,
+    MindMap,
+    MindMapKind,
+    MindMapResult,
     Note,
     Notebook,
     NotebookDescription,
@@ -128,6 +150,10 @@ from .types import (
     QuizQuantity,
     ReportFormat,
     ReportSuggestion,
+    ResearchSource,
+    ResearchStart,
+    ResearchStatus,
+    ResearchTask,
     RpcTelemetryEvent,
     ShareAccess,
     SharedUser,
@@ -138,6 +164,7 @@ from .types import (
     SlideDeckLength,
     Source,
     SourceFulltext,
+    SourceGuide,
     SourceStatus,
     SourceSummary,
     SourceType,
@@ -175,16 +202,26 @@ __all__ = [
     "SuggestedTopic",
     "Source",
     "SourceFulltext",
+    "SourceGuide",
     "SourceSummary",
     "Artifact",
+    "GenerationState",
     "GenerationStatus",
     "ReportSuggestion",
+    "MindMap",
+    "MindMapKind",
+    "MindMapResult",
     "Note",
+    "Label",
     "ConversationTurn",
     "ChatReference",
     "AskResult",
     "ChatMode",
     "CitedSourceSelection",
+    "ResearchStatus",
+    "ResearchSource",
+    "ResearchTask",
+    "ResearchStart",
     "SharedUser",
     "ShareStatus",
     # Utility helpers
@@ -193,6 +230,8 @@ __all__ = [
     "NotebookLMError",
     "ValidationError",
     "ConfigurationError",
+    # Cross-domain umbrellas
+    "NotFoundError",
     # RPC/Network Exceptions
     "RPCError",
     "DecodingError",
@@ -222,12 +261,30 @@ __all__ = [
     "SourceNotFoundError",
     # Domain Exceptions: Artifacts
     "ArtifactError",
+    "ArtifactFeatureUnavailableError",
     "ArtifactNotFoundError",
     "ArtifactNotReadyError",
     "ArtifactParseError",
     "ArtifactDownloadError",
+    "ArtifactTimeoutError",
+    "ArtifactPendingTimeoutError",
+    "ArtifactInProgressTimeoutError",
     # Domain Exceptions: Research
+    "AmbiguousResearchTaskError",
+    "ResearchError",
+    "ResearchTimeoutError",
     "ResearchTaskMismatchError",
+    # Domain Exceptions: Notes
+    "NoteError",
+    "NoteNotFoundError",
+    # Domain Exceptions: Mind maps
+    "MindMapError",
+    "MindMapNotFoundError",
+    # Domain Exceptions: Source labels
+    "LabelError",
+    "LabelNotFoundError",
+    # Cross-domain umbrella: wait/poll timeouts
+    "WaitTimeoutError",
     # Warnings
     "UnknownTypeWarning",
     # User-facing type enums (str enums for .kind property)
@@ -254,42 +311,4 @@ __all__ = [
     "ShareAccess",
     "ShareViewLevel",
     "SharePermission",
-    # Deprecated (will be removed in v0.5.0)
-    "StudioContentType",
 ]
-
-
-def __getattr__(name: str):
-    """Emit deprecation warnings for deprecated module-level names.
-
-    This allows us to provide backward-compatible imports with warnings.
-    Uses globals() caching to avoid duplicate warnings on repeated access.
-    """
-    import warnings
-
-    if name == "DEFAULT_STORAGE_PATH":
-        from .paths import get_storage_path
-
-        warnings.warn(
-            "DEFAULT_STORAGE_PATH is deprecated, use notebooklm.paths.get_storage_path() instead. "
-            "Will be removed in v0.5.0.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        val = get_storage_path()
-        globals()[name] = val
-        return val
-
-    if name == "StudioContentType":
-        from .rpc.types import ArtifactTypeCode
-
-        warnings.warn(
-            "StudioContentType is deprecated, use ArtifactType instead. Will be removed in v0.5.0.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # Cache to prevent duplicate warnings on repeated access
-        globals()[name] = ArtifactTypeCode
-        return ArtifactTypeCode
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

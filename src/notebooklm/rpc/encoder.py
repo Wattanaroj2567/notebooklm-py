@@ -29,7 +29,7 @@ def encode_rpc_request(
             Callers must pass the SAME string to the URL builder so the
             ``rpcids=`` query param and the ``f.req`` body stay in sync —
             mismatched IDs reach the wire as malformed requests. Used by
-            ``ClientCore`` to thread ``NOTEBOOKLM_RPC_OVERRIDES`` through.
+            ``NotebookLMClient`` to thread ``NOTEBOOKLM_RPC_OVERRIDES`` through.
 
     Returns:
         Triple-nested array structure for batchexecute
@@ -84,7 +84,8 @@ def build_request_body(
     Args:
         rpc_request: Encoded RPC request from encode_rpc_request
         csrf_token: CSRF token (SNlM0e value) - optional but recommended
-        session_id: Session ID (FdrFJe value) - optional
+        session_id: Ignored compatibility parameter; session IDs are passed in
+            URL query params, not the form body.
 
     Returns:
         Form-encoded body string with trailing &
@@ -99,8 +100,8 @@ def build_request_body(
     if csrf_token:
         body_parts.append(f"at={quote(csrf_token, safe='')}")
 
-    # Note: session_id is typically passed in URL query params, not body
-    # but we support it here for flexibility
+    # ``session_id`` is accepted for call compatibility; batchexecute session
+    # IDs stay in URL query params.
 
     # Join with & and add trailing &
     body = "&".join(body_parts) + "&"

@@ -9,16 +9,13 @@ Usage:
     from notebooklm.types import SourceType, ArtifactType  # str enums for .kind
 """
 
-from datetime import datetime
-from typing import Any
-
 from ._types import artifacts as _artifact_types
 from ._types import common as _common_types
-from ._types import notebooks as _notebook_types
 from ._types import sources as _source_types
 from ._types.artifacts import (
     Artifact,
     ArtifactType,
+    GenerationState,
     GenerationStatus,
     ReportSuggestion,
 )
@@ -37,9 +34,8 @@ from ._types.common import (
     RpcTelemetryEvent,
     UnknownTypeWarning,
 )
-from ._types.common import (
-    _datetime_from_timestamp as _common_datetime_from_timestamp,
-)
+from ._types.labels import Label
+from ._types.mind_maps import MindMap, MindMapKind
 from ._types.notebooks import (
     Notebook,
     NotebookDescription,
@@ -48,6 +44,15 @@ from ._types.notebooks import (
     SuggestedTopic,
 )
 from ._types.notes import Note
+from ._types.research import (
+    MindMapResult,
+    ResearchSource,
+    ResearchSourceInput,
+    ResearchStart,
+    ResearchStatus,
+    ResearchTask,
+    SourceGuide,
+)
 from ._types.sharing import SharedUser, ShareStatus
 from ._types.sources import (
     Source,
@@ -59,9 +64,15 @@ from ._types.sources import (
 from .exceptions import (
     ArtifactDownloadError,
     ArtifactError,
+    ArtifactFeatureUnavailableError,
+    ArtifactInProgressTimeoutError,
     ArtifactNotFoundError,
     ArtifactNotReadyError,
     ArtifactParseError,
+    ArtifactPendingTimeoutError,
+    ArtifactTimeoutError,
+    LabelError,
+    LabelNotFoundError,
     SourceAddError,
     SourceError,
     SourceNotFoundError,
@@ -101,32 +112,28 @@ from .rpc.types import (
 
 # Keep private facade names that first-party tests and external callers have
 # historically imported while the implementation moves into _types modules.
-_ARTIFACT_TYPE_CODE_MAP = _artifact_types._ARTIFACT_TYPE_CODE_MAP
-_SOURCE_TYPE_CODE_MAP = _source_types._SOURCE_TYPE_CODE_MAP
 _SOURCE_TYPE_COMPAT_MAP = _source_types._SOURCE_TYPE_COMPAT_MAP
+_datetime_from_timestamp = _common_types._datetime_from_timestamp
 _extract_artifact_url = _artifact_types._extract_artifact_url
 _extract_audio_artifact_url = _artifact_types._extract_audio_artifact_url
 _extract_infographic_artifact_url = _artifact_types._extract_infographic_artifact_url
-_extract_notebook_sources_count = _notebook_types._extract_notebook_sources_count
 _extract_slide_deck_artifact_url = _artifact_types._extract_slide_deck_artifact_url
 _extract_source_created_at = _source_types._extract_source_created_at
 _extract_source_url = _source_types._extract_source_url
 _extract_video_artifact_url = _artifact_types._extract_video_artifact_url
 _is_valid_artifact_url = _artifact_types._is_valid_artifact_url
-_map_artifact_kind = _artifact_types._map_artifact_kind
-_safe_source_type = _source_types._safe_source_type
 _warned_artifact_types = _artifact_types._warned_artifact_types
-_warned_deprecated_properties = _common_types._warned_deprecated_properties
 _warned_source_types = _source_types._warned_source_types
 
 # Imported for the historical ``notebooklm.types.ArtifactTypeCode`` attribute,
 # but intentionally absent from ``__all__``.
 ArtifactTypeCode = _ArtifactTypeCode
 
-
-def _datetime_from_timestamp(value: Any) -> datetime | None:
-    """Convert an API seconds timestamp to ``datetime``, returning ``None`` if invalid."""
-    return _common_datetime_from_timestamp(value, datetime_type=datetime)
+# Guards the ``ResearchSourceInput`` import from being removed as unused:
+# ``typing.get_type_hints(CitedSourceSelection)`` needs it in this facade's
+# globals after ``CitedSourceSelection.__module__`` is rewritten below.
+# Intentionally absent from ``__all__``.
+_CITED_SOURCE_SELECTION_TYPE_HINT_GLOBALS = (ResearchSourceInput,)
 
 
 __all__ = [
@@ -143,15 +150,26 @@ __all__ = [
     "SourceFulltext",
     "SourceSummary",
     "Artifact",
+    "GenerationState",
     "GenerationStatus",
     "ReportSuggestion",
     "Note",
+    "Label",
     "ConversationTurn",
     "ChatReference",
     "AskResult",
     "ChatMode",
     "SharedUser",
     "ShareStatus",
+    # Research / mind-map / source-guide typed returns
+    "ResearchStatus",
+    "ResearchSource",
+    "ResearchTask",
+    "ResearchStart",
+    "MindMap",
+    "MindMapKind",
+    "MindMapResult",
+    "SourceGuide",
     # Exceptions
     "SourceError",
     "SourceAddError",
@@ -159,10 +177,16 @@ __all__ = [
     "SourceTimeoutError",
     "SourceNotFoundError",
     "ArtifactError",
+    "ArtifactFeatureUnavailableError",
     "ArtifactNotFoundError",
     "ArtifactNotReadyError",
     "ArtifactParseError",
     "ArtifactDownloadError",
+    "ArtifactTimeoutError",
+    "ArtifactPendingTimeoutError",
+    "ArtifactInProgressTimeoutError",
+    "LabelError",
+    "LabelNotFoundError",
     # Warnings
     "UnknownTypeWarning",
     # User-facing type enums (str enums for .kind property)
@@ -170,7 +194,7 @@ __all__ = [
     "ArtifactType",
     # Re-exported enums (configuration/RPC)
     "ArtifactStatus",
-    # Note: ArtifactTypeCode/StudioContentType are internal - not exported here
+    # Note: ArtifactTypeCode is internal - not exported here
     "AudioFormat",
     "AudioLength",
     "VideoFormat",
@@ -217,16 +241,26 @@ for _public_moved_type in (
     ChatMode,
     ChatReference,
     ConversationTurn,
+    GenerationState,
     GenerationStatus,
+    Label,
+    MindMap,
+    MindMapKind,
+    MindMapResult,
     Note,
     Notebook,
     NotebookDescription,
     NotebookMetadata,
     ReportSuggestion,
+    ResearchSource,
+    ResearchStart,
+    ResearchStatus,
+    ResearchTask,
     SharedUser,
     ShareStatus,
     Source,
     SourceFulltext,
+    SourceGuide,
     SourceSummary,
     SourceType,
     SuggestedTopic,

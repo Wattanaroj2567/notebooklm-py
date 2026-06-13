@@ -1,26 +1,13 @@
 """Sharing operations API."""
 
 import logging
-from typing import Protocol
 
-from ._capabilities import AuthRouteProvider, CoreRPCProvider
+from ._runtime.contracts import RpcCaller
 from .rpc import RPCMethod
 from .rpc.types import ShareAccess, SharePermission, ShareViewLevel
 from .types import ShareStatus
 
 logger = logging.getLogger(__name__)
-
-
-class _SharingCore(CoreRPCProvider, AuthRouteProvider, Protocol):
-    """Narrow per-sub-client view of the core required by :class:`SharingAPI`.
-
-    Co-located with the sub-client that consumes it (per ADR-002). Inherits
-    only the capabilities SharingAPI actually uses: ``rpc_call`` (from
-    :class:`CoreRPCProvider`) and authuser routing (from
-    :class:`AuthRouteProvider`).
-    """
-
-    pass
 
 
 class SharingAPI:
@@ -30,7 +17,7 @@ class SharingAPI:
     including public link access and user-specific sharing.
 
     Usage:
-        async with await NotebookLMClient.from_storage() as client:
+        async with NotebookLMClient.from_storage() as client:
             # Get current status
             status = await client.sharing.get_status(notebook_id)
 
@@ -47,13 +34,13 @@ class SharingAPI:
             )
     """
 
-    def __init__(self, core: _SharingCore):
+    def __init__(self, rpc: RpcCaller):
         """Initialize the sharing API.
 
         Args:
-            core: The core client infrastructure.
+            rpc: RPC dispatch surface (typically the shared client session).
         """
-        self._core = core
+        self._rpc = rpc
 
     async def get_status(self, notebook_id: str) -> ShareStatus:
         """Get current sharing configuration.
@@ -66,7 +53,7 @@ class SharingAPI:
         """
         logger.debug("Getting share status for notebook: %s", notebook_id)
         params = [notebook_id, [2]]
-        result = await self._core.rpc_call(
+        result = await self._rpc.rpc_call(
             RPCMethod.GET_SHARE_STATUS,
             params,
             source_path=f"/notebook/{notebook_id}",
@@ -100,7 +87,7 @@ class SharingAPI:
             None,
             [2],
         ]
-        await self._core.rpc_call(
+        await self._rpc.rpc_call(
             RPCMethod.SHARE_NOTEBOOK,
             params,
             source_path=f"/notebook/{notebook_id}",
@@ -132,7 +119,7 @@ class SharingAPI:
             notebook_id,
             [[None, None, None, None, None, None, None, None, [[level.value]]]],
         ]
-        await self._core.rpc_call(
+        await self._rpc.rpc_call(
             RPCMethod.RENAME_NOTEBOOK,
             params,
             source_path=f"/notebook/{notebook_id}",
@@ -201,7 +188,7 @@ class SharingAPI:
             None,
             [2],
         ]
-        await self._core.rpc_call(
+        await self._rpc.rpc_call(
             RPCMethod.SHARE_NOTEBOOK,
             params,
             source_path=f"/notebook/{notebook_id}",
@@ -255,7 +242,7 @@ class SharingAPI:
             None,
             [2],
         ]
-        await self._core.rpc_call(
+        await self._rpc.rpc_call(
             RPCMethod.SHARE_NOTEBOOK,
             params,
             source_path=f"/notebook/{notebook_id}",

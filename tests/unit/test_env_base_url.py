@@ -2,13 +2,14 @@
 
 import pytest
 
-from notebooklm._core import ClientCore
 from notebooklm._env import get_base_host, get_base_url
+from notebooklm._source.upload import SourceUploadPipeline
 from notebooklm._sources import SourcesAPI
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
 from notebooklm.rpc import RPCMethod, get_batchexecute_url, get_query_url, get_upload_url
 from notebooklm.types import ShareStatus
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 def test_default_base_url_is_personal(monkeypatch):
@@ -69,19 +70,19 @@ def test_rpc_endpoint_helpers_are_lazy(monkeypatch):
 
 def test_core_build_url_uses_enterprise_base_url(monkeypatch):
     monkeypatch.setenv("NOTEBOOKLM_BASE_URL", "https://notebooklm.cloud.google.com")
-    core = ClientCore(AuthTokens(cookies={}, csrf_token="csrf", session_id="sid"))
+    core = build_client_shell_for_tests(AuthTokens(cookies={}, csrf_token="csrf", session_id="sid"))
 
-    # ``_build_url`` consumes an ``_AuthSnapshot`` so callers
-    # outside ``_perform_authed_post`` must build one inline.
-    from notebooklm._core import _AuthSnapshot
+    # ``RpcExecutor.build_url`` consumes an ``AuthSnapshot`` so direct callers
+    # outside the shared transport path must build one inline.
+    from notebooklm._request_types import AuthSnapshot
 
-    snapshot = _AuthSnapshot(
-        csrf_token=core.auth.csrf_token,
-        session_id=core.auth.session_id,
-        authuser=core.auth.authuser,
-        account_email=core.auth.account_email,
+    snapshot = AuthSnapshot(
+        csrf_token=core._auth.csrf_token,
+        session_id=core._auth.session_id,
+        authuser=core._auth.authuser,
+        account_email=core._auth.account_email,
     )
-    url = core._build_url(RPCMethod.LIST_NOTEBOOKS, snapshot)
+    url = core._rpc_executor.build_url(RPCMethod.LIST_NOTEBOOKS, snapshot)
 
     assert url.startswith("https://notebooklm.cloud.google.com/_/LabsTailwindUi/data/")
 
@@ -97,14 +98,26 @@ async def test_upload_start_uses_enterprise_url_and_headers(monkeypatch, httpx_m
         headers={"x-goog-upload-url": upload_url},
     )
 
-    core = ClientCore(auth)
-    await core.open()
+    core = build_client_shell_for_tests(auth)
+    await core.__aenter__()
     try:
-        result = await SourcesAPI(core)._start_resumable_upload(
+        api = SourcesAPI(
+            core,
+            uploader=SourceUploadPipeline(
+                rpc=core,
+                drain=core,
+                lifecycle=core,
+                kernel=core._collaborators.kernel,
+                auth=core._auth,
+                record_upload_queue_wait=core._collaborators.metrics.record_upload_queue_wait,
+            ),
+        )
+        result = await api._start_resumable_upload(
             "nb_123",
             "file.txt",
             12,
             "src_123",
+            "text/plain",
         )
     finally:
         await core.close()

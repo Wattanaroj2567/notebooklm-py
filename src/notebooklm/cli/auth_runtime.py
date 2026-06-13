@@ -8,9 +8,9 @@ as ``notebooklm.cli.helpers.get_auth_tokens`` and
 """
 
 import logging
-import os
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from functools import wraps
 from pathlib import Path
 from typing import Any, NoReturn, TypeVar, cast
@@ -18,6 +18,7 @@ from typing import Any, NoReturn, TypeVar, cast
 import click
 
 from ..auth import AuthTokens
+from .services.auth_source import AUTH_JSON_ENV_NAME, AuthSource, has_env_auth_json
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -41,12 +42,21 @@ def _auth_context(ctx) -> tuple[Path | str | None, str | None]:
 def _resolve_auth_storage_path(
     storage_path: Path | str | None, profile: str | None
 ) -> Path | str | None:
-    """Resolve storage unless auth is supplied directly by environment."""
-    if storage_path is not None:
-        return storage_path
-    if os.environ.get("NOTEBOOKLM_AUTH_JSON"):
-        return None
+    """Resolve storage unless auth is supplied directly by environment.
 
+    Preserves the legacy return shape (the input ``storage_path`` is passed
+    through verbatim — Path stays Path, str stays str) so callers that have
+    historically passed a bare string (e.g. ``ctx.obj["storage_path"]``
+    when set directly by tests) continue to receive the same value. The
+    precedence logic itself delegates to :class:`AuthSource` so the gate
+    is consolidated.
+    """
+    if storage_path is not None:
+        # ``--storage`` override beats every other source — return the
+        # caller's value verbatim (no Path coercion).
+        return storage_path
+    if has_env_auth_json():
+        return None
     from ..paths import get_storage_path
 
     return get_storage_path(profile=profile)
@@ -81,7 +91,7 @@ def get_client(ctx) -> tuple[dict, str, str]:
     resolved_storage_path = _resolved_auth_storage_path(ctx)
     typed_storage_path = cast(Path | None, resolved_storage_path)
 
-    # Load from storage (which respects NOTEBOOKLM_AUTH_JSON if resolved path is None).
+    # Load from storage (which respects env-supplied auth if resolved path is None).
     cookies = helpers.load_auth_from_storage(resolved_storage_path)
 
     from ..auth import fetch_tokens_with_domains
@@ -105,7 +115,7 @@ def get_auth_tokens(ctx) -> AuthTokens:
     resolved_storage_path = _resolved_auth_storage_path(ctx)
     typed_storage_path = cast(Path | None, resolved_storage_path)
 
-    if os.environ.get("NOTEBOOKLM_AUTH_JSON") and storage_path is None:
+    if has_env_auth_json() and storage_path is None:
         from ..auth import build_httpx_cookies_from_storage
 
         jar = build_httpx_cookies_from_storage(None)
@@ -129,20 +139,23 @@ def get_auth_tokens(ctx) -> AuthTokens:
 
 def handle_auth_error(json_output: bool = False) -> NoReturn:
     """Handle authentication errors with helpful context."""
-    from ..paths import get_path_info, get_storage_path
+    import os
+
+    from ..paths import get_path_info
+    from .error_handler import exit_with_code
 
     helpers = _helpers_facade()
     ctx = click.get_current_context(silent=True)
-    profile = ctx.obj.get("profile") if ctx and ctx.obj else None
-    storage_override = helpers._current_storage_override()
-    path_info = get_path_info(profile=profile, storage_path=storage_override)
-    storage_path = (
-        storage_override if storage_override is not None else get_storage_path(profile=profile)
-    )
-    storage_path = Path(storage_path).expanduser().resolve()
-    has_env_var = bool(os.environ.get("NOTEBOOKLM_AUTH_JSON"))
+    auth = AuthSource.from_click_context(ctx)
+    storage_override = auth.storage_override
+    path_info = get_path_info(profile=auth.profile, storage_path=storage_override)
+    storage_path = auth.storage_path_for_diagnostics()
+    has_env_var = auth.has_env_auth
     has_home_env = bool(os.environ.get("NOTEBOOKLM_HOME"))
     storage_source = path_info["home_source"]
+    # ``AUTH_JSON_ENV_NAME`` exposes the env-var name as a constant so this
+    # module does not redeclare the literal.
+    env_var_name = AUTH_JSON_ENV_NAME
 
     if json_output:
         helpers.json_error_response(
@@ -152,12 +165,12 @@ def handle_auth_error(json_output: bool = False) -> NoReturn:
                 "checked_paths": {
                     "storage_file": str(storage_path),
                     "storage_source": storage_source,
-                    "env_var": "NOTEBOOKLM_AUTH_JSON" if has_env_var else None,
+                    "env_var": env_var_name if has_env_var else None,
                 },
-                "help": "Run 'notebooklm login' or set NOTEBOOKLM_AUTH_JSON",
+                "help": f"Run 'notebooklm login' or set {env_var_name}",
             },
         )
-        raise SystemExit(1)
+        exit_with_code(1)
     else:
         helpers.console.print("[red]Not logged in.[/red]\n")
         helpers.console.print("[dim]Checked locations:[/dim]")
@@ -165,12 +178,12 @@ def handle_auth_error(json_output: bool = False) -> NoReturn:
         if has_home_env:
             helpers.console.print("    [dim](via $NOTEBOOKLM_HOME)[/dim]")
         env_status = "[yellow]set but invalid[/yellow]" if has_env_var else "[dim]not set[/dim]"
-        helpers.console.print(f"  • NOTEBOOKLM_AUTH_JSON: {env_status}")
+        helpers.console.print(f"  • {env_var_name}: {env_status}")
         helpers.console.print("\n[bold]Options to authenticate:[/bold]")
         helpers.console.print("  1. Run: [green]notebooklm login[/green]")
-        helpers.console.print("  2. Set [cyan]NOTEBOOKLM_AUTH_JSON[/cyan] env var (for CI/CD)")
+        helpers.console.print(f"  2. Set [cyan]{env_var_name}[/cyan] env var (for CI/CD)")
         helpers.console.print("  3. Use [cyan]--storage /path/to/file.json[/cyan] flag")
-        raise SystemExit(1)
+        exit_with_code(1)
 
 
 def with_auth_and_errors(
@@ -180,6 +193,7 @@ def with_auth_and_errors(
     json_output: bool,
     body: Callable[[AuthTokens], Awaitable[T]],
     auth_loader: Callable[[click.Context], AuthTokens] | None = None,
+    body_error_handler: Callable[[Exception], T] | None = None,
 ) -> T:
     """Run a CLI command body with shared auth bootstrap and error handling."""
     from .error_handler import handle_errors
@@ -236,9 +250,83 @@ def with_auth_and_errors(
             result = helpers.run_async(body(auth))
         except Exception as e:
             log_result("failed", str(e))
+            if body_error_handler is not None:
+                return body_error_handler(e)
             raise
         log_result("completed")
         return result
+
+
+def resolve_client_factory(
+    ctx: click.Context | None,
+    default: Callable[..., AbstractAsyncContextManager[Any]] | None = None,
+) -> Callable[..., AbstractAsyncContextManager[Any]]:
+    """Resolve the ``NotebookLMClient`` factory for a CLI command.
+
+    Resolution order, evaluated at call time:
+
+    1. An injected factory in ``ctx.obj["client_factory"]`` -- the CLI seam tests
+       use this to substitute a fake client. ``ctx.obj`` is the CLI adapter's
+       client seam; a future MCP/HTTP front-end injects through the neutral
+       ``_app`` ``execute_<verb>(plan, client)`` signature, not this key (ADR-0021).
+    2. The ``default`` supplied by the call site -- during the de-monkeypatch
+       migration this is the command module's still-patchable ``NotebookLMClient``
+       name, so legacy ``patch("...X_cmd.NotebookLMClient")`` seams keep working.
+    3. A lazy import of the real :class:`~notebooklm.client.NotebookLMClient` --
+       the production fallback once the module-level default is dropped.
+
+    Null-safe: a bare ``click.Context`` has ``obj is None`` (mirrors the guard in
+    :func:`_auth_context`). The returned factory is invoked as
+    ``factory(client_auth, **client_kwargs)``, so it is typed to accept keyword
+    arguments (the ``source add`` / ``chat ask`` timeout passthrough).
+    """
+    if ctx is not None and isinstance(ctx.obj, dict):
+        injected = ctx.obj.get("client_factory")
+        if injected is not None:
+            return injected
+    if default is not None:
+        return default
+    from ..client import NotebookLMClient
+
+    return NotebookLMClient
+
+
+def run_client_workflow(
+    ctx: click.Context,
+    *,
+    command_name: str,
+    json_output: bool,
+    body: Callable[[Any], Awaitable[T]],
+    auth_loader: Callable[[click.Context], AuthTokens] | None = None,
+    client_factory: Callable[..., AbstractAsyncContextManager[Any]] | None = None,
+    body_error_handler: Callable[[Exception], T] | None = None,
+) -> T:
+    """Run a CLI workflow with shared auth, client lifetime, and error handling.
+
+    This is the command-level adapter for handlers that need an opened
+    ``NotebookLMClient`` rather than raw ``AuthTokens``. ``with_auth_and_errors``
+    remains the lower-level primitive for commands that intentionally manage
+    client lifetime themselves.
+
+    When ``client_factory`` is not supplied, the factory is resolved from
+    ``ctx.obj`` (falling back to the real client) via
+    :func:`resolve_client_factory`, so injected test factories reach this path too.
+    """
+    if client_factory is None:
+        client_factory = resolve_client_factory(ctx)
+
+    async def workflow(auth: AuthTokens) -> T:
+        async with client_factory(auth) as client:
+            return await body(client)
+
+    return with_auth_and_errors(
+        ctx,
+        command_name=command_name,
+        json_output=json_output,
+        body=workflow,
+        auth_loader=auth_loader,
+        body_error_handler=body_error_handler,
+    )
 
 
 def with_client(f):

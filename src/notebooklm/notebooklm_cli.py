@@ -21,11 +21,12 @@ Architecture:
     - It imports command groups from the ``notebooklm.cli`` package and
       registers them on the top-level Click group ``notebooklm``.
     - The ``cli/`` package contains the actual command implementations
-      (one module per command group: ``session``, ``notebook``, ``source``,
-      ``artifact``, ``generate``, ``download``, ``chat``, ``note``,
-      ``doctor``, ``profile``, ``agent``).
-    - Editing CLI behavior: change ``cli/<group>.py``. Editing CLI surface
-      (adding a new top-level command): import + register here.
+      (``*_cmd.py`` modules for command groups and top-level command
+      registration; shared runtime helpers live in sibling modules such as
+      ``options.py``, ``runtime.py``, and ``auth_runtime.py``).
+    - Editing CLI behavior: change the relevant ``cli/*_cmd.py`` module or
+      shared helper. Editing CLI surface (adding a new top-level command):
+      import + register it here.
 
 LLM-friendly design:
   # Set context once, then use simple commands
@@ -98,7 +99,9 @@ from .cli import (
     artifact,
     download,
     generate,
+    label,
     language,
+    mcp,
     note,
     profile,
     register_chat_commands,
@@ -113,7 +116,13 @@ from .cli import (
 )
 from .cli.grouped import SectionedGroup
 
-# Import helpers needed for backward compatibility with tests
+# Public surface (ADR-0012). ``main`` is the ``[project.scripts]`` entry
+# point and ``src/notebooklm/__main__.py`` shim; ``cli`` is the root
+# ``click.Group`` imported by tests to drive ``CliRunner`` invocations.
+# The underscore-prefixed helpers in this module (``_reconfigure_output_stream``,
+# ``_configure_windows_runtime``) stay importable for tests but are not part
+# of the documented public API.
+__all__ = ["cli", "main"]
 
 
 # =============================================================================
@@ -146,7 +155,7 @@ from .cli.grouped import SectionedGroup
     is_flag=True,
     default=False,
     help=(
-        "Suppress INFO/WARN log records on stderr (only ERROR survives). "
+        "Suppress status output and INFO/WARN log records (only errors survive). "
         "Mutually exclusive with -v/-vv."
     ),
 )
@@ -193,9 +202,13 @@ def cli(ctx, storage, profile, verbose, quiet):
     set_active_profile(profile)
 
     # Only set up profiles dir when not using an explicit auth source.
-    # --storage and NOTEBOOKLM_AUTH_JSON bypass the profile system entirely
-    # and must not require a writable NOTEBOOKLM_HOME.
-    if not storage and not os.environ.get("NOTEBOOKLM_AUTH_JSON"):
+    # ``--storage`` and the env-var auth fast path bypass the profile system
+    # entirely and must not require a writable NOTEBOOKLM_HOME. The env-var
+    # check goes through :mod:`cli.services.auth_source` so the precedence
+    # logic stays in one place.
+    from .cli.services.auth_source import has_env_auth_json
+
+    if not storage and not has_env_auth_json():
         try:
             from .migration import ensure_profiles_dir
 
@@ -209,9 +222,17 @@ def cli(ctx, storage, profile, verbose, quiet):
     ctx.ensure_object(dict)
     # Canonicalize once at the boundary: ``--storage ~/foo.json`` and
     # ``--storage /Users/x/foo.json`` must map to the same sibling-context
-    # namespace (see ``cli.helpers._current_storage_override``).
+    # namespace (see :class:`notebooklm.cli.services.auth_source.AuthSource`).
     ctx.obj["storage_path"] = Path(storage).expanduser().resolve() if storage else None
     ctx.obj["profile"] = profile
+    # Mirror the root quiet flag for call sites that already read ctx.obj.
+    # ``cli.runtime.is_quiet(ctx)`` remains the canonical reader.
+    ctx.obj["quiet"] = bool(quiet)
+    # Default client factory: commands resolve ``NotebookLMClient`` through
+    # ``cli.auth_runtime.resolve_client_factory``. ``setdefault`` never clobbers a
+    # factory injected via ``CliRunner.invoke(obj=...)`` (the test seam); ``None``
+    # leaves resolution to the call-site default / lazy real client.
+    ctx.obj.setdefault("client_factory", None)
 
 
 # =============================================================================
@@ -231,11 +252,13 @@ cli.add_command(agent)
 cli.add_command(generate)
 cli.add_command(download)
 cli.add_command(note)
+cli.add_command(label)
 cli.add_command(share)
 cli.add_command(skill)
 cli.add_command(research)
 cli.add_command(language)
 cli.add_command(profile)
+cli.add_command(mcp)
 
 
 # =============================================================================

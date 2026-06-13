@@ -70,6 +70,12 @@ class RPCMethod(str, Enum):
     CHECK_SOURCE_FRESHNESS = "yR9Yof"
     UPDATE_SOURCE = "b7Wfje"
 
+    # Source label operations (AI topic grouping; see docs/design/source-labels/)
+    CREATE_LABEL = "agX4Bc"  # Multi-mode: AI auto-group (generate) AND manual create
+    LIST_LABELS = "I3xc3c"
+    UPDATE_LABEL = "le8sX"  # Rename / set emoji / add sources (fieldmask)
+    DELETE_LABEL = "GyzE7e"  # Batch delete by id
+
     # Summary and query
     SUMMARIZE = "VfAZjd"
     GET_SOURCE_GUIDE = "tr032e"
@@ -82,8 +88,9 @@ class RPCMethod(str, Enum):
     RENAME_ARTIFACT = "rc3d8d"
     EXPORT_ARTIFACT = "Krh3pd"
     SHARE_ARTIFACT = "RGP97b"
-    GET_INTERACTIVE_HTML = "v9rmvd"  # Fetch quiz/flashcard HTML content
+    GET_INTERACTIVE_HTML = "v9rmvd"  # Fetch quiz/flashcard HTML content (also serves interactive mind map data at [0][9][3])
     REVISE_SLIDE = "KmcKPe"  # Revise individual slide with prompt
+    RETRY_ARTIFACT = "Rytqqe"  # Retry a failed Studio artifact in place (UI "Retry")
 
     # Research
     START_FAST_RESEARCH = "Ljjv0c"
@@ -120,8 +127,10 @@ class RPCMethod(str, Enum):
 class ArtifactTypeCode(int, Enum):
     """Integer codes for artifact types used in RPC calls.
 
-    These are the raw codes used in the CREATE_ARTIFACT (R7cb6c) RPC call.
-    Values correspond to artifact_data[2] in API responses.
+    Codes 1, 2, 3, 4, 7, 8, and 9 are raw CREATE_ARTIFACT / LIST_ARTIFACTS
+    values. MIND_MAP (5) is the library's synthetic code for note-backed mind
+    maps returned by GET_NOTES_AND_MIND_MAPS; interactive mind maps are type 4 /
+    variant 4.
 
     Note: This is an internal enum. Users should use ArtifactType (str enum)
     from notebooklm.types for a cleaner API.
@@ -132,7 +141,7 @@ class ArtifactTypeCode(int, Enum):
         2  # Includes: Briefing Doc, Study Guide, Blog Post, White Paper, Research Proposal, etc.
     )
     VIDEO = 3
-    QUIZ = 4  # Also used for flashcards
+    QUIZ = 4  # Also used for flashcards and interactive mind maps (variant 4)
     QUIZ_FLASHCARD = 4  # Alias for backward compatibility
     MIND_MAP = 5
     # Note: Type 6 appears unused in current API
@@ -141,8 +150,13 @@ class ArtifactTypeCode(int, Enum):
     DATA_TABLE = 9
 
 
-# Deprecated alias for backward compatibility
-StudioContentType = ArtifactTypeCode
+# Variant codes at artifact_data[9][1][0], distinguishing sub-kinds within the
+# type-4 (QUIZ) family. The interactive mind map is a studio artifact
+# (type 4 / variant 4) created via CREATE_ARTIFACT, distinct from the
+# note-backed mind map (surfaced with the synthetic type code 5).
+FLASHCARDS_VARIANT: Final[int] = 1
+QUIZ_VARIANT: Final[int] = 2
+INTERACTIVE_MIND_MAP_VARIANT: Final[int] = 4
 
 
 class ArtifactStatus(int, Enum):
@@ -402,7 +416,7 @@ def source_status_to_str(status_code: int | SourceStatus) -> str:
         status_code: Status code as int or SourceStatus enum.
 
     Returns:
-        String status: "processing", "ready", "error", or "unknown".
+        String status: "processing", "ready", "error", "preparing", or "unknown".
         Returns "unknown" for unrecognized codes (future-proofing).
     """
     return _SOURCE_STATUS_MAP.get(status_code, "unknown")

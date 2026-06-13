@@ -1,19 +1,40 @@
 """Tests for language CLI commands (list, get, set)."""
 
-import gc
 import importlib
 import json
-import warnings
-from unittest.mock import MagicMock, patch
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+import notebooklm.cli.helpers as helpers_module
+from notebooklm.exceptions import AuthError, NetworkError
 from notebooklm.notebooklm_cli import cli
+
+from .conftest import inject_client
 
 # Import the module explicitly to avoid confusion with the Click group
 # (notebooklm.cli exports 'language' as a Click Group, which shadows the module)
-language_module = importlib.import_module("notebooklm.cli.language")
+language_module = importlib.import_module("notebooklm.cli.language_cmd")
+
+
+def test_save_config_alias_removed() -> None:
+    """The deprecated public ``save_config`` alias is removed in v0.5.0."""
+    assert not hasattr(language_module, "save_config")
+    assert hasattr(language_module, "_save_config")
+
+
+def test_swallow_helpers_removed() -> None:
+    """The broad-``except`` silent-degrade helpers are gone (issue #1309).
+
+    Server interaction now routes through the standard error envelope; the
+    old helpers that swallowed auth/network/RPC errors must not return.
+    """
+    assert not hasattr(language_module, "_get_language_from_server")
+    assert not hasattr(language_module, "_sync_language_to_server")
+    assert not hasattr(language_module, "_run_language_rpc")
 
 
 @pytest.fixture
@@ -33,13 +54,67 @@ def mock_config_file(tmp_path):
         yield config_file
 
 
-def unawaited_coroutine_warnings(caught_warnings):
-    return [
-        warning
-        for warning in caught_warnings
-        if issubclass(warning.category, RuntimeWarning)
-        and "was never awaited" in str(warning.message)
-    ]
+def write_config(path, config):
+    """Write a config dict to ``path`` with explicit UTF-8 + LF semantics.
+
+    Centralizes the cross-platform file-write contract (utf-8 encoding, ``\n``
+    newlines, ``ensure_ascii=False``) so individual tests stay terse and no
+    test relies on the platform default of ``Path.write_text``.
+    """
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(config, ensure_ascii=False))
+
+
+def read_config(path):
+    """Read a config dict from ``path`` with explicit UTF-8 decoding."""
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@contextmanager
+def mock_server(*, get_returns="en", set_returns="en", get_error=None, set_error=None):
+    """Stub the auth bootstrap and yield ``(settings, client_obj)`` for the server path.
+
+    ``language get``/``set`` (without ``--local``) now route through
+    ``with_auth_and_errors`` → the resolved client factory → ``client.settings``.
+    This stubs the auth stack so a unit test can drive the server response (or
+    inject an auth/network error to exercise the hard-fail envelope).
+
+    The mock client is supplied to the command via ``ctx.obj`` injection rather
+    than a module patch: the yielded ``client_obj`` is the
+    ``CliRunner.invoke(obj=...)`` payload (``inject_client(client)``), which
+    seeds ``ctx.obj["client_factory"]`` so the command builds the mock client.
+    """
+    settings = MagicMock()
+    if get_error is not None:
+        settings.get_output_language = AsyncMock(side_effect=get_error)
+    else:
+        settings.get_output_language = AsyncMock(return_value=get_returns)
+    if set_error is not None:
+        settings.set_output_language = AsyncMock(side_effect=set_error)
+    else:
+        settings.set_output_language = AsyncMock(return_value=set_returns)
+
+    client = MagicMock()
+    client.settings = settings
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch.object(helpers_module, "load_auth_from_storage") as mock_load,
+        patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch,
+    ):
+        mock_load.return_value = {
+            "SID": "test",
+            "__Secure-1PSIDTS": "test_1psidts",
+            "HSID": "test",
+            "SSID": "test",
+            "APISID": "test",
+            "SAPISID": "test",
+        }
+        mock_fetch.return_value = ("csrf", "session")
+        yield settings, inject_client(client)
 
 
 # =============================================================================
@@ -90,7 +165,7 @@ class TestLanguageGetCommand:
     def test_language_get_when_set(self, runner, mock_config_file):
         """Test 'language get --local' when language is configured."""
         # Write config file with language
-        mock_config_file.write_text(json.dumps({"language": "zh_Hans"}))
+        write_config(mock_config_file, {"language": "zh_Hans"})
 
         # Use --local to test local config only
         result = runner.invoke(cli, ["language", "get", "--local"])
@@ -101,7 +176,7 @@ class TestLanguageGetCommand:
 
     def test_language_get_json_output(self, runner, mock_config_file):
         """Test 'language get --local --json' outputs JSON format."""
-        mock_config_file.write_text(json.dumps({"language": "ja"}))
+        write_config(mock_config_file, {"language": "ja"})
 
         # Use --local to test local config only
         result = runner.invoke(cli, ["language", "get", "--local", "--json"])
@@ -111,6 +186,8 @@ class TestLanguageGetCommand:
         assert data["language"] == "ja"
         assert data["name"] == "日本語"
         assert data["is_default"] is False
+        # --local never contacts the server, so the sync flag is always False.
+        assert data["synced_from_server"] is False
 
     def test_language_get_json_when_not_set(self, runner, mock_config_file):
         """Test 'language get --local --json' when not configured."""
@@ -130,49 +207,113 @@ class TestLanguageGetCommand:
 
 class TestLanguageSetCommand:
     def test_language_set_valid_code(self, runner, mock_config_file):
-        """Test 'language set' with valid language code."""
-        result = runner.invoke(cli, ["language", "set", "zh_Hans"])
+        """Test 'language set' with valid language code (server-authoritative)."""
+        with mock_server(set_returns="zh_Hans") as (settings, client_obj):
+            result = runner.invoke(cli, ["language", "set", "zh_Hans"], obj=client_obj)
 
         assert result.exit_code == 0
         assert "zh_Hans" in result.output
         assert "中文" in result.output or "GLOBAL" in result.output
+        # Server sync happened before the local write.
+        settings.set_output_language.assert_awaited_once_with("zh_Hans")
 
-        # Verify config was written
-        config = json.loads(mock_config_file.read_text())
+        # Verify config was written (only after the server confirmed).
+        config = read_config(mock_config_file)
         assert config["language"] == "zh_Hans"
 
     def test_language_set_shows_global_warning(self, runner, mock_config_file):
         """Test 'language set' shows global setting warning."""
-        result = runner.invoke(cli, ["language", "set", "ko"])
+        with mock_server(set_returns="ko") as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "set", "ko"], obj=client_obj)
 
         assert result.exit_code == 0
         assert "GLOBAL" in result.output or "global" in result.output.lower()
         assert "all notebooks" in result.output.lower()
 
     def test_language_set_invalid_code(self, runner, mock_config_file):
-        """Test 'language set' with invalid language code."""
+        """Test 'language set' with invalid language code.
+
+        Validation runs before any auth/client, so no server fixture is needed
+        and storage is never touched.
+        """
         result = runner.invoke(cli, ["language", "set", "invalid_code"])
 
         assert result.exit_code == 1
         assert "Unknown language code" in result.output
         assert "language list" in result.output.lower()
+        assert not mock_config_file.exists()
 
     def test_language_set_json_output(self, runner, mock_config_file):
         """Test 'language set --json' outputs JSON format."""
-        result = runner.invoke(cli, ["language", "set", "fr", "--json"])
+        with mock_server(set_returns="fr") as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "set", "fr", "--json"], obj=client_obj)
 
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["language"] == "fr"
         assert data["name"] == "Français"
+        assert data["synced_to_server"] is True
+
+    def test_language_set_local_skips_server(self, runner, mock_config_file):
+        """``language set --local`` persists locally with NO auth/client (offline)."""
+        # No mock_server fixture: if --local touched auth/client this would fail.
+        result = runner.invoke(cli, ["language", "set", "ja", "--local"])
+
+        assert result.exit_code == 0
+        assert "ja" in result.output
+        assert "server sync skipped" in result.output
+        config = read_config(mock_config_file)
+        assert config["language"] == "ja"
+
+    def test_language_set_local_json(self, runner, mock_config_file):
+        """``language set --local --json`` reports ``synced_to_server`` False offline."""
+        result = runner.invoke(cli, ["language", "set", "ko", "--local", "--json"])
+
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["language"] == "ko"
+        assert data["synced_to_server"] is False
+
+    def test_language_set_server_error_hard_fails(self, runner, mock_config_file):
+        """A server RPC failure surfaces the envelope + non-zero exit (NOT swallowed)."""
+        with mock_server(set_error=NetworkError("connection refused")) as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "set", "fr"], obj=client_obj)
+
+        assert result.exit_code != 0
+        assert "Network error" in result.output or "error" in result.output.lower()
+        # Server-authoritative ordering: the failed sync must NOT leave a
+        # misleading local value behind.
+        assert not mock_config_file.exists()
+
+    def test_language_set_server_error_json_envelope(self, runner, mock_config_file):
+        """``language set --json`` on a server failure emits the typed error envelope."""
+        with mock_server(set_error=AuthError("expired session")) as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "set", "fr", "--json"], obj=client_obj)
+
+        assert result.exit_code != 0
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "AUTH_ERROR"
+        assert "synced_to_server" not in data
+        # Local value never written when the server rejected the change.
+        assert not mock_config_file.exists()
 
     def test_language_set_invalid_json_output(self, runner, mock_config_file):
-        """Test 'language set --json' with invalid code outputs JSON error."""
+        """``language set --json`` with invalid code emits the shared JSON error schema.
+
+        The error payload must match ``json_error_response`` in ``cli/rendering.py``
+        so machine-readable error handling is uniform across CLI commands:
+        ``{"error": true, "code": "INVALID_LANGUAGE", "message": ..., "hint": ...}``.
+        """
         result = runner.invoke(cli, ["language", "set", "xyz", "--json"])
 
         assert result.exit_code == 1
         data = json.loads(result.output)
-        assert data["error"] == "INVALID_LANGUAGE"
+        assert data["error"] is True
+        assert data["code"] == "INVALID_LANGUAGE"
+        assert "xyz" in data["message"]
+        assert "hint" in data
+        assert "language list" in data["hint"].lower()
 
 
 # =============================================================================
@@ -183,7 +324,7 @@ class TestLanguageSetCommand:
 class TestGenerateUsesConfigLanguage:
     def test_generate_audio_uses_config_language(self, runner, mock_config_file):
         """Test that generate audio uses config language when not specified."""
-        mock_config_file.write_text(json.dumps({"language": "zh_Hans"}))
+        write_config(mock_config_file, {"language": "zh_Hans"})
 
         # Just verify the help shows the default behavior
         result = runner.invoke(cli, ["generate", "audio", "--help"])
@@ -194,266 +335,109 @@ class TestGenerateUsesConfigLanguage:
 
 
 # =============================================================================
-# GET_CONFIG ERROR PATHS (lines 116-121)
+# GET_CONFIG ERROR PATHS
+#
+# The pure ``get_config()`` corrupt-JSON / OSError fallback tests moved to
+# ``tests/unit/app/test_app_language.py::TestGetConfig`` (the behavior lives in
+# ``_app/language.LanguageConfigStore.get_config``; the CLI ``get_config()`` is
+# a thin wrapper that binds this module's path/home helpers into the store).
 # =============================================================================
 
 
-class TestGetConfigErrorPaths:
-    def test_get_config_json_decode_error(self, tmp_path):
-        """Test get_config() returns {} when config file has invalid JSON."""
-        config_file = tmp_path / "config.json"
-        config_file.write_text("this is not valid json{{{")
-
-        with patch.object(language_module, "get_config_path", return_value=config_file):
-            result = language_module.get_config()
-
-        assert result == {}
-
-    def test_get_config_oserror(self, tmp_path):
-        """Test get_config() returns {} when config file can't be read (OSError)."""
-        config_file = tmp_path / "config.json"
-        # Create the file so exists() returns True, then mock read_text to raise OSError
-        config_file.write_text('{"language": "en"}')
-
-        with (
-            patch.object(language_module, "get_config_path", return_value=config_file),
-            patch.object(
-                config_file.__class__, "read_text", side_effect=OSError("permission denied")
-            ),
-        ):
-            result = language_module.get_config()
-
-        assert result == {}
-
-
 # =============================================================================
-# _SYNC_LANGUAGE_TO_SERVER AND _GET_LANGUAGE_FROM_SERVER (lines 162-164, 176-186)
+# LANGUAGE GET SERVER PATH (issue #1309: hard-fail via the error envelope)
 # =============================================================================
 
 
-class TestSyncLanguageToServer:
-    def test_sync_language_to_server_success(self):
-        """Test _sync_language_to_server returns run_async result on success."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {"auth": {"SID": "test", "HSID": "test", "SSID": "test"}}
+class TestLanguageGetServerPath:
+    def test_server_different_value_updates_local(self, runner, mock_config_file):
+        """'language get' updates local config when the server has a different value."""
+        # Local is "en", server returns "fr" → local should be updated to "fr".
+        write_config(mock_config_file, {"language": "en"})
 
-        with (
-            patch.object(language_module, "get_auth_tokens", return_value={"SID": "test"}),
-            patch.object(language_module, "run_async", return_value="en") as mock_run,
-        ):
-            result = language_module._sync_language_to_server("en", mock_ctx)
-
-        assert result == "en"
-        mock_run.assert_called_once()
-
-    def test_sync_language_to_server_exception_returns_none(self):
-        """Test _sync_language_to_server returns None when exception occurs."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {}
-
-        with patch.object(language_module, "get_auth_tokens", side_effect=Exception("no auth")):
-            result = language_module._sync_language_to_server("en", mock_ctx)
-
-        assert result is None
-
-    def test_sync_language_to_server_run_async_exception(self):
-        """Test _sync_language_to_server returns None when run_async raises."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {}
-
-        with (
-            patch.object(language_module, "get_auth_tokens", return_value={"SID": "test"}),
-            patch.object(language_module, "run_async", side_effect=Exception("connection error")),
-        ):
-            result = language_module._sync_language_to_server("en", mock_ctx)
-
-        assert result is None
-
-    def test_sync_language_to_server_closes_coroutine_when_run_async_raises(self):
-        """Test run_async failures do not leak an unawaited coroutine warning."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {}
-
-        with (
-            patch.object(language_module, "get_auth_tokens", return_value={"SID": "test"}),
-            patch.object(language_module, "run_async", side_effect=Exception("connection error")),
-            warnings.catch_warnings(record=True) as caught_warnings,
-        ):
-            warnings.simplefilter("always", RuntimeWarning)
-
-            result = language_module._sync_language_to_server("en", mock_ctx)
-            gc.collect()
-
-        assert result is None
-        assert unawaited_coroutine_warnings(caught_warnings) == []
-
-
-class TestGetLanguageFromServer:
-    def test_get_language_from_server_success(self):
-        """Test _get_language_from_server returns the server language on success."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {"auth": {"SID": "test"}}
-
-        with (
-            patch.object(language_module, "get_auth_tokens", return_value={"SID": "test"}),
-            patch.object(language_module, "run_async", return_value="fr") as mock_run,
-        ):
-            result = language_module._get_language_from_server(mock_ctx)
-
-        assert result == "fr"
-        mock_run.assert_called_once()
-
-    def test_get_language_from_server_exception_returns_none(self):
-        """Test _get_language_from_server returns None when exception occurs."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {}
-
-        with patch.object(language_module, "get_auth_tokens", side_effect=Exception("no auth")):
-            result = language_module._get_language_from_server(mock_ctx)
-
-        assert result is None
-
-    def test_get_language_from_server_run_async_exception(self):
-        """Test _get_language_from_server returns None when run_async raises."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {}
-
-        with (
-            patch.object(language_module, "get_auth_tokens", return_value={"SID": "test"}),
-            patch.object(language_module, "run_async", side_effect=Exception("rpc error")),
-        ):
-            result = language_module._get_language_from_server(mock_ctx)
-
-        assert result is None
-
-    def test_get_language_from_server_closes_coroutine_when_run_async_raises(self):
-        """Test run_async failures do not leak an unawaited coroutine warning."""
-        mock_ctx = MagicMock()
-        mock_ctx.obj = {}
-
-        with (
-            patch.object(language_module, "get_auth_tokens", return_value={"SID": "test"}),
-            patch.object(language_module, "run_async", side_effect=Exception("rpc error")),
-            warnings.catch_warnings(record=True) as caught_warnings,
-        ):
-            warnings.simplefilter("always", RuntimeWarning)
-
-            result = language_module._get_language_from_server(mock_ctx)
-            gc.collect()
-
-        assert result is None
-        assert unawaited_coroutine_warnings(caught_warnings) == []
-
-
-# =============================================================================
-# LANGUAGE GET SERVER SYNC PATHS (lines 244-250, 270)
-# =============================================================================
-
-
-class TestLanguageGetServerSyncPaths:
-    def test_language_get_server_has_different_value_updates_local(self, runner, mock_config_file):
-        """Test 'language get' updates local config when server has a different value."""
-        # Local is "en", server returns "fr" → local should be updated to "fr"
-        mock_config_file.write_text(json.dumps({"language": "en"}))
-
-        with patch.object(language_module, "_get_language_from_server", return_value="fr"):
-            result = runner.invoke(cli, ["language", "get"])
+        with mock_server(get_returns="fr") as (settings, client_obj):
+            result = runner.invoke(cli, ["language", "get"], obj=client_obj)
 
         assert result.exit_code == 0
-        # Local config should be updated to "fr"
-        config = json.loads(mock_config_file.read_text())
+        settings.get_output_language.assert_awaited_once()
+        config = read_config(mock_config_file)
         assert config["language"] == "fr"
-        # Output should show "fr" (the server value)
         assert "fr" in result.output
 
-    def test_language_get_server_different_shows_synced(self, runner, mock_config_file):
-        """Test 'language get' shows synced message when server differs from local."""
-        mock_config_file.write_text(json.dumps({"language": "en"}))
+    def test_server_different_shows_synced(self, runner, mock_config_file):
+        """'language get' shows the synced message when the server differs from local."""
+        write_config(mock_config_file, {"language": "en"})
 
-        with patch.object(language_module, "_get_language_from_server", return_value="ja"):
-            result = runner.invoke(cli, ["language", "get"])
+        with mock_server(get_returns="ja") as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "get"], obj=client_obj)
 
         assert result.exit_code == 0
         assert "synced" in result.output.lower()
 
-    def test_language_get_server_same_value_no_update(self, runner, mock_config_file):
-        """Test 'language get' does not update local when server value matches."""
-        mock_config_file.write_text(json.dumps({"language": "en"}))
+    def test_server_same_value_no_update(self, runner, mock_config_file):
+        """'language get' does not rewrite local config when the server value matches."""
+        write_config(mock_config_file, {"language": "en"})
 
         with (
-            patch.object(language_module, "_get_language_from_server", return_value="en"),
+            mock_server(get_returns="en") as (_settings, client_obj),
             patch.object(language_module, "set_language") as mock_set,
         ):
-            result = runner.invoke(cli, ["language", "get"])
+            result = runner.invoke(cli, ["language", "get"], obj=client_obj)
 
         assert result.exit_code == 0
         mock_set.assert_not_called()
 
-    def test_language_get_no_language_shows_not_set(self, runner, mock_config_file):
-        """Test 'language get' shows 'not set' when no language is configured and server returns None."""
-        # No language configured locally
-        with patch.object(language_module, "_get_language_from_server", return_value=None):
-            result = runner.invoke(cli, ["language", "get"])
+    def test_server_returns_none_falls_back_to_local(self, runner, mock_config_file):
+        """When the server has no value set, fall back to local for display."""
+        write_config(mock_config_file, {"language": "de"})
+
+        with mock_server(get_returns=None) as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "get"], obj=client_obj)
+
+        assert result.exit_code == 0
+        assert "de" in result.output
+
+    def test_server_and_local_unset_shows_not_set(self, runner, mock_config_file):
+        """'language get' shows 'not set' when neither server nor local has a value."""
+        with mock_server(get_returns=None) as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "get"], obj=client_obj)
 
         assert result.exit_code == 0
         assert "not set" in result.output
 
-    def test_language_get_server_sync_json_output(self, runner, mock_config_file):
-        """Test 'language get --json' reflects synced_from_server when values differ."""
-        mock_config_file.write_text(json.dumps({"language": "en"}))
+    def test_server_sync_json_output(self, runner, mock_config_file):
+        """'language get --json' reflects synced_from_server when values differ."""
+        write_config(mock_config_file, {"language": "en"})
 
-        with patch.object(language_module, "_get_language_from_server", return_value="de"):
-            result = runner.invoke(cli, ["language", "get", "--json"])
+        with mock_server(get_returns="de") as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "get", "--json"], obj=client_obj)
 
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["language"] == "de"
         assert data["synced_from_server"] is True
 
+    def test_server_error_hard_fails(self, runner, mock_config_file):
+        """A server RPC failure surfaces the envelope + non-zero exit (NOT swallowed)."""
+        write_config(mock_config_file, {"language": "en"})
 
-# =============================================================================
-# LANGUAGE SET SYNC FAILED AND JSON PATHS (lines 316-320, 335-336)
-# =============================================================================
+        with mock_server(get_error=NetworkError("connection refused")) as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "get"], obj=client_obj)
 
+        assert result.exit_code != 0
+        assert "Network error" in result.output or "error" in result.output.lower()
+        # Local config must be left untouched on a failed fetch.
+        config = read_config(mock_config_file)
+        assert config["language"] == "en"
 
-class TestLanguageSetSyncFailedAndJsonPaths:
-    def test_language_set_sync_failed_shows_local_only_message(self, runner, mock_config_file):
-        """Test 'language set' shows local-only message when server sync fails."""
-        with patch.object(language_module, "_sync_language_to_server", return_value=None):
-            result = runner.invoke(cli, ["language", "set", "en"])
+    def test_server_error_json_envelope(self, runner, mock_config_file):
+        """'language get --json' on a server failure emits the typed error envelope."""
+        with mock_server(get_error=AuthError("expired session")) as (_settings, client_obj):
+            result = runner.invoke(cli, ["language", "get", "--json"], obj=client_obj)
 
-        assert result.exit_code == 0
-        assert "saved locally" in result.output or "server sync failed" in result.output
-
-    def test_language_set_sync_success_shows_synced_message(self, runner, mock_config_file):
-        """Test 'language set' shows synced message when server sync succeeds."""
-        with patch.object(language_module, "_sync_language_to_server", return_value="en"):
-            result = runner.invoke(cli, ["language", "set", "en"])
-
-        assert result.exit_code == 0
-        assert "synced" in result.output.lower()
-        # Should NOT show "server sync failed"
-        assert "server sync failed" not in result.output
-
-    def test_language_set_json_output_with_server_sync(self, runner, mock_config_file):
-        """Test 'language set --json' includes synced_to_server field."""
-        with patch.object(language_module, "_sync_language_to_server", return_value="fr"):
-            result = runner.invoke(cli, ["language", "set", "fr", "--json"])
-
-        assert result.exit_code == 0
+        assert result.exit_code != 0
         data = json.loads(result.output)
-        assert data["language"] == "fr"
-        assert data["name"] == "Français"
-        assert "synced_to_server" in data
-        assert data["synced_to_server"] is True
-
-    def test_language_set_json_output_sync_failed(self, runner, mock_config_file):
-        """Test 'language set --json' shows synced_to_server=False when sync fails."""
-        with patch.object(language_module, "_sync_language_to_server", return_value=None):
-            result = runner.invoke(cli, ["language", "set", "ko", "--json"])
-
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert data["language"] == "ko"
-        assert "synced_to_server" in data
-        assert data["synced_to_server"] is False
+        assert data["error"] is True
+        assert data["code"] == "AUTH_ERROR"
+        # The success payload keys must not leak into the error envelope.
+        assert "synced_from_server" not in data

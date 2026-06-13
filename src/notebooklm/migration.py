@@ -16,6 +16,8 @@ import json
 import logging
 import shutil
 import sys
+from pathlib import Path
+from typing import Any
 
 from filelock import FileLock, Timeout
 
@@ -23,6 +25,17 @@ from ._atomic_io import atomic_update_json
 from .paths import get_config_path, get_home_dir
 
 logger = logging.getLogger(__name__)
+
+# Public surface (ADR-0012). Underscore-prefixed constants such as
+# ``_MIGRATION_LOCK``, ``_MIGRATION_MARKER``, and ``_MIGRATION_LOCK_TIMEOUT``
+# remain importable / monkeypatch-able for tests via direct attribute
+# lookup; ``__all__`` only governs ``from notebooklm.migration import *``
+# and documents the intended public API.
+__all__ = [
+    "MigrationLockTimeoutError",
+    "ensure_profiles_dir",
+    "migrate_to_profiles",
+]
 
 _MIGRATION_MARKER = ".migration_complete"
 _MIGRATION_LOCK = ".migration.lock"
@@ -42,7 +55,7 @@ class MigrationLockTimeoutError(RuntimeError):
     """
 
 
-def _has_legacy_files(home) -> bool:
+def _has_legacy_files(home: Path) -> bool:
     """Check if any legacy files exist at the home root."""
     return any((home / name).exists() for name in _LEGACY_FILES) or any(
         (home / name).is_dir() for name in _LEGACY_DIRS
@@ -90,7 +103,7 @@ def migrate_to_profiles() -> bool:
         ) from exc
 
 
-def _migrate_to_profiles_locked(home) -> bool:
+def _migrate_to_profiles_locked(home: Path) -> bool:
     """Core migration body, executed while holding the migration lock.
 
     Split out so the lock-acquisition wrapper stays small and the locked
@@ -194,7 +207,7 @@ def _set_default_profile_in_config() -> None:
     else:
         config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-    def _ensure_default(data: dict) -> dict:
+    def _ensure_default(data: dict[str, Any]) -> dict[str, Any]:
         if "default_profile" not in data:
             data["default_profile"] = "default"
         return data

@@ -23,7 +23,7 @@ class RecordingRpc:
         self.response = response
         self.calls: list[tuple[RPCMethod, list[Any], str | None]] = []
 
-    async def __call__(
+    async def rpc_call(
         self,
         method: RPCMethod,
         params: list[Any],
@@ -32,6 +32,7 @@ class RecordingRpc:
         _is_retry: bool = False,
         *,
         disable_internal_retries: bool = False,
+        operation_variant: str | None = None,
     ) -> Any:
         self.calls.append((method, params, source_path))
         return self.response
@@ -187,7 +188,9 @@ async def test_default_source_lister_uses_phase8_listing_service() -> None:
 
 @pytest.mark.asyncio
 async def test_default_source_lister_delegates_strict_malformed_handling() -> None:
-    source_lister = create_default_source_lister(RecordingRpc([["Notebook", None]]))
+    # A non-list, non-None sources slot is a genuinely malformed shape (a
+    # ``None`` slot is now the empty-notebook signal — see issue #1159).
+    source_lister = create_default_source_lister(RecordingRpc([["Notebook", "not-a-list"]]))
 
-    with pytest.raises(RPCError, match="sources data is NoneType, not list"):
+    with pytest.raises(RPCError, match="sources data is str, not list"):
         await source_lister.list("nb_123", strict=True)

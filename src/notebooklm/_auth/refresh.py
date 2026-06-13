@@ -3,10 +3,9 @@
 This private module owns the ``NOTEBOOKLM_REFRESH_CMD`` subprocess flow, the
 per-loop coalescing of refresh attempts, and the public ``fetch_tokens`` /
 ``fetch_tokens_with_domains`` entry points. ``notebooklm.auth`` re-exports
-every name listed here; the facade write-through in ``_AuthFacadeModule``
-mirrors any monkeypatched values back to this module so the existing white-box
-tests (``monkeypatch.setattr(auth_mod, "_run_refresh_cmd", ...)``,
-``..., "snapshot_cookie_jar"``, etc.) keep working after the move.
+compatibility names, but production no longer mirrors facade-level rebindings;
+tests that substitute moved refresh bodies should patch
+``notebooklm._auth.refresh`` directly.
 
 Logger name is pinned to ``"notebooklm.auth"`` (NOT ``__name__``) so existing
 ``caplog`` assertions targeting ``notebooklm.auth`` keep matching the records
@@ -43,12 +42,15 @@ logger = logging.getLogger("notebooklm.auth")
 
 # --- Names aliased from sibling modules --------------------------------------
 # The moved bodies historically resolved these names against ``notebooklm.auth``
-# (where they were direct-assigned). Re-aliasing them here gives each one a
-# rebindable bare name local to this module; the ``notebooklm.auth`` facade
-# write-through (``_AuthFacadeModule._REFRESH_DEP_MIRROR_NAMES``) mirrors any
-# monkeypatched value back to this module so the bare-name lookups inside the
-# moved bodies still observe the patch.
+# when they lived there. They are now local aliases in this module; tests that
+# need to substitute one of these dependencies should patch the alias on
+# ``notebooklm._auth.refresh`` directly.
 build_httpx_cookies_from_storage = _auth_cookies.build_httpx_cookies_from_storage
+# No-recovery loader: validates and raises on missing cookies, but never fires
+# the inline ``RotateCookies`` PSIDTS recovery (network POST + disk write) that
+# ``build_httpx_cookies_from_storage`` does. Used by the passive probe so it
+# stays strictly read-only (issue #1569).
+_build_httpx_cookies_from_storage_strict = _auth_cookies._build_httpx_cookies_from_storage_strict
 _replace_cookie_jar = _auth_cookies._replace_cookie_jar
 _cookie_map_from_jar = _auth_cookies._cookie_map_from_jar
 build_cookie_jar = _auth_cookies.build_cookie_jar
@@ -67,9 +69,9 @@ NOTEBOOKLM_REFRESH_CMD_ENV = _auth_paths.NOTEBOOKLM_REFRESH_CMD_ENV
 NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV = _auth_paths.NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV
 _REFRESH_ATTEMPTED_ENV = _auth_paths._REFRESH_ATTEMPTED_ENV
 
-# ``_poke_session`` lives in ``_auth.keepalive``; aliased here as a rebindable
-# bare name so monkeypatches to ``notebooklm.auth._poke_session`` flow through
-# the facade write-through into this module's slot.
+# ``_poke_session`` lives in ``_auth.keepalive``; aliased here as a local bare
+# name because refresh bodies call it directly. Tests that need to substitute it
+# should patch ``notebooklm._auth.refresh._poke_session``.
 _poke_session = _keepalive._poke_session
 
 
@@ -159,8 +161,8 @@ async def _coalesced_run_refresh_cmd(
       survives cancellation of any individual awaiter.
     - Each awaiter wraps the future in ``asyncio.shield`` so local
       cancellation of the awaiter does NOT cancel the shared subprocess —
-      mirrors the ``ClientCore._await_refresh`` pattern used for the RPC
-      refresh path.
+      mirrors the ``AuthRefreshCoordinator.await_refresh`` pattern used
+      for the RPC refresh path.
     - The caller in ``_fetch_tokens_with_refresh`` keeps re-awaiting the
       shielded future under the per-loop asyncio lock so the lock is not
       released until the subprocess settles. This prevents a duplicate
@@ -202,7 +204,7 @@ async def _coalesced_run_refresh_cmd(
             # Intentionally LEAVE the (now-done) future in the registry so the
             # caller's CancelledError handler in ``_fetch_tokens_with_refresh``
             # can still inspect ``inflight.exception()`` after a cancel/settle
-            # race (CodeRabbit PR #621 finding). The leader-check at the
+            # race. The leader-check at the
             # get-or-create site (``existing is None or existing.done()``)
             # treats a done future as overwritable, so the next refresh
             # cycle's leader replaces this slot — no accumulation.
@@ -305,6 +307,32 @@ async def _run_refresh_cmd(storage_path: Path | None = None, profile: str | None
     ``shell=True`` behavior (e.g., when the command relies on shell features
     like pipes, redirection, or env-var expansion).
 
+    Environment forwarding:
+        The refresh command inherits the **full parent environment** (so it
+        can find ``PATH``, ``HOME``, proxy settings, and any custom config the
+        operator relies on), with three deliberate adjustments:
+
+        * ``NOTEBOOKLM_AUTH_JSON`` is **scrubbed** — it carries a
+          credential-equivalent storage_state payload the child never needs
+          (the child gets the on-disk storage path via
+          ``NOTEBOOKLM_REFRESH_STORAGE_PATH`` instead). It is the only
+          first-party storage_state credential payload we forward, so it is the
+          one var we can scrub without risking the refresh contract.
+        * ``_NOTEBOOKLM_REFRESH_ATTEMPTED`` is injected as the recursion guard.
+        * ``NOTEBOOKLM_REFRESH_PROFILE`` / ``NOTEBOOKLM_REFRESH_STORAGE_PATH``
+          are injected so the command refreshes the right profile in place.
+
+        SECURITY: only ``NOTEBOOKLM_AUTH_JSON`` is scrubbed. We deliberately do
+        **not** impose an allowlist, because a refresh command commonly
+        re-invokes this library and legitimately needs much of the inherited
+        env. As a consequence, **any other secret in the launching shell**
+        (e.g. ``GOOGLE_*`` tokens, CI secrets, API keys — and any token the
+        operator embeds in ``NOTEBOOKLM_REFRESH_CMD`` itself) is inherited by
+        the refresh command and every grandchild it spawns, and is visible via
+        ``/proc/<pid>/environ`` to the same UID. Operators MUST NOT keep
+        unrelated secrets in the environment that launches the refresh command;
+        scope secrets to the processes that need them.
+
     Raises:
         RuntimeError: If the refresh command is missing, parses to an empty
             argv, is malformed (unterminated quote), times out, or exits
@@ -313,7 +341,24 @@ async def _run_refresh_cmd(storage_path: Path | None = None, profile: str | None
     cmd = os.environ.get(NOTEBOOKLM_REFRESH_CMD_ENV)
     if not cmd:
         raise RuntimeError(f"{NOTEBOOKLM_REFRESH_CMD_ENV} is not set; cannot refresh cookies.")
+    # Forward the full parent env (PATH/HOME/proxy/etc. the command needs),
+    # minus the one credential-equivalent var below. See the "Environment
+    # forwarding" section of this function's docstring for the SECURITY note
+    # on why a hard allowlist is deliberately avoided (issue #1274).
     refresh_env = os.environ.copy()
+    # ``NOTEBOOKLM_AUTH_JSON`` carries the full Playwright storage_state — a
+    # credential-equivalent payload. Forwarding it via ``os.environ.copy()``
+    # into the refresh subprocess would inherit it down the tree (visible via
+    # ``/proc/<pid>/environ`` to the same UID) and into any grandchild the
+    # refresh command spawns. The refresh command already receives the
+    # canonical on-disk storage path via ``NOTEBOOKLM_REFRESH_STORAGE_PATH``
+    # (set just below), so the in-env JSON is not needed by the child. It is the
+    # only first-party storage_state credential payload we forward (audited
+    # #1274); the rest (PROFILE/HOME/BASE_URL/...) are config the child may
+    # legitimately consume when it re-invokes this library, so they stay. Any
+    # token an operator embeds in ``NOTEBOOKLM_REFRESH_CMD`` is intentionally
+    # inherited — see this function's docstring SECURITY note.
+    refresh_env.pop("NOTEBOOKLM_AUTH_JSON", None)
     refresh_env[_REFRESH_ATTEMPTED_ENV] = "1"
     refresh_env["NOTEBOOKLM_REFRESH_PROFILE"] = resolve_profile(profile)
     refresh_env["NOTEBOOKLM_REFRESH_STORAGE_PATH"] = str(
@@ -364,7 +409,7 @@ async def _run_refresh_cmd(storage_path: Path | None = None, profile: str | None
             f"{NOTEBOOKLM_REFRESH_CMD_ENV} failed to execute: {refresh_err}"
         ) from refresh_err
     if result.returncode != 0:
-        # P1-18: do NOT interpolate stdout/stderr into the user-facing raise.
+        # Do NOT interpolate stdout/stderr into the user-facing raise.
         # Subprocesses commonly print bearer tokens, cookies, and absolute
         # paths into a user's credentials directory. ``RuntimeError`` bubbles
         # up through ``cli.error_handler`` and lands on stderr (or a JSON
@@ -373,8 +418,8 @@ async def _run_refresh_cmd(storage_path: Path | None = None, profile: str | None
         # Two-channel disclosure: the user sees only exit code + executable
         # basename; developers running with ``-vv`` get the full output
         # through the package's redacting DEBUG logger.
-        # Claude bot review feedback: in shell-mode ``run_target`` is the raw
-        # command STRING, not a list. Extract the basename of its first token
+        # In shell-mode ``run_target`` is the raw command STRING, not a
+        # list. Extract the basename of its first token
         # so users still see a useful script name (the string is user-supplied
         # and not a secret — its argv[0] equivalent is safe to surface).
         if isinstance(run_target, list) and run_target:
@@ -496,8 +541,8 @@ async def _fetch_tokens_with_refresh(
                     # Snapshot the inflight registry slot BEFORE entering
                     # the await. The ``_settle`` callback intentionally
                     # leaves done futures in the registry so the
-                    # cancel/settle race fix from CodeRabbit PR #621 can
-                    # still inspect ``inflight.exception()``; that
+                    # cancel/settle race fix can still inspect
+                    # ``inflight.exception()``; that
                     # retention also means the registry may still hold a
                     # STALE done future from a previous refresh cycle when
                     # our await starts. We distinguish that stale slot
@@ -644,6 +689,7 @@ async def _fetch_tokens_with_jar(
     authuser: int = 0,
     account_email: str | None = None,
     force_authuser_query: bool = False,
+    poke: bool = True,
 ) -> tuple[str, str]:
     """Internal: fetch CSRF and session tokens using a pre-built cookie jar.
 
@@ -666,6 +712,11 @@ async def _fetch_tokens_with_jar(
         force_authuser_query: Append ``?authuser=0`` when callers explicitly
             requested account index 0. Implicit default-account calls leave the
             URL byte-identical to pre-multi-account behavior.
+        poke: When ``False``, skip the layer-1 ``_poke_session`` rotation POST
+            entirely. The passive read-only validation path
+            (:func:`fetch_tokens_passive`) sets this so a readiness probe does
+            not rotate ``__Secure-1PSIDTS`` server-side without persisting the
+            result (which would stale the on-disk jar).
 
     Returns:
         Tuple of (csrf_token, session_id)
@@ -677,7 +728,8 @@ async def _fetch_tokens_with_jar(
     logger.debug("Fetching CSRF and session tokens from NotebookLM")
 
     async with httpx.AsyncClient(cookies=cookie_jar) as client:
-        await _poke_session(client, storage_path)
+        if poke:
+            await _poke_session(client, storage_path)
 
         url = f"{get_base_url()}/"
         if account_email or authuser or force_authuser_query:
@@ -797,7 +849,7 @@ async def fetch_tokens_with_domains(
     route_kwargs = _resolve_token_route_kwargs(path, authuser=authuser, account_email=account_email)
     # Capture the open-time snapshot before any rotation could fire. The
     # snapshot is the input to the dirty-flag/delta merge that closes the
-    # stale-overwrite-fresh race (docs/auth-keepalive.md §3.4.1).
+    # stale-overwrite-fresh race (docs/auth-cookie-lifecycle.md §3.4.1).
     snapshot = snapshot_cookie_jar(jar)
     csrf, session_id, refreshed, post_refresh_snapshot = await _fetch_tokens_with_refresh(
         jar, path, profile, **route_kwargs
@@ -813,3 +865,59 @@ async def fetch_tokens_with_domains(
     # slow filesystems.
     await asyncio.to_thread(save_cookies_to_storage, jar, path, original_snapshot=snapshot)
     return csrf, session_id
+
+
+async def fetch_tokens_passive(
+    path: Path | None = None,
+    profile: str | None = None,
+    *,
+    authuser: int | None = None,
+    account_email: str | None = None,
+) -> tuple[str, str]:
+    """Validate the auth cookies on disk without any side effects.
+
+    Performs the same token-fetch round-trip (a homepage GET that re-mints
+    CSRF / session) as :func:`fetch_tokens_with_domains`, but is strictly
+    read-only. Unlike that function it:
+
+    * never runs ``NOTEBOOKLM_REFRESH_CMD`` (no re-auth hook / subprocess);
+    * never fires the layer-1 keepalive poke that rotates ``__Secure-1PSIDTS``
+      server-side;
+    * never fires the inline ``RotateCookies`` PSIDTS recovery (it loads the jar
+      with the no-recovery strict loader, so a missing/expired PSIDTS surfaces as
+      a plain ``ValueError`` instead of a network POST + disk write); and
+    * never writes rotated cookies back to ``storage_state.json``.
+
+    This is the readiness probe an unattended monitor (systemd / cron health
+    check) wants: it answers "do the cookies currently on disk authenticate?"
+    without mutating state, spawning a refresh subprocess, or racing concurrent
+    real work (issue #1569). Pair it with a passive ``auth check --test`` or
+    ``auth refresh --verify``.
+
+    Args:
+        path: Path to storage_state.json. If provided, takes precedence over env vars.
+        profile: Optional profile name used to resolve the storage path.
+        authuser: Optional explicit Google account index. Defaults to the
+            persisted profile value, or 0 when none exists.
+        account_email: Optional explicit Google account email. When provided,
+            it is used as the auth routing value instead of the integer index.
+
+    Returns:
+        Tuple of (csrf_token, session_id)
+
+    Raises:
+        FileNotFoundError: If storage file doesn't exist.
+        httpx.HTTPError: If request fails.
+        ValueError: If tokens cannot be extracted (e.g. redirected to sign-in).
+    """
+    if path is None and (profile is not None or "NOTEBOOKLM_AUTH_JSON" not in os.environ):
+        path = get_storage_path(profile=profile)
+    # Strict (no-recovery) loader: a missing/expired PSIDTS raises ``ValueError``
+    # here rather than triggering the inline ``RotateCookies`` rotation + save
+    # that ``build_httpx_cookies_from_storage`` would. A readiness probe reports
+    # "not authenticated" — it does not heal cookies.
+    jar = _build_httpx_cookies_from_storage_strict(path)
+    route_kwargs = _resolve_token_route_kwargs(path, authuser=authuser, account_email=account_email)
+    # poke=False + no save_cookies_to_storage ⇒ zero side effects on disk or
+    # on the server-side cookie rotation state.
+    return await _fetch_tokens_with_jar(jar, path, poke=False, **route_kwargs)

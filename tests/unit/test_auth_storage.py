@@ -1,9 +1,9 @@
-"""Tests for auth storage and loader behavior (split from tests/unit/test_auth.py for D1 PR-2).
+"""Tests for auth storage and loader behavior (split in D1 PR-2).
 
 This file owns one concern from the auth subpackage. The original
-``tests/unit/test_auth.py`` (4090 LOC) was split into six concern-aligned
-files alongside the deletion of ``_AuthFacadeModule``; see ADR-003
-(superseded) and ADR-007 (test-monkeypatch policy) for the rationale.
+monolithic auth test module was split into six concern-aligned files
+alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
+(superseded) and ADR-0007 (test-monkeypatch policy) for the rationale.
 """
 
 import json
@@ -16,6 +16,17 @@ from notebooklm.auth import (
     load_auth_from_storage,
     load_httpx_cookies,
 )
+
+
+def test_load_auth_from_storage_lives_in_private_module() -> None:
+    """Wave 3a of session-decoupling: load_auth_from_storage body lives in
+    ``_auth/tokens.py``; ``notebooklm.auth.load_auth_from_storage`` is a
+    re-export. Identity pin so a future drift (someone re-introducing a
+    distinct body on ``auth.py``) fails at PR time."""
+    from notebooklm import auth as auth_module
+    from notebooklm._auth import tokens as tokens_module
+
+    assert auth_module.load_auth_from_storage is tokens_module.load_auth_from_storage
 
 
 class TestLoadAuthFromStorage:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
+
+from notebooklm.exceptions import UnknownRPCMethodError
 
 # Path to the repo's src/notebooklm/ — used by the silent-site source inspection tests.
 SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "notebooklm"
@@ -19,14 +21,15 @@ SRC_ROOT = Path(__file__).resolve().parents[2] / "src" / "notebooklm"
 
 @pytest.mark.asyncio
 async def test_get_source_ids_warns_on_top_level_shape_drift(caplog):
-    """_core.py:get_source_ids — non-list at notebook_data[0] triggers WARNING."""
-    from notebooklm._core import ClientCore
+    """_notebooks.py:get_source_ids — non-list at notebook_data[0] triggers WARNING."""
+    from notebooklm._notebooks import NotebooksAPI
+    from tests._fixtures.fake_core import make_fake_core
 
-    core = ClientCore.__new__(ClientCore)
-    core.rpc_call = AsyncMock(return_value=[{"unexpected": "dict"}])
+    core = make_fake_core(rpc_call=AsyncMock(return_value=[{"unexpected": "dict"}]))
+    api = NotebooksAPI(core)
 
     with caplog.at_level(logging.WARNING, logger="notebooklm"):
-        result = await core.get_source_ids("nb_drift")
+        result = await api.get_source_ids("nb_drift")
 
     assert result == []
     drift_warnings = [
@@ -40,15 +43,16 @@ async def test_get_source_ids_warns_on_top_level_shape_drift(caplog):
 
 @pytest.mark.asyncio
 async def test_get_source_ids_warns_on_inner_shape_drift(caplog):
-    """_core.py:get_source_ids — notebook_info[1] not list triggers WARNING."""
-    from notebooklm._core import ClientCore
+    """_notebooks.py:get_source_ids — notebook_info[1] not list triggers WARNING."""
+    from notebooklm._notebooks import NotebooksAPI
+    from tests._fixtures.fake_core import make_fake_core
 
-    core = ClientCore.__new__(ClientCore)
     # notebook_data[0] is a list of length >1 but [1] is not a list
-    core.rpc_call = AsyncMock(return_value=[[None, "not a list", "x"]])
+    core = make_fake_core(rpc_call=AsyncMock(return_value=[[None, "not a list", "x"]]))
+    api = NotebooksAPI(core)
 
     with caplog.at_level(logging.WARNING, logger="notebooklm"):
-        result = await core.get_source_ids("nb_inner")
+        result = await api.get_source_ids("nb_inner")
 
     assert result == []
     assert any("schema drift" in r.message and "nb_inner" in r.message for r in caplog.records)
@@ -57,27 +61,32 @@ async def test_get_source_ids_warns_on_inner_shape_drift(caplog):
 @pytest.mark.asyncio
 async def test_get_source_ids_happy_path_no_warning(caplog):
     """Well-formed payload extracts source ids and emits no warning."""
-    from notebooklm._core import ClientCore
+    from notebooklm._notebooks import NotebooksAPI
+    from tests._fixtures.fake_core import make_fake_core
 
-    core = ClientCore.__new__(ClientCore)
-    core.rpc_call = AsyncMock(return_value=[[None, [[["src_alpha"]], [["src_beta"]]]]])
+    core = make_fake_core(
+        rpc_call=AsyncMock(return_value=[[None, [[["src_alpha"]], [["src_beta"]]]]])
+    )
+    api = NotebooksAPI(core)
 
     with caplog.at_level(logging.WARNING, logger="notebooklm"):
-        result = await core.get_source_ids("nb_happy")
+        result = await api.get_source_ids("nb_happy")
 
     assert result == ["src_alpha", "src_beta"]
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == []
 
 
-def test_qa_pairs_warns_on_unguarded_shape(caplog):
-    """_chat.py: QA-pair parser warns when next_turn[4] is not indexable."""
+def test_qa_pairs_raises_on_unguarded_shape():
+    """_chat/api.py: QA-pair parser raises when next_turn[4] is not indexable.
+
+    Strict decoding is the only mode (the ``NOTEBOOKLM_STRICT_DECODE=0``
+    soft-mode opt-out was retired in v0.7.0), so a drifted answer turn raises
+    ``UnknownRPCMethodError`` rather than silently producing an empty answer.
+    """
     from notebooklm._chat import ChatAPI
 
-    # next_turn[4] is a string — string[0] returns a char (no error), but
-    # string[0][0] raises IndexError on empty char access. Use a value
-    # whose [0][0] raises TypeError: a non-subscriptable nested object.
-    # Simpler: next_turn[4] is None → None[0] → TypeError.
+    # next_turn[4] is None → None[0] raises TypeError, surfaced by safe_index.
     turns_data = [
         [
             [None, None, 1, "what?"],  # question turn (type=1)
@@ -86,52 +95,36 @@ def test_qa_pairs_warns_on_unguarded_shape(caplog):
     ]
 
     chat = ChatAPI.__new__(ChatAPI)
-    with caplog.at_level(logging.WARNING, logger="notebooklm"):
-        # Direct call to the private parser
-        pairs = chat._parse_turns_to_qa_pairs(turns_data)  # type: ignore[arg-type]
-
-    # Got at least the question (answer is empty due to except)
-    assert pairs == [("what?", "")]
-    # After the fix, _chat._extract_next_turn_content delegates to safe_index,
-    # which emits its own canonical "safe_index drift" warning (rather than
-    # the older _chat-specific "schema drift" wording). Accept either so
-    # this test survives future helper renames.
-    assert any(
-        ("schema drift" in r.message or "safe_index drift" in r.message)
-        and r.levelno == logging.WARNING
-        for r in caplog.records
-    )
+    with pytest.raises(UnknownRPCMethodError):
+        chat._parse_turns_to_qa_pairs(turns_data)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_summary_warns_on_indexerror_drift(caplog, monkeypatch):
-    """_notebooks.py: summary extraction warns when result[0][0][0] raises.
+async def test_summary_raises_on_indexerror_drift():
+    """_notebooks.py: summary extraction raises when result[0][0][0] drifts.
 
-    This site was migrated to ``safe_index``; the warning message
-    now comes from ``notebooklm.rpc._safe_index`` and carries the call-site
-    label ``source='_notebooks.get_summary'`` instead of the notebook id.
+    ``get_summary`` delegates the descent to ``_extract_summary`` (the single
+    source of truth shared with ``get_description`` — #1485), so under strict
+    decoding (the only mode) a *present-but-malformed* response raises
+    ``UnknownRPCMethodError`` carrying the helper label
+    ``source='_notebooks._extract_summary'``. A genuinely-absent summary
+    (None / empty / null slot) returns "" instead and is covered in
+    ``test_get_summary_drift.py``.
     """
     from notebooklm._notebooks import NotebooksAPI
-
-    # Pin soft mode so safe_index warns instead of raising.
-    monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
+    from tests._fixtures.fake_core import make_fake_core
 
     api = NotebooksAPI.__new__(NotebooksAPI)
-    mock_core = MagicMock()
-    # result[0][0] is a string, so [0] returns a char; result[0][0][0] is fine
-    # We need a shape that raises IndexError. result[0] is an empty list →
-    # result[0][0] raises IndexError.
-    mock_core.rpc_call = AsyncMock(return_value=[[]])
-    api._core = mock_core
+    # result[0] == [42]: the summary slot is present and non-None but holds an
+    # int, so the inner result[0][0][0] descent raises TypeError — genuine
+    # drift, distinct from a routinely-absent summary.
+    mock_core = make_fake_core(rpc_call=AsyncMock(return_value=[[42]]))
+    api._rpc = mock_core
 
-    with caplog.at_level(logging.WARNING, logger="notebooklm"):
-        summary = await api.get_summary("nb_summary")
+    with pytest.raises(UnknownRPCMethodError) as exc_info:
+        await api.get_summary("nb_summary")
 
-    assert summary == ""
-    assert any(
-        "safe_index drift" in r.message and "_notebooks.get_summary" in r.message
-        for r in caplog.records
-    )
+    assert exc_info.value.source == "_notebooks._extract_summary"
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +135,7 @@ async def test_summary_warns_on_indexerror_drift(caplog, monkeypatch):
 # Removed: ``test_retry_after_non_integer_logs_debug`` was self-fulfilling — it
 # called ``core_mod.logger.debug(...)`` inline rather than exercising production
 # code. A later refactor replaced the original "Retry-After header not an integer" log
-# site with the ``_parse_retry_after`` helper, which returns ``None`` silently
+# site with the ``parse_retry_after`` helper, which returns ``None`` silently
 # for unparseable input. Parse semantics are covered by
 # ``tests/unit/test_retry_after.py``.
 
@@ -151,12 +144,12 @@ async def test_summary_warns_on_indexerror_drift(caplog, monkeypatch):
 async def test_description_partial_summary_logs_debug(caplog):
     """_notebooks.py:273 — partial summary (no topics) logs at DEBUG."""
     from notebooklm._notebooks import NotebooksAPI
+    from tests._fixtures.fake_core import make_fake_core
 
     api = NotebooksAPI.__new__(NotebooksAPI)
-    mock_core = MagicMock()
     # outer[0][0] works but outer[1] raises (no topics shape)
-    mock_core.rpc_call = AsyncMock(return_value=[[["the summary"]]])
-    api._core = mock_core
+    mock_core = make_fake_core(rpc_call=AsyncMock(return_value=[[["the summary"]]]))
+    api._rpc = mock_core
 
     with caplog.at_level(logging.DEBUG, logger="notebooklm"):
         desc = await api.get_description("nb_partial")
@@ -227,10 +220,10 @@ def test_auth_corrupt_legacy_context_does_not_block_in_band_write(tmp_path):
 
 
 def test_stream_parser_debug_guarded_by_isenabledfor(caplog):
-    """_chat_protocol.py — non-JSON chunk debug log is guarded before it fires."""
+    """_chat/wire.py — non-JSON chunk debug log is guarded before it fires."""
 
     # Direct: ensure the module has a guarded debug call (structural check).
-    src = (SRC_ROOT / "_chat_protocol.py").read_text(encoding="utf-8")
+    src = (SRC_ROOT / "_chat" / "wire.py").read_text(encoding="utf-8")
     assert "logger.isEnabledFor(logging.DEBUG)" in src
     assert "Stream parser" in src
 

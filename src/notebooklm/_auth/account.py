@@ -17,6 +17,7 @@ from filelock import FileLock
 from .._atomic_io import atomic_write_json
 from .._env import get_base_url
 from .._url_utils import is_google_auth_redirect
+from .paths import _storage_state_lock_path
 
 logger = logging.getLogger("notebooklm.auth")
 
@@ -199,7 +200,7 @@ async def enumerate_accounts(
 
 _ACCOUNT_CONTEXT_KEY = "account"
 
-# P1-20: the unified atomic profile-state format embeds account metadata
+# The unified atomic profile-state format embeds account metadata
 # inside ``storage_state.json`` under a ``notebooklm`` namespace key, so
 # a single ``atomic_write_json`` covers both cookies and account in one
 # crash-safe commit. ``version`` is bumped only when the in-band schema
@@ -212,9 +213,9 @@ def _account_context_path(storage_path: Path) -> Path:
     """Return the context.json path that annotates ``storage_path``.
 
     Legacy two-file layout: this sibling held ``account`` metadata before
-    P1-20 unified it into ``storage_state.json``. Post-migration, it keeps
-    CLI context state (``notebook_id``, ``conversation_id``) but no longer
-    stores the ``account`` key.
+    the unified format embedded it in ``storage_state.json``. Post-migration,
+    it keeps CLI context state (``notebook_id``, ``conversation_id``) but no
+    longer stores the ``account`` key.
     """
     return storage_path.with_name("context.json")
 
@@ -232,9 +233,14 @@ def _read_in_band_account(storage_path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("in-band account read failed at %s: %s", storage_path, e)
         return {}
-    if not isinstance(data, dict):
+    return read_account_metadata_from_storage_state(data)
+
+
+def read_account_metadata_from_storage_state(storage_state: Any) -> dict[str, Any]:
+    """Read in-band account metadata from parsed Playwright storage state."""
+    if not isinstance(storage_state, dict):
         return {}
-    namespace = data.get(_STORAGE_NAMESPACE_KEY)
+    namespace = storage_state.get(_STORAGE_NAMESPACE_KEY)
     if not isinstance(namespace, dict):
         return {}
     account = namespace.get(_ACCOUNT_CONTEXT_KEY)
@@ -260,7 +266,7 @@ def _read_legacy_account(storage_path: Path) -> dict[str, Any]:
 def read_account_metadata(storage_path: Path | None) -> dict[str, Any]:
     """Read profile account metadata, preferring the unified in-band record.
 
-    P1-20 unified layout: account metadata lives inside ``storage_state.json``
+    Unified layout: account metadata lives inside ``storage_state.json``
     under the ``notebooklm`` namespace key. Legacy two-file installs are
     still supported via fallback to sibling ``context.json``; the next write
     will migrate them in-band.
@@ -364,7 +370,7 @@ def _drop_legacy_account_key(storage_path: Path) -> None:
 
 
 def write_account_metadata(storage_path: Path, *, authuser: int, email: str | None = None) -> None:
-    """Persist account metadata atomically inside ``storage_state.json`` (P1-20).
+    """Persist account metadata atomically inside ``storage_state.json``.
 
     The account record lands under the ``notebooklm`` namespace key so the
     (cookies, account) pair commits together via a single
@@ -378,7 +384,7 @@ def write_account_metadata(storage_path: Path, *, authuser: int, email: str | No
     Args:
         storage_path: Path to ``storage_state.json``. The file is created
             with empty ``cookies`` / ``origins`` arrays if missing — matching
-            the pre-P1-20 semantics of "writing account metadata never fails
+            the previous semantics of "writing account metadata never fails
             because cookies haven't been written yet."
         authuser: ``authuser`` index used when extracting cookies for this
             profile (0 for the default account).
@@ -390,8 +396,12 @@ def write_account_metadata(storage_path: Path, *, authuser: int, email: str | No
 
     # Acquire a sibling-lock so concurrent callers serialize correctly during
     # the migration window. ``filelock`` reuses the lock file across
-    # invocations; the file is zero-byte and cheap to leave on disk.
-    lock_path = storage_path.with_suffix(storage_path.suffix + ".lock")
+    # invocations; the file is zero-byte and cheap to leave on disk. The lock
+    # path comes from ``_storage_state_lock_path`` so every ``storage_state.json``
+    # mutator (cookie saves in ``_auth/storage.py``, account-metadata writes
+    # here) serializes on the *same* file — otherwise they race on different
+    # flock files and lose updates.
+    lock_path = _storage_state_lock_path(storage_path)
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(lock_path), timeout=10.0):
         # Read-modify-write under the lock to avoid losing concurrent updates.
@@ -413,7 +423,7 @@ def _load_storage_state_for_write(storage_path: Path) -> dict[str, Any]:
     """Read ``storage_state.json`` for a read-modify-write under the lock.
 
     Returns a synthetic empty document if the file is missing — matches
-    pre-P1-20 semantics where account writes never failed just because the
+    the earlier behavior where account writes never failed just because the
     cookie file hadn't been written yet. Corruption is fatal because the
     primary cookie data can't be recovered from account metadata; surface
     a ``RuntimeError`` so the caller can prompt the user to re-run login.
@@ -432,7 +442,7 @@ def _load_storage_state_for_write(storage_path: Path) -> dict[str, Any]:
 
 
 def clear_account_metadata(storage_path: Path | None) -> None:
-    """Remove account metadata from both in-band and legacy locations (P1-20).
+    """Remove account metadata from both in-band and legacy locations.
 
     Holds a sibling ``.lock`` file via :class:`filelock.FileLock` so
     concurrent ``write_account_metadata`` calls serialize against the
@@ -455,7 +465,10 @@ def _clear_in_band_account(storage_path: Path) -> None:
     """
     if not storage_path.exists():
         return
-    lock_path = storage_path.with_suffix(storage_path.suffix + ".lock")
+    # Same canonical lock file as ``write_account_metadata`` and
+    # ``save_cookies_to_storage`` so every ``storage_state.json`` mutator
+    # serializes on one flock file.
+    lock_path = _storage_state_lock_path(storage_path)
     storage_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(lock_path), timeout=10.0):

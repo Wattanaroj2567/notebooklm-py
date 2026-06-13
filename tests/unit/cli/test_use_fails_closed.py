@@ -25,11 +25,17 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+import notebooklm.cli.context as context_module
+import notebooklm.cli.helpers as helpers_module
+import notebooklm.cli.resolve as resolve_module
+import notebooklm.cli.services.session_context as session_context_module
+import notebooklm.cli.session_cmd as session_cmd_module
 from notebooklm.exceptions import NotebookNotFoundError, RPCError
 from notebooklm.notebooklm_cli import cli
 from notebooklm.types import Notebook
 
-from .conftest import create_mock_client, patch_main_cli_client
+from .conftest import create_mock_client, inject_client
 
 
 @pytest.fixture
@@ -40,7 +46,7 @@ def runner() -> CliRunner:
 @pytest.fixture
 def mock_auth():
     """Patch storage auth so the `use` command sees real-looking cookies."""
-    with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock:
+    with patch.object(helpers_module, "load_auth_from_storage") as mock:
         mock.return_value = {
             "SID": "test",
             "__Secure-1PSIDTS": "test_1psidts",
@@ -54,13 +60,23 @@ def mock_auth():
 
 @pytest.fixture
 def mock_context_file(tmp_path):
-    """Provide a temporary context path; both call sites are patched."""
+    """Provide a temporary context path; every consumer call site is patched.
+
+    The ``notebooklm.cli.session_cmd.get_context_path`` re-export was retired
+    in #1367; ``read_status`` now resolves the symbol on its real consumer
+    module ``services.session_context`` (matching the canonical
+    ``mock_context_file`` fixture in ``conftest.py``).
+    """
     context_file = tmp_path / "context.json"
     with (
-        patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.session.get_context_path", return_value=context_file),
+        patch.object(helpers_module, "get_context_path", return_value=context_file),
+        patch.object(context_module, "get_context_path", return_value=context_file),
+        patch.object(resolve_module, "get_context_path", return_value=context_file),
+        patch.object(
+            session_context_module,
+            "get_context_path",
+            return_value=context_file,
+        ),
     ):
         yield context_file
 
@@ -97,23 +113,21 @@ class TestUseFailsClosedBadId:
     """Bad notebook ID → no context write, exit 1."""
 
     def test_notebook_not_found_does_not_persist(self, runner, mock_auth, mock_context_file):
-        with patch_main_cli_client() as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.notebooks.get = AsyncMock(
-                side_effect=NotebookNotFoundError("nb_missing", method_id="rwIQyf"),
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.notebooks.get = AsyncMock(
+            side_effect=NotebookNotFoundError("nb_missing", method_id="rwIQyf"),
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                with patch(
-                    "notebooklm.cli.session.resolve_notebook_id", new_callable=AsyncMock
-                ) as mock_resolve:
-                    mock_resolve.return_value = "nb_missing"
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            with patch.object(
+                session_cmd_module, "resolve_notebook_id", new_callable=AsyncMock
+            ) as mock_resolve:
+                mock_resolve.return_value = "nb_missing"
 
-                    result = runner.invoke(cli, ["use", "nb_missing"])
+                result = runner.invoke(cli, ["use", "nb_missing"], obj=inject_client(mock_client))
 
         # Exit non-zero, never touched context.json.
         assert result.exit_code == 1
@@ -124,23 +138,21 @@ class TestUseFailsClosedBadId:
 
     def test_generic_rpc_error_does_not_persist(self, runner, mock_auth, mock_context_file):
         """Network / RPC errors also fail closed — we can't confirm existence."""
-        with patch_main_cli_client() as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.notebooks.get = AsyncMock(
-                side_effect=RPCError("server hung up", method_id="rwIQyf"),
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.notebooks.get = AsyncMock(
+            side_effect=RPCError("server hung up", method_id="rwIQyf"),
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                with patch(
-                    "notebooklm.cli.session.resolve_notebook_id", new_callable=AsyncMock
-                ) as mock_resolve:
-                    mock_resolve.return_value = "nb_rpc_fail"
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            with patch.object(
+                session_cmd_module, "resolve_notebook_id", new_callable=AsyncMock
+            ) as mock_resolve:
+                mock_resolve.return_value = "nb_rpc_fail"
 
-                    result = runner.invoke(cli, ["use", "nb_rpc_fail"])
+                result = runner.invoke(cli, ["use", "nb_rpc_fail"], obj=inject_client(mock_client))
 
         assert result.exit_code == 1
         assert not mock_context_file.exists()
@@ -150,23 +162,21 @@ class TestUseFailsClosedGoodId:
     """Good notebook ID → context persisted, exit 0."""
 
     def test_good_id_persists_context(self, runner, mock_auth, mock_context_file):
-        with patch_main_cli_client() as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.notebooks.get = AsyncMock(
-                return_value=_make_notebook("nb_real", "Real Notebook"),
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.notebooks.get = AsyncMock(
+            return_value=_make_notebook("nb_real", "Real Notebook"),
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                with patch(
-                    "notebooklm.cli.session.resolve_notebook_id", new_callable=AsyncMock
-                ) as mock_resolve:
-                    mock_resolve.return_value = "nb_real"
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            with patch.object(
+                session_cmd_module, "resolve_notebook_id", new_callable=AsyncMock
+            ) as mock_resolve:
+                mock_resolve.return_value = "nb_real"
 
-                    result = runner.invoke(cli, ["use", "nb_real"])
+                result = runner.invoke(cli, ["use", "nb_real"], obj=inject_client(mock_client))
 
         assert result.exit_code == 0
         assert mock_context_file.exists()
@@ -191,15 +201,15 @@ class TestUseForceFlag:
 
     def test_force_does_not_call_get(self, runner, mock_auth, mock_context_file):
         """--force is offline-safe: even a guaranteed-raise ``get`` is bypassed."""
-        with patch_main_cli_client() as mock_client_cls:
-            mock_client = create_mock_client()
-            # If --force *did* call get, this mock would surface the error.
-            mock_client.notebooks.get = AsyncMock(
-                side_effect=NotebookNotFoundError("should-not-be-called"),
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        # If --force *did* call get, this mock would surface the error.
+        mock_client.notebooks.get = AsyncMock(
+            side_effect=NotebookNotFoundError("should-not-be-called"),
+        )
 
-            result = runner.invoke(cli, ["use", "--force", "nb_force_id"])
+        result = runner.invoke(
+            cli, ["use", "--force", "nb_force_id"], obj=inject_client(mock_client)
+        )
 
         assert result.exit_code == 0
         assert mock_context_file.exists()

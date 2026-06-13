@@ -11,12 +11,10 @@ import pytest
 
 from notebooklm.auth import AuthTokens
 
-# Load ``tests/vcr_config.py`` by file path — the ``tests`` directory is not a
-# package (no ``__init__.py``), so ``from tests.vcr_config import ...`` only
-# works when the repo root happens to be on ``sys.path``. That holds in a
-# fresh REPL but NOT inside pytest's per-module import. Loading by file path
-# bypasses ``sys.path`` and is the same idiom used inside ``vcr_config.py``
-# itself for its sibling ``cassette_patterns.py`` import.
+# Load ``tests/vcr_config.py`` by file path. ``from tests.vcr_config import ...``
+# now resolves in pytest via ``pythonpath = ["."]`` (pyproject, #1482); loading
+# by file path is kept as a ``sys.path``-independent fallback (the same idiom
+# ``vcr_config.py`` uses for its sibling ``cassette_patterns.py`` import).
 _vcr_config_spec = importlib.util.spec_from_file_location(
     "tests_vcr_config", Path(__file__).resolve().parent.parent / "vcr_config.py"
 )
@@ -155,8 +153,9 @@ def pytest_collection_modifyitems(config, items):
     Every collected test under ``tests/integration/`` MUST be VCR-tier: it must carry
     ``@pytest.mark.vcr``, be decorated with ``@notebooklm_vcr.use_cassette``,
     or explicitly opt out with ``@pytest.mark.allow_no_vcr`` (for mock-only
-    or no-network tests that legitimately live under ``tests/integration/``
-    — e.g. ``test_skill_packaging.py``, ``concurrency/test_*``). Violations
+    or no-network tests that legitimately live under ``tests/integration/`` —
+    e.g. ``test_auto_refresh.py``, ``test_sources_integration.py``,
+    ``concurrency/test_*``). Violations
     raise ``pytest.UsageError`` so the test suite refuses to collect rather
     than silently letting a new mock test slip into the integration tier.
     """
@@ -310,7 +309,7 @@ def _block_unbound_network_in_replay(request, monkeypatch):
         return
 
     # Patch BOTH ``send`` and ``stream`` — the production RPC transport in
-    # ``src/notebooklm/_core_transport.py`` uses ``client.stream(...)`` for the
+    # ``src/notebooklm/_streaming_post.py`` uses ``client.stream(...)`` for the
     # streaming-chat endpoint, which httpx routes through a separate codepath
     # from ``send``. Patching only ``send`` would let an unbound streaming
     # request slip past the guard. The vcrpy stubs intercept at the lower

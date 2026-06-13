@@ -1,7 +1,7 @@
 # Configuration
 
 **Status:** Active
-**Last Updated:** 2026-05-14
+**Last Updated:** 2026-05-29
 
 This guide covers storage locations, environment settings, and configuration options for `notebooklm-py`.
 
@@ -28,7 +28,7 @@ All data is stored under `~/.notebooklm/` by default, organized by profile:
 `config.json` stores process-wide settings — the persisted default profile
 name (under the `default_profile` key) and the configured interface language
 (`language`). It is **global, not per-profile** (see
-`src/notebooklm/paths.py` and `src/notebooklm/cli/language.py`).
+`src/notebooklm/paths.py` and `src/notebooklm/cli/language_cmd.py`).
 
 **Legacy layout:** If upgrading from a pre-profile version, the first run auto-migrates flat files into `profiles/default/`. The migration runs under a single-writer `filelock` rooted at `~/.notebooklm/.migration.lock`, so concurrent CLI invocations (e.g., container start-up races) cannot interleave copies — the loser of the lock re-checks the completion marker and no-ops (see `src/notebooklm/migration.py`). The legacy flat layout continues to work as a fallback.
 
@@ -58,16 +58,33 @@ Contains the authentication data extracted from your browser session:
     },
     ...
   ],
-  "origins": []
+  "origins": [],
+  "notebooklm": {
+    "version": 1,
+    "account": {
+      "authuser": 0,
+      "email": "you@example.com"
+    }
+  }
 }
 ```
 
-**Cookie requirements** (empirically validated via single- and pair-wise ablation, see `auth-keepalive.md` §3.5; enforced by `_validate_required_cookies()` in `auth.py`):
+**Cookie requirements** (empirically validated via single- and pair-wise ablation, see `auth-cookie-lifecycle.md` §3.5; enforced by `_validate_required_cookies()` in `auth.py`):
 
 - **Tier 1 — strictly required (raises on absence):** `SID` AND `__Secure-1PSIDTS`. `SID` is the only individually-required cookie (`__Secure-1PSIDTS` is removable on its own because Google can re-mint it via `RotateCookies`), but the pair-wise check uncovered that as soon as `__Secure-1PSIDTS` and any one other auth cookie are both missing, Google rejects with `Authentication expired or invalid`. The library therefore enforces both up-front. Authoritative value: `MINIMUM_REQUIRED_COOKIES` in `auth.py`.
 - **Tier 2 — secondary binding (logs a warning if absent):** either `OSID` is present, or both `APISID` and `SAPISID` are present. Without this, even valid Tier 1 cookies can't authenticate the homepage GET. Logged rather than raised so unverified edge-case flows (e.g. Workspace SSO) aren't broken by a too-strict client check.
 
 In practice: extract the full cookie set via `notebooklm login` and don't try to subset it. Partial extractions (a known failure mode of browser-cookies tooling under Chrome 127+ App-Bound Encryption) are the leading suspect for "auth expires immediately" reports — see [#371](https://github.com/teng-lin/notebooklm-py/issues/371).
+
+The optional `notebooklm.account` block records the Google account route for
+multi-account sessions. New `notebooklm login` runs write it when the active
+account can be discovered safely. Older Playwright-created files can be repaired
+with `notebooklm auth refresh` when the storage state maps to one visible
+account; if several accounts are visible, use
+`notebooklm login --browser-cookies <browser> --account EMAIL` to bind the
+intended account explicitly. `auth refresh` only repairs absent metadata; if
+metadata exists but points at the wrong account, re-bind explicitly with the
+browser-cookie login path.
 
 **Override location:**
 ```bash
@@ -76,19 +93,14 @@ notebooklm --storage /path/to/storage_state.json list
 
 ### Context File (`context.json`)
 
-Stores the current CLI context (active notebook plus optional metadata)
-and the multi-account routing payload used by `auth`:
+Stores the current CLI context, such as the active notebook:
 
 ```json
 {
   "notebook_id": "abc123def456",
   "title": "Quarterly review notes",
   "is_owner": true,
-  "created_at": "2026-05-01T17:43:21Z",
-  "account": {
-    "authuser": 0,
-    "email": "you@example.com"
-  }
+  "created_at": "2026-05-01T17:43:21Z"
 }
 ```
 
@@ -96,7 +108,6 @@ Field summary:
 
 - `notebook_id` — currently selected notebook, written by `notebooklm use` and read by every command that takes `-n/--notebook`.
 - `title`, `is_owner`, `created_at` — optional notebook metadata captured at selection time so `status` / display commands don't need an extra round-trip. Omitted when the CLI didn't have the values to write (see `src/notebooklm/cli/helpers.py:623-651`).
-- `account` — preserved across `notebooklm use` / `notebooklm clear` (only `notebooklm auth logout` removes it). Records `authuser` (Google account index, default `0`) and optional `email` so the client routes batchexecute requests to the same account that minted the cookies (see `src/notebooklm/auth.py:1168-1283`).
 
 This file is managed automatically by `notebooklm use`, `notebooklm clear`, and the `auth` commands.
 
@@ -122,14 +133,39 @@ A persistent Chromium user data directory used during `notebooklm login`.
 | `NOTEBOOKLM_LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `WARNING` |
 | `NOTEBOOKLM_DEBUG_RPC` | Legacy: Enable RPC debug logging (use `LOG_LEVEL=DEBUG` instead) | `false` |
 | `NOTEBOOKLM_DEBUG` | Show untruncated RPC response bodies in error messages instead of the default 80-char preview (verbose; intended for deep debugging) | `0` |
-| `NOTEBOOKLM_STRICT_DECODE` | Raise `UnknownRPCMethodError` on schema drift instead of warn-and-fallback | `0` |
+| `NOTEBOOKLM_STRICT_DECODE` | **Retired (ignored since v0.7.0).** Strict decoding is now the only mode: `safe_index` always raises `UnknownRPCMethodError` on schema drift. The former `0` warn-and-fallback opt-out was removed. | (ignored) |
 | `NOTEBOOKLM_RPC_OVERRIDES` | JSON object mapping `RPCMethod` enum names to RPC ID strings (community self-patch when Google rotates a method ID; e.g. `{"LIST_NOTEBOOKS":"AbC123"}`) | - |
 | `NOTEBOOKLM_REFRESH_CMD` | Optional command (argv list, or shell string with `_USE_SHELL=1`) invoked when auth refresh is required. Must exit `0` after writing a refreshed `storage_state.json`; the parent reloads from disk | - |
 | `NOTEBOOKLM_REFRESH_CMD_USE_SHELL` | Opt the `NOTEBOOKLM_REFRESH_CMD` subprocess back into `shell=True` execution. Default `shell=False` (argv list) — set to the literal `1` (only `"1"` is honored — not `true`/`yes`/`on`) when the refresh command requires shell metacharacters | `0` |
 | `NOTEBOOKLM_REFRESH_PROFILE` | Child-process hint set for `NOTEBOOKLM_REFRESH_CMD`; names the resolved profile being refreshed | resolved profile |
 | `NOTEBOOKLM_REFRESH_STORAGE_PATH` | Child-process hint set for `NOTEBOOKLM_REFRESH_CMD`; path to the `storage_state.json` file the command must rewrite | resolved storage path |
 | `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE` | Disable the proactive `accounts.google.com/RotateCookies` poke that refreshes `__Secure-1PSIDTS` ahead of expiry | `0` |
-| `NOTEBOOKLM_QUIET_DEPRECATIONS` | Suppress stderr deprecation notices for deprecated CLI flags | - |
+| `NOTEBOOKLM_HEADLESS_REAUTH` | Opt in to layer-3 headless re-auth during automatic refresh paths. Explicit `client.refresh_auth(allow_headless=True)` does not require this env var. | `0` |
+| `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL` | Optional loopback Chrome DevTools endpoint for layer-3 headless re-auth, e.g. `http://127.0.0.1:9222`. Non-loopback endpoints are ignored for credential safety. | - |
+| `NOTEBOOKLM_MCP_TRANSPORT` | MCP server transport for `notebooklm-mcp`: `stdio` or `http` | `stdio` |
+| `NOTEBOOKLM_MCP_HOST` | MCP HTTP transport bind host; non-loopback refused unless `NOTEBOOKLM_MCP_ALLOW_EXTERNAL_BIND=1` | `127.0.0.1` |
+| `NOTEBOOKLM_MCP_PORT` | MCP HTTP transport bind port | `8000` |
+| `NOTEBOOKLM_MCP_ALLOW_EXTERNAL_BIND` | Allow MCP HTTP transport to bind a non-loopback host. Use only behind a trusted proxy. | `0` |
+| `NOTEBOOKLM_SERVER_TOKEN` | Bearer token required by every REST `/v1` request. The REST server refuses to start without it. | - |
+| `NOTEBOOKLM_SERVER_HOST` | REST server bind host; non-loopback refused unless `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND=1` | `127.0.0.1` |
+| `NOTEBOOKLM_SERVER_PORT` | REST server bind port | `8000` |
+| `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND` | Allow REST server to bind a non-loopback host. Use only behind a trusted proxy. | `0` |
+| `NOTEBOOKLM_QUIET_DEPRECATIONS` | Suppress the project's public-API `DeprecationWarning`s (the one-off warnings routed through `warn_deprecated`, e.g. awaiting `from_storage(...)`). Set to a truthy value (`1` / `true` / `yes` / `on`, case-insensitive) to silence them; see `docs/deprecations.md`. | (warnings emitted) |
+| `NOTEBOOKLM_FUTURE_ERRORS` | **Retired (removed in v0.8.0; ignored).** It was the v0.7.0 forward-compat preview gate for the v0.8.0 error contract; now that every break it staged is the default, the flag is a no-op — setting it has no effect. See `docs/deprecations.md`. | (ignored) |
+| `NOTEBOOKLM_VCR_RECORD_ERRORS` | Synthetic-error injection mode for VCR test cassettes (`429`, `5xx`, `expired_csrf`) | - |
+
+### Public config API vs internal resolvers
+
+`src/notebooklm/_env.py` owns internal environment/default resolution for
+runtime behavior. It reads process environment variables and contains internal
+defaults such as `DEFAULT_BL` for the chat streaming build label.
+
+`notebooklm.config` is the stable public import surface. It intentionally
+re-exports only the supported endpoint/language helpers:
+`DEFAULT_BASE_URL`, `ENTERPRISE_BASE_HOST`, `get_base_host`, `get_base_url`,
+`get_default_language`, and `PERSONAL_BASE_HOST`. Existing imports
+from `notebooklm.config` remain supported; internal-only `_env` names should
+not be imported by downstream code.
 
 ### Env vars and precedence
 
@@ -149,8 +185,9 @@ be audited from one location.
 | `NOTEBOOKLM_DEBUG_RPC` | Legacy alias that sets the package logger to `DEBUG`. Prefer `NOTEBOOKLM_LOG_LEVEL=DEBUG` for new code. | (See `NOTEBOOKLM_LOG_LEVEL`.) | `_logging.configure_logging` |
 | `NOTEBOOKLM_NOTEBOOK` | Default notebook ID when no `-n/--notebook` flag is passed. Composes with `notebooklm use <id>` so per-shell overrides do not clobber the persisted active-notebook context. | `-n/--notebook` flag → `NOTEBOOKLM_NOTEBOOK` → active context (from `notebooklm use`) → error | `cli.helpers.require_notebook` (Click also reads it natively via `cli/options.py:notebook_option`'s `envvar=`) |
 | `NOTEBOOKLM_RPC_OVERRIDES` | **JSON object** mapping `RPCMethod` enum names to RPC ID strings (e.g. `{"LIST_NOTEBOOKS": "AbC123"}`). Overrides runtime RPC IDs — community self-patch when Google rotates a method ID. Empty string / unset disables the mechanism; invalid JSON or non-object payloads emit a `WARNING` and are ignored. | Process env, evaluated per RPC resolve (cached on the raw env string). | `notebooklm.rpc.overrides._parse_rpc_overrides` |
-| `NOTEBOOKLM_QUIET_DEPRECATIONS` | Suppress stderr deprecation notices for deprecated CLI flags (e.g. `source add --mime-type` on file sources). Library-level `DeprecationWarning`s are unaffected. | Set to `1` to suppress; any other value (or unset) leaves the notice enabled. | individual CLI commands; see `NOTEBOOKLM_QUIET_DEPRECATIONS` section below |
-| `NOTEBOOKLM_STRICT_DECODE` | Toggle the decoder's drift behavior — warn-and-fallback (`0`, default) vs raise `UnknownRPCMethodError` (`1`/`true`/`True`). | Process env on each decode call. | `_env.is_strict_decode_enabled` |
+| `NOTEBOOKLM_QUIET_DEPRECATIONS` | Suppress the project's public-API `DeprecationWarning`s — the one-off warnings routed through `src/notebooklm/_deprecation.py::warn_deprecated` (e.g. awaiting `from_storage(...)`). Set to a truthy value (`1` / `true` / `yes` / `on`) to silence them. See `docs/deprecations.md`. | (warnings emitted) | `_deprecation._deprecations_quiet` / `deprecations_quiet` |
+| `NOTEBOOKLM_FUTURE_ERRORS` | **Retired (removed in v0.8.0; ignored).** It was the v0.7.0 forward-compat preview gate for the v0.8.0 error contract (ADR-0019 / umbrella [#1346](https://github.com/teng-lin/notebooklm-py/issues/1346)). Now that every break it staged — `get()` raising `*NotFoundError`, the attribute-only typed returns, the removed `interval=` alias, the bool→`None` returns, the refusal-raises, and the mutate-existing fail-loud — is the default, the flag is a **no-op**: setting it has no effect. See `docs/deprecations.md`. | (ignored) | — |
+| `NOTEBOOKLM_STRICT_DECODE` | **Retired (ignored since v0.7.0).** Strict decoding is the only mode — `safe_index` always raises `UnknownRPCMethodError` on schema drift. The former `0` warn-and-fallback opt-out was removed; setting the variable has no effect. | (ignored) | — |
 | `NOTEBOOKLM_BASE_URL` | NotebookLM base URL. Constrained to `https://notebooklm.google.com` (personal) or `https://notebooklm.cloud.google.com` (enterprise); other schemes/hosts/paths raise `ValueError`. | Process env on every base-URL lookup. | `_env.get_base_url` |
 | `NOTEBOOKLM_BL` | `bl` (build label) URL parameter sent on the chat streaming endpoint (`ChatAPI.ask`). Pins the frontend build the request is attributed to. | Process env on every chat stream call; whitespace-only falls back to `_env.DEFAULT_BL`. | `_env.get_default_bl` |
 | `NOTEBOOKLM_DEBUG` | When `1`, RPC error messages include the **full** untruncated response body instead of the default 80-char preview. Verbose; intended for deep debugging only. | Process env on each error formatting call. | `exceptions._truncate_response_preview` |
@@ -159,22 +196,39 @@ be audited from one location.
 | `NOTEBOOKLM_REFRESH_PROFILE` | Child env var injected into `NOTEBOOKLM_REFRESH_CMD`; names the resolved NotebookLM profile that is being refreshed. Refresh scripts may read it, but setting it in the parent shell does not select the profile. | Set by `auth` refresh-spawn helper from the resolved profile. | `auth._run_refresh_cmd` |
 | `NOTEBOOKLM_REFRESH_STORAGE_PATH` | Child env var injected into `NOTEBOOKLM_REFRESH_CMD`; points to the `storage_state.json` file the command must rewrite before exiting `0`. Refresh scripts may read it, but setting it in the parent shell does not select storage. | Set by `auth` refresh-spawn helper from the explicit storage path or profile-aware storage path. | `auth._run_refresh_cmd` |
 | `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE` | When `1`, disable the proactive `accounts.google.com/RotateCookies` poke that refreshes `__Secure-1PSIDTS` ahead of expiry. Useful when running behind a proxy that rejects the extra request, or in offline test fixtures. | Process env on every keepalive check. | `auth` keepalive guards (constant `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV` in `notebooklm.auth`) |
+| `NOTEBOOKLM_HEADLESS_REAUTH` | Opt in to layer-3 headless re-auth for automatic refresh paths. `client.refresh_auth(allow_headless=True)` is the explicit Python API opt-in and does not require the env var. | Literal `1` enables; all other values disabled. | `_auth.headless_reauth.headless_reauth_env_enabled` |
+| `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL` | Optional Chrome DevTools Protocol endpoint for layer-3 headless re-auth. Must be loopback (`127.0.0.1`, `::1`, or `localhost`); remote endpoints are ignored because CDP is account-equivalent. | Explicit function argument → env var → no CDP arm. | `_auth.headless_reauth.resolve_cdp_url` |
+| `NOTEBOOKLM_MCP_TRANSPORT` | Default transport for `notebooklm-mcp`: `stdio` or `http`. CLI `--transport` wins. | `--transport` flag → env var → `stdio` | `mcp.__main__._build_parser` |
+| `NOTEBOOKLM_MCP_HOST` | HTTP bind host for `notebooklm-mcp --transport http`. Non-loopback refused unless `NOTEBOOKLM_MCP_ALLOW_EXTERNAL_BIND=1`. | `--host` flag → env var → `127.0.0.1` | `mcp.__main__._build_parser` / `_check_http_bind_allowed` |
+| `NOTEBOOKLM_MCP_PORT` | HTTP bind port for `notebooklm-mcp --transport http`. | `--port` flag → env var → `8000` | `mcp.__main__._build_parser` / `_resolve_port` |
+| `NOTEBOOKLM_MCP_ALLOW_EXTERNAL_BIND` | Allow MCP HTTP transport to bind a non-loopback host. Use only behind a trusted proxy. | Literal `1` enables; all other values disabled. | `mcp.__main__._check_http_bind_allowed` |
+| `NOTEBOOKLM_SERVER_TOKEN` | Bearer token required by every REST `/v1` request. The server refuses to start when unset/empty. | `--token` flag → env var → startup failure | `server.__main__._check_token_configured` / `server._auth.require_auth` |
+| `NOTEBOOKLM_SERVER_HOST` | REST server bind host. Non-loopback refused unless `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND=1`. | `--host` flag → env var → `127.0.0.1` | `server.__main__._build_parser` / `_check_bind_allowed` |
+| `NOTEBOOKLM_SERVER_PORT` | REST server bind port. | `--port` flag → env var → `8000` | `server.__main__._build_parser` / `_resolve_port` |
+| `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND` | Allow REST server to bind a non-loopback host. Use only behind a trusted proxy. | Literal `1` enables; all other values disabled. | `server.__main__._check_bind_allowed` |
+| `NOTEBOOKLM_VCR_RECORD_ERRORS` | Synthetic-error injection mode for VCR test cassettes. Lowercase-normalized; valid values are `429` (rate limit), `5xx` (server error), or `expired_csrf` (CSRF token expiration). Used to record synthetic error cassettes under VCR. | Process env on each request, evaluated by `ErrorInjectionMiddleware` to intercept and synthesize failures. | `_error_injection._get_error_injection_mode` |
 
-**Boolean handling.** `NOTEBOOKLM_DEBUG_RPC` and `NOTEBOOKLM_STRICT_DECODE`
-treat `1` / `true` / `yes` (case-insensitive) as truthy; everything else is
-falsy. `NOTEBOOKLM_QUIET_DEPRECATIONS` requires the literal string `1`.
+**Boolean handling.** `NOTEBOOKLM_DEBUG_RPC` treats `1` / `true` / `yes`
+(case-insensitive) as truthy; everything else is falsy.
+`NOTEBOOKLM_STRICT_DECODE` is ignored as of v0.7.0 (strict decoding is the
+only mode); no value changes decoder behavior.
+`NOTEBOOKLM_QUIET_DEPRECATIONS` treats `1` / `true` / `yes` / `on`
+(case-insensitive) as truthy; any other value (including unset) leaves
+deprecation warnings enabled. It silences the project's public-API
+`DeprecationWarning`s — the `get()`-returns-`None` warning and deprecated
+keyword aliases (e.g. `ResearchAPI.wait_for_completion`'s legacy `interval=`) —
+without changing their behavior.
 `NOTEBOOKLM_NOTEBOOK` is treated as unset when empty or whitespace-only so a
 bare `export NOTEBOOKLM_NOTEBOOK=` does not block `notebooklm use` /
 `-n/--notebook` from resolving.
 
-**The `--quiet` global flag.** `notebooklm --quiet <subcommand>` raises the
-`notebooklm` package logger floor to `ERROR` for the duration of one
-invocation, so cron and CI logs stay clean while real failures still surface.
-It is mutually exclusive with `-v/-vv` — combining the two raises a
-`UsageError` (exit `2`) since the resolved log levels conflict
-(`ERROR` vs `INFO`/`DEBUG`). For per-call (rather than per-shell) silencing
-of `INFO`/`WARN` the global flag is the preferred surface; `NOTEBOOKLM_LOG_LEVEL`
-remains the right tool for shell-wide / always-on suppression.
+**The `--quiet` global flag.** `notebooklm --quiet <subcommand>` suppresses
+status prose and raises the `notebooklm` package logger floor to `ERROR` for
+the duration of one invocation, so cron and CI logs stay clean while real
+failures still surface. Structured `--json` payloads are still emitted. It is
+mutually exclusive with `-v/-vv` — combining the two raises a `UsageError`
+(exit `2`) since the resolved log levels conflict (`ERROR` vs `INFO`/`DEBUG`).
+For shell-wide / always-on log suppression, use `NOTEBOOKLM_LOG_LEVEL`.
 
 ### NOTEBOOKLM_HOME
 
@@ -252,9 +306,11 @@ parsing.
 ### NOTEBOOKLM_HL
 
 Sets the default interface/output language used by the client. The value is
-passed as the `hl` query parameter on every batchexecute RPC call and is the
-fallback language for the `generate audio|video|slide-deck|infographic|
-data-table|mind-map|report` commands and their `ArtifactsAPI` equivalents:
+passed as the `hl` query parameter on every batchexecute RPC call and is used by
+the `generate audio|video|slide-deck|infographic|data-table|mind-map|report`
+commands. In the Python API, omitted `language` on `ArtifactsAPI.generate_*`
+keeps the historical `"en"` artifact default; pass `language=None` to opt in to
+this `NOTEBOOKLM_HL` resolver.
 
 ```bash
 export NOTEBOOKLM_HL=ja
@@ -267,70 +323,96 @@ back to `en`. For the generate commands, the resolution order is:
 1. `--language` CLI flag
 2. `NOTEBOOKLM_HL` environment variable
 3. `language` value from the **global** `~/.notebooklm/config.json` (set via
-   `notebooklm config language <code>`). The language is stored once per
+   `notebooklm language set <code>`). The language is stored once per
    `NOTEBOOKLM_HOME`, **not** per profile — switching `notebooklm -p work`
    does not switch the configured language. See
-   `src/notebooklm/cli/language.py:111-151` for the resolver and
-   `src/notebooklm/paths.py:331-337` for the storage location.
+   `src/notebooklm/cli/language_cmd.py` for the resolver and
+   `src/notebooklm/paths.py` for the storage location.
 4. `en` (built-in default)
 
 ### NOTEBOOKLM_QUIET_DEPRECATIONS
 
-Suppresses stderr deprecation notices emitted by CLI commands when a
-deprecated flag or option is used. Useful in CI logs where the deprecation
-signal would otherwise be repeated across every invocation in a pipeline.
+Suppresses the project's public-API `DeprecationWarning`s while you migrate. Set
+it to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive) to silence
+them; any other value (including unset) leaves them enabled.
+
+It gates the one-off deprecation warnings routed through
+`src/notebooklm/_deprecation.py::warn_deprecated` — e.g. awaiting
+`NotebookLMClient.from_storage(...)` instead of using the `async with` form. (The
+v0.7.0 error-contract runways it also gated — the `get()`-returns-`None` warning,
+the `wait_for_completion(interval=...)` alias, and the dict-subscript bridge — all
+**completed their removal in v0.8.0**, so those warnings no longer exist; see
+[`deprecations.md`](deprecations.md).)
+
+The helper that reads this variable is
+`notebooklm._deprecation._deprecations_quiet` (public alias
+`deprecations_quiet`).
 
 ```bash
+# Silence the project's public-API deprecation warnings while migrating
 export NOTEBOOKLM_QUIET_DEPRECATIONS=1
-notebooklm source add ./report.pdf --type file --mime-type application/pdf
-# (no "--mime-type is unused for file sources" notice on stderr)
 ```
 
-Set the value to ``1`` to suppress the notice; any other value (including
-``0`` or ``false``) leaves the deprecation notice enabled. The underlying
-behavior — that the deprecated flag remains a no-op — is unchanged; only
-the user-facing
-warning text is silenced. Library-level `DeprecationWarning`s emitted from
-the Python API (e.g. `client.sources.add_file(..., mime_type=...)`) are
-**not** affected by this variable; use standard `warnings.filterwarnings`
-to manage those programmatically.
+> Note: this variable does **not** affect `source add --mime-type` /
+> `client.sources.add_file(mime_type=...)` — `mime_type` is a supported
+> parameter and emits no warning.
+
+### NOTEBOOKLM_FUTURE_ERRORS (removed in v0.8.0)
+
+**Removed.** This was the v0.7.0 forward-compat preview gate for the v0.8.0 error
+contract (ADR-0019 / umbrella
+[#1346](https://github.com/teng-lin/notebooklm-py/issues/1346)): setting it made
+the v0.7.0 warn-runways adopt their v0.8.0 raise-target early so you could test
+forward-compatibility before the breaking flips shipped. v0.8.0 makes every one
+of those flips the default — `get()` raising `*NotFoundError` on a miss, the
+attribute-only typed returns, the removed `interval=` alias, the bool→`None`
+returns, the refusal-raises, and the mutate-existing fail-loud — so the flag and
+its resolver were deleted. **Setting `NOTEBOOKLM_FUTURE_ERRORS` now has no
+effect.** Remove it from your environment / CI config. See
+[`deprecations.md`](deprecations.md) for the full Removed-in-v0.8.0 table.
 
 ### Timeouts
 
-Every batchexecute RPC issued by the client (whether through `NotebookLMClient`
-or any of the CLI commands) uses a **30-second** HTTP request timeout by
-default, with a tighter **10-second** connection-establishment timeout. The
-shorter connect timeout helps surface network-level issues quickly while the
-longer read timeout accommodates slow server responses. Both are exposed as
-constructor arguments on `NotebookLMClient` (`timeout=` and `connect_timeout=`)
-for callers that need to tune them per-workload — see the
-`DEFAULT_TIMEOUT` / `DEFAULT_CONNECT_TIMEOUT` constants in
-`src/notebooklm/_core.py`. The chat streaming endpoint
-(`ChatAPI.ask`) keeps its own longer per-stream deadlines because individual
-chat responses can exceed 30 seconds; refer to the Python API reference for
-its `timeout=` argument.
+Most batchexecute RPCs issued by the client (whether through `NotebookLMClient`
+or any of the CLI commands) use a **30-second** HTTP request timeout by default,
+with a tighter **10-second** connection-establishment timeout. The shorter
+connect timeout helps surface network-level issues quickly while the read
+timeout accommodates slow server responses. The timeout is exposed as a
+constructor argument on `NotebookLMClient` (`timeout=`) for callers that need to
+tune it per-workload — see the `DEFAULT_TIMEOUT` / `DEFAULT_CONNECT_TIMEOUT`
+constants in `src/notebooklm/_runtime/config.py`.
+
+The chat streaming endpoint (`ChatAPI.ask`) also exposes a separate per-read
+silence window (`chat_timeout=`). It defaults to **180 seconds** because shared
+notebooks can be slow to send the first streamed chat byte; fast metadata RPCs
+stay on the normal **30-second** timeout. A chat read timeout means the server
+sent no stream bytes for that window, either before the first byte or between
+chunks; it does not mean total generation time exceeded 30 seconds. Pass
+`chat_timeout=None` to inherit the normal client timeout for chat. The CLI
+`ask --request-timeout N` flag overrides both values for that invocation.
 
 ### Decoder strictness
 
 NotebookLM's batchexecute responses are obfuscated, undocumented, and reshaped
 by Google without notice. The decoder uses a shared `safe_index` helper to walk
 nested response payloads. When it can't descend (an index is out of range, or
-the value at a step isn't indexable), behavior depends on
-`NOTEBOOKLM_STRICT_DECODE`:
+the value at a step isn't indexable), it **raises**
+`UnknownRPCMethodError` (a subclass of `DecodingError` / `RPCError`) with
+structured `method_id`, `path`, `source`, and `data_at_failure` attributes.
 
-| Value | Behavior |
-|-------|----------|
-| `0` (default) | Log a warning with the failing path, `method_id`, `source` label, and a truncated repr of the data. Return `None` so legacy callers keep working. |
-| `1` / `true` / `True` | Raise `UnknownRPCMethodError` (a subclass of `DecodingError` / `RPCError`) with structured `method_id`, `path`, `source`, and `data_at_failure` attributes. |
-
-The default of `0` is a soft-rollout safeguard for this release while
-call sites migrate to defensive indexing. A future release will flip the
-default to `1` — set `NOTEBOOKLM_STRICT_DECODE=1` in your CI/staging
-environments now to catch drift early.
+Strict decoding is the only mode. The legacy `NOTEBOOKLM_STRICT_DECODE=0`
+warn-and-return-`None` opt-out (which emitted a `DeprecationWarning` through
+v0.5.0/v0.6.0) was **retired in v0.7.0**; the env var is now ignored. The
+strict contract surfaces real schema drift (Google rotating a response shape)
+as a typed exception instead of a silent `None` return, so callers that
+previously treated `None` as a sentinel must handle `UnknownRPCMethodError`.
 
 The same `UnknownRPCMethodError` is also raised by `decode_response()` when the
 batchexecute response contains RPC IDs but not the one the call requested
 (typically a sign that Google rotated the method ID).
+
+> Background and rationale for the flip: see
+> [`docs/adr/0011-schema-validation-policy.md`](adr/0011-schema-validation-policy.md).
 
 ## CLI Options
 
@@ -341,7 +423,7 @@ batchexecute response contains RPC IDs but not the one the call requested
 | `--storage PATH` | Path to storage_state.json | `$NOTEBOOKLM_HOME/profiles/<profile>/storage_state.json` |
 | `-p, --profile NAME` | Use a named profile | Active profile or `default` |
 | `-v, --verbose` | Enable verbose output (`-v` for INFO, `-vv` for DEBUG) | - |
-| `--quiet` | Suppress INFO/WARN logs on stderr (only ERROR survives). Mutually exclusive with `-v`. | - |
+| `--quiet` | Suppress status output and INFO/WARN logs (only errors survive). Mutually exclusive with `-v`. | - |
 | `--version` | Show version | - |
 | `--help` | Show help | - |
 
@@ -435,13 +517,10 @@ they are NOT the same file:
   see `paths.get_context_path`). Two `--storage` invocations against different
   files cannot see each other's selected notebook, and neither pollutes the
   default profile context.
-- **Account-routing metadata** (the `account` object — `authuser` index and
-  optional `email`) lives at a *sibling* file `context.json` next to the
-  storage file (`storage_path.with_name("context.json")`, see
-  `auth._account_context_path`). The split is deliberate: account metadata is
-  shared across CLI tooling that resolves the storage file by directory
-  (e.g., interactive `auth check`) while notebook context belongs to the
-  specific storage payload.
+- **Account-routing metadata** (the `notebooklm.account` object — `authuser`
+  index and optional `email`) lives in-band inside the selected
+  `storage_state.json`. This keeps copied files and `NOTEBOOKLM_AUTH_JSON`
+  secrets bound to the same Google account route as the original profile.
 
 Run `notebooklm --storage <path> status --paths` to see exactly which
 context file is being used for notebook selection.
@@ -490,8 +569,9 @@ jobs:
 ### Obtaining the Secret Value
 
 1. Run `notebooklm login` locally
-2. Copy the contents of `~/.notebooklm/profiles/default/storage_state.json` (the canonical write location; the legacy `~/.notebooklm/storage_state.json` is only read as a fallback)
-3. Add as a GitHub repository secret named `NOTEBOOKLM_AUTH_JSON` (see [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci) for trailing-newline + ephemeral-runner refresh notes)
+2. If the file was created by an older Playwright login and lacks `notebooklm.account`, run `notebooklm auth refresh` to repair single-account states or re-login with `notebooklm login --browser-cookies <browser> --account EMAIL` for multi-account states
+3. Copy the contents of `~/.notebooklm/profiles/default/storage_state.json` (the canonical write location; the legacy `~/.notebooklm/storage_state.json` is only read as a fallback)
+4. Add as a GitHub repository secret named `NOTEBOOKLM_AUTH_JSON` (see [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci) for trailing-newline + ephemeral-runner refresh notes)
 
 ### Alternative: File-Based Auth
 
@@ -543,6 +623,13 @@ notebooklm list 2>&1 | cat
 ```bash
 NOTEBOOKLM_DEBUG_RPC=1 notebooklm list
 ```
+
+### Logger namespace compatibility
+
+Runtime transport and middleware logs still use the historical
+`notebooklm._core` logger key via `CORE_LOGGER_NAME`. That name is a
+compatibility logging contract for existing filters and tests; it does not
+mean the deleted `_core.py` module or a concrete `Session` owner still exists.
 
 ### Check Authentication
 

@@ -71,21 +71,16 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
 
-# Add tests directory to path for vcr_config import (parity with the rest of
-# tests/integration/test_vcr_*.py — these files are imported by pytest with
-# the repo root NOT on sys.path).
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-from conftest import get_vcr_auth, skip_no_cassettes  # noqa: E402
-from notebooklm import NotebookLMClient  # noqa: E402
-from notebooklm.rpc import RPCMethod  # noqa: E402
-from vcr_config import notebooklm_vcr  # noqa: E402
+from notebooklm import NotebookLMClient
+from notebooklm.rpc import RPCMethod
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
 
@@ -181,14 +176,19 @@ class TestPollingReplay:
             assert final_status.is_complete or final_status.is_failed
 
             # 4. Rename leg — exercises RENAME_ARTIFACT regardless of whether
-            #    the artifact ended ``completed`` or ``failed``. We don't
-            #    re-fetch + assert title here because that would require an
-            #    additional cassette interaction; the regression we care
-            #    about is "the rename RPC fires without error".
+            #    the artifact ended ``completed`` or ``failed``. We pass
+            #    ``return_object=False`` so the regression we care about is "the
+            #    rename RPC fires without error".
+            #    v0.8.0 (#1362): return_object=False now runs the existence
+            #    preflight too; stub it as a hit (the artifact was generated
+            #    above, so it exists) so no extra LIST_ARTIFACTS interaction is
+            #    required beyond what the cassette already captured.
+            client.artifacts._listing.get_studio_only = AsyncMock(return_value=final_status)
             await client.artifacts.rename(
                 MUTABLE_NOTEBOOK_ID,
                 task_id,
                 "Renamed VCR Test",
+                return_object=False,
             )
 
     def test_cassette_has_multiple_polling_interactions(self) -> None:

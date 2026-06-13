@@ -1,7 +1,10 @@
 """Unit tests for types module dataclasses and parsing."""
 
+import os
 import pickle
+import time
 import warnings
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -57,15 +60,75 @@ class TestTimestampParsing:
         assert parsed is not None
         assert parsed.timestamp() == ts
 
-    def test_datetime_from_timestamp_oserror(self):
-        """Platform-specific timestamp errors should normalize to None."""
+    def test_datetime_from_timestamp_is_tz_aware_utc(self):
+        """Decoded datetimes are tz-aware UTC, not naive host-local time (#1519).
+
+        The bug: a naive ``datetime.fromtimestamp(value)`` rendered the epoch in
+        the host's local zone, so the public ``created_at`` mis-stated the absolute
+        instant and serialized differently per box. The decoder must return a
+        tz-aware value pinned to UTC and equal to the correct absolute instant.
+
+        Red-first: against the unfixed (naive) decoder ``parsed.tzinfo`` is ``None``,
+        so the ``tzinfo is not None`` assertion fails (and the offset-aware equality
+        would compare unequal — a naive value never ``==`` an aware one).
+        """
         from notebooklm.types import _datetime_from_timestamp
 
-        with patch("notebooklm.types.datetime") as mock_datetime:
-            mock_datetime.fromtimestamp.side_effect = OSError("timestamp out of range")
-            parsed = _datetime_from_timestamp(1704067200)
+        # 1768311605 == 2026-01-13T13:40:05+00:00 (the issue's illustrative instant).
+        parsed = _datetime_from_timestamp(1768311605)
+
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == timedelta(0)
+        assert parsed == datetime(2026, 1, 13, 13, 40, 5, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize("tz_name", ["UTC", "America/New_York", "Asia/Kolkata"])
+    def test_datetime_from_timestamp_host_independent(self, tz_name):
+        """The decoded instant is identical regardless of the host timezone (#1519).
+
+        Exercises the original failure mode directly: under ``America/New_York`` a
+        notebook created 13:40:05 UTC used to serialize as the offset-less
+        ``08:40:05``. With the fix every host yields the same tz-aware UTC value.
+        ``time.tzset`` only honours ``$TZ`` on POSIX, so skip elsewhere.
+        """
+        if not hasattr(time, "tzset"):
+            pytest.skip("time.tzset is POSIX-only; cannot exercise host-TZ swap")
+
+        from notebooklm.types import _datetime_from_timestamp
+
+        # Swap the process-wide zone, then restore the host's real $TZ + tz table
+        # in ``finally`` so the swap never leaks into later tests in this process.
+        original_tz = os.environ.get("TZ")
+        os.environ["TZ"] = tz_name
+        time.tzset()
+        try:
+            parsed = _datetime_from_timestamp(1768311605)
+        finally:
+            if original_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_tz
+            time.tzset()
+
+        assert parsed == datetime(2026, 1, 13, 13, 40, 5, tzinfo=timezone.utc)
+        assert parsed.isoformat() == "2026-01-13T13:40:05+00:00"
+
+    def test_datetime_from_timestamp_oserror(self, monkeypatch):
+        """Platform-specific timestamp errors should normalize to None."""
+        from unittest.mock import MagicMock
+
+        from notebooklm._types import common as _common
+        from notebooklm.types import _datetime_from_timestamp
+
+        mock_datetime = MagicMock()
+        mock_datetime.fromtimestamp.side_effect = OSError("timestamp out of range")
+        monkeypatch.setattr(_common, "datetime", mock_datetime)
+
+        parsed = _datetime_from_timestamp(1704067200)
 
         assert parsed is None
+        # Pinned to UTC so the rendered instant is host-independent (#1519).
+        mock_datetime.fromtimestamp.assert_called_once_with(1704067200, tz=timezone.utc)
 
     @pytest.mark.parametrize("value", ["bad", None, float("inf"), float("-inf")])
     def test_datetime_from_timestamp_invalid_value(self, value):
@@ -87,7 +150,10 @@ _PUBLIC_MOVABLE_CLASSES = [
     "ClientMetricsSnapshot",
     "ConnectionLimits",
     "ConversationTurn",
+    "GenerationState",
     "GenerationStatus",
+    "MindMap",
+    "MindMapKind",
     "Note",
     "Notebook",
     "NotebookDescription",
@@ -119,6 +185,7 @@ def test_artifact_note_chat_and_sharing_types_are_facade_reexports():
 
     assert public_types.Artifact is artifacts.Artifact
     assert public_types.ArtifactType is artifacts.ArtifactType
+    assert public_types.GenerationState is artifacts.GenerationState
     assert public_types.GenerationStatus is artifacts.GenerationStatus
     assert public_types.ReportSuggestion is artifacts.ReportSuggestion
     assert public_types.Note is notes.Note
@@ -135,9 +202,7 @@ def test_artifact_private_helper_seams_are_facade_reexports():
     import notebooklm.types as public_types
     from notebooklm._types import artifacts
 
-    assert public_types._ARTIFACT_TYPE_CODE_MAP is artifacts._ARTIFACT_TYPE_CODE_MAP
     assert public_types._warned_artifact_types is artifacts._warned_artifact_types
-    assert public_types._map_artifact_kind is artifacts._map_artifact_kind
     assert public_types._is_valid_artifact_url is artifacts._is_valid_artifact_url
     assert public_types._extract_artifact_url is artifacts._extract_artifact_url
     assert public_types._extract_audio_artifact_url is artifacts._extract_audio_artifact_url
@@ -163,8 +228,8 @@ def test_representative_public_dataclasses_pickle_round_trip():
         ClientMetricsSnapshot,
         ConnectionLimits,
         ConversationTurn,
+        GenerationState,
         GenerationStatus,
-        Note,
         Notebook,
         NotebookDescription,
         NotebookMetadata,
@@ -251,7 +316,12 @@ def test_representative_public_dataclasses_pickle_round_trip():
     for instance in instances:
         assert pickle.loads(pickle.dumps(instance)) == instance
 
-    for enum_member in [SourceType.PDF, ArtifactType.AUDIO, ChatMode.DEFAULT]:
+    for enum_member in [
+        SourceType.PDF,
+        ArtifactType.AUDIO,
+        ChatMode.DEFAULT,
+        GenerationState.COMPLETED,
+    ]:
         assert pickle.loads(pickle.dumps(enum_member)) is enum_member
 
 
@@ -281,22 +351,110 @@ class TestNotebook:
         assert notebook.sources_count == 0
 
     def test_from_api_response_with_timestamp(self):
-        """Test parsing notebook with timestamp."""
-        ts = 1704067200  # 2024-01-01 00:00:00 UTC
+        """Test parsing notebook with timestamp.
+
+        ``created_at`` is read from ``meta[8]`` (the creation slot), so the
+        creation epoch is placed there. ``meta[5]`` carries the now-distinct
+        last-modified slot.
+        """
+        created_ts = 1704067200  # 2024-01-01 00:00:00 UTC
+        modified_ts = 1704153600  # 2024-01-02 00:00:00 UTC
         data = [
             "Timestamped Notebook",
             [],
             "nb_456",
             "📘",
             None,
-            [None, None, None, None, None, [ts, 0]],
+            # meta[5] = modified slot, meta[8] = creation slot
+            [None, None, None, None, None, [modified_ts, 0], None, None, [created_ts, 0]],
         ]
         notebook = Notebook.from_api_response(data)
 
         assert notebook.id == "nb_456"
         assert notebook.created_at is not None
         # Check timestamp value rather than year (timezone-independent)
-        assert notebook.created_at.timestamp() == ts
+        assert notebook.created_at.timestamp() == created_ts
+        assert notebook.modified_at is not None
+        assert notebook.modified_at.timestamp() == modified_ts
+
+    def test_from_api_response_created_modified_not_swapped(self):
+        """``created_at`` is ``meta[8]`` and ``modified_at`` is ``meta[5]``.
+
+        Regression pin for the swapped-slots bug: the metadata block exposes the
+        creation instant at ``data[5][8][0]`` (pinned across edits) and the
+        last-modified instant at ``data[5][5][0]`` (advances on each edit). The
+        pre-fix code read ``meta[5]`` for ``created_at`` and so surfaced the
+        last-modified time as the creation time.
+        """
+        created_ts = 1767921609  # 2026-01-09 — earlier (true creation)
+        modified_ts = 1768963937  # 2026-01-21 — later (last edit)
+        data = [
+            "Swap Probe Notebook",
+            [],
+            "nb_swap",
+            "📓",
+            None,
+            [None, None, None, None, None, [modified_ts, 1], None, None, [created_ts, 2]],
+        ]
+        notebook = Notebook.from_api_response(data)
+
+        # created_at == the meta[8] instant (NOT meta[5])
+        assert notebook.created_at is not None
+        assert notebook.created_at.timestamp() == created_ts
+        # modified_at == the meta[5] instant
+        assert notebook.modified_at is not None
+        assert notebook.modified_at.timestamp() == modified_ts
+        # The two are distinct and ordered created < modified (sanity).
+        assert notebook.created_at < notebook.modified_at
+
+    def test_from_api_response_short_meta_leaves_both_timestamps_none(self):
+        """A ``meta`` block too short to carry the slots soft-degrades to None.
+
+        ``meta[8]`` is absent (len 6) so ``created_at`` is None; ``meta[5]`` is
+        also degraded here (None payload) so ``modified_at`` is None too.
+        """
+        data = [
+            "Short Meta Notebook",
+            [],
+            "nb_short",
+            "📓",
+            None,
+            [None, None, None, None, None, None],  # len 6: meta[8] absent, meta[5] None
+        ]
+        notebook = Notebook.from_api_response(data)
+
+        assert notebook.created_at is None
+        assert notebook.modified_at is None
+
+    def test_from_api_response_short_meta_keeps_modified_but_not_created(self):
+        """A ``meta`` block carrying ``meta[5]`` but too short for ``meta[8]``.
+
+        Locks the length-guard policy: ``created_at`` (``meta[8]``) soft-degrades
+        to None rather than falling back to ``meta[5]`` (which would re-introduce
+        the swap bug), while ``modified_at`` (``meta[5]``) is still populated.
+        """
+        modified_ts = 1768311605
+        data = [
+            "Modified-Only Notebook",
+            [],
+            "nb_modonly",
+            "📓",
+            None,
+            [None, None, None, None, None, [modified_ts, 0]],  # len 6: meta[5] set, meta[8] absent
+        ]
+        notebook = Notebook.from_api_response(data)
+
+        assert notebook.created_at is None
+        assert notebook.modified_at is not None
+        assert notebook.modified_at.timestamp() == modified_ts
+
+    def test_from_api_response_missing_meta_leaves_both_timestamps_none(self):
+        """No metadata block at all → both timestamps None."""
+        data = ["No Meta Notebook", [], "nb_nometa", "📓"]
+        notebook = Notebook.from_api_response(data)
+
+        assert notebook.created_at is None
+        assert notebook.modified_at is None
 
     def test_from_api_response_strips_thought_prefix(self):
         """Test that 'thought\\n' prefix is stripped from title."""
@@ -329,18 +487,23 @@ class TestNotebook:
         assert notebook.is_owner is True
 
     def test_from_api_response_invalid_timestamp(self):
-        """Test parsing with invalid timestamp data."""
+        """Test parsing with invalid timestamp data.
+
+        ``created_at`` reads ``meta[8]`` and ``modified_at`` reads ``meta[5]``;
+        both invalid payloads soft-degrade to ``None``.
+        """
         data = [
             "Notebook",
             [],
             "nb_123",
             "📓",
             None,
-            [None, None, None, None, None, ["invalid", 0]],
+            [None, None, None, None, None, ["invalid", 0], None, None, ["invalid", 0]],
         ]
         notebook = Notebook.from_api_response(data)
 
         assert notebook.created_at is None
+        assert notebook.modified_at is None
 
     def test_from_api_response_out_of_range_timestamp(self):
         """Platform timestamp range errors should not escape notebook parsing."""
@@ -350,13 +513,16 @@ class TestNotebook:
             "nb_123",
             "📓",
             None,
-            [None, None, None, None, None, [1704067200, 0]],
+            [None, None, None, None, None, [1704067200, 0], None, None, [1704067200, 0]],
         ]
 
+        # Both the creation slot (meta[8]) and modified slot (meta[5]) overflow.
+        data[5][8][0] = float("inf")
         data[5][5][0] = float("inf")
         notebook = Notebook.from_api_response(data)
 
         assert notebook.created_at is None
+        assert notebook.modified_at is None
 
     def test_from_api_response_non_string_title(self):
         """Test parsing when title is not a string."""
@@ -364,6 +530,46 @@ class TestNotebook:
         notebook = Notebook.from_api_response(data)
 
         assert notebook.title == ""
+
+    def test_from_api_response_malformed_id_slot_warns(self, caplog):
+        """A present-but-non-str id slot fabricates ``""`` LOUDLY (#1485).
+
+        The degrade itself is kept (a raising row parser would abort
+        whole-list parsing), but the fabrication now leaves a WARNING with a
+        bounded payload preview instead of being silent.
+        """
+        import logging
+
+        data = ["My Notebook", [], 12345, "📓"]
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            notebook = Notebook.from_api_response(data)
+
+        assert notebook.id == ""
+        assert any(
+            r.levelno == logging.WARNING and "id slot malformed" in r.message
+            for r in caplog.records
+        )
+
+    def test_from_api_response_null_id_slot_is_silent(self, caplog):
+        """A ``None`` id slot is absence, not drift — silent ``""`` degrade."""
+        import logging
+
+        data = ["My Notebook", [], None, "📓"]
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            notebook = Notebook.from_api_response(data)
+
+        assert notebook.id == ""
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_from_api_response_short_row_is_silent(self, caplog):
+        """Rows too short to carry the id slot keep the silent degrade."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            notebook = Notebook.from_api_response(["Title only"])
+
+        assert notebook.id == ""
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 class TestSource:
@@ -635,6 +841,185 @@ class TestSource:
         with pytest.raises(ValueError, match="Invalid source data"):
             Source.from_api_response(None)
 
+    def test_from_api_response_carries_status(self):
+        """``from_api_response`` decodes ``status`` from the row's status block.
+
+        Previously the classmethod never set ``status``, so it silently
+        fell back to ``SourceStatus.READY`` even when the wire carried a
+        PROCESSING/ERROR status block. After unifying on the single
+        ``SourceRow``-based construction it now reads the same status the
+        listing path does.
+        """
+        from notebooklm.rpc.types import SourceStatus
+
+        data = [
+            [
+                ["src_proc"],
+                "Processing Source",
+                [None, None, [1704067200, 0], None, 5, None, None, ["https://example.com"]],
+                [None, SourceStatus.PROCESSING],
+            ]
+        ]
+        source = Source.from_api_response(data)
+
+        assert source.status == SourceStatus.PROCESSING
+        assert source.is_processing is True
+        assert source.is_ready is False
+
+    def test_from_api_response_deeply_nested_carries_status(self):
+        """The deeply-nested dispatch path also decodes the status block.
+
+        ``from_unknown_shape`` unwraps the extra outer list and funnels
+        the entry through the same ``from_row`` construction, so the
+        decoded status must survive on the deeply-nested shape too.
+        """
+        from notebooklm.rpc.types import SourceStatus
+
+        entry = [
+            ["src_deep_err"],
+            "Deep Errored Source",
+            [None, None, None, None, 3, None, None, ["https://example.com"]],
+            [None, SourceStatus.ERROR],
+        ]
+        source = Source.from_api_response([[entry]])
+
+        assert source.id == "src_deep_err"
+        assert source.status == SourceStatus.ERROR
+        assert source.is_error is True
+
+    def test_from_api_response_status_defaults_ready_without_block(self):
+        """A row without a status block keeps the historical READY default."""
+        from notebooklm.rpc.types import SourceStatus
+
+        # Medium-nested entry with no status block at index 3.
+        data = [[["src_no_status"], "No Status", [None, None, None, None, 5]]]
+        source = Source.from_api_response(data)
+
+        assert source.status == SourceStatus.READY
+
+        # Flat shape also defaults to READY.
+        flat = Source.from_api_response(["src_flat", "Flat"])
+        assert flat.status == SourceStatus.READY
+
+    def test_from_api_response_matches_listing_path(self):
+        """``from_api_response`` and the ``GET_NOTEBOOK`` listing path produce
+        identical ``Source`` instances from the same entry — the two parsers
+        are now a single source of truth (issue #1205, part 1/5).
+        """
+        from notebooklm._row_adapters.sources import SourceRow
+        from notebooklm.rpc import RPCMethod
+        from notebooklm.rpc.types import SourceStatus
+
+        # An entry exactly as ``SourceLister._parse_source`` receives it.
+        entry = [
+            ["src_match"],
+            "Matching Source",
+            [None, 11, [1704067200, 0], None, 5, None, None, ["https://example.com"]],
+            [None, SourceStatus.PROCESSING],
+        ]
+
+        # Listing path: ``SourceLister._parse_source`` wraps the entry with
+        # ``SourceRow.from_entry`` and funnels it through ``Source.from_row``.
+        listing_source = Source.from_row(
+            SourceRow.from_entry(entry, method_id=RPCMethod.GET_NOTEBOOK.value)
+        )
+
+        # Public classmethod path: the same entry wrapped in the medium-
+        # nested envelope that ``ADD_SOURCE``/rename responses carry.
+        api_source = Source.from_api_response([entry])
+
+        assert api_source == listing_source
+        assert api_source.status == listing_source.status == SourceStatus.PROCESSING
+        assert api_source.url == listing_source.url == "https://example.com"
+        assert api_source.created_at == listing_source.created_at
+        # type code lives at metadata[4] (== 5 → WEB_PAGE) for both paths.
+        assert api_source.kind == listing_source.kind == SourceType.WEB_PAGE
+
+    def test_from_api_response_forwards_method_id_to_row(self):
+        """``method_id`` threads through to the constructed ``SourceRow`` so
+        drift diagnostics name the originating RPC (issue #1242).
+
+        The ADD_SOURCE / rename construction paths pass the real method id;
+        without forwarding it the row defaults to ``GET_NOTEBOOK`` and any
+        ``safe_index`` drift log is mis-tagged.
+        """
+        from notebooklm._row_adapters.sources import SourceRow
+        from notebooklm.rpc import RPCMethod
+
+        captured: dict[str, str | None] = {}
+        real_from_unknown_shape = SourceRow.from_unknown_shape
+
+        def _spy(data, *, method_id=None):
+            captured["method_id"] = method_id
+            return real_from_unknown_shape(data, method_id=method_id)
+
+        entry = [["src_add"], "Added Source", [None, 5, [1704067200, 0]]]
+        with patch.object(SourceRow, "from_unknown_shape", staticmethod(_spy)):
+            Source.from_api_response([entry], method_id=RPCMethod.ADD_SOURCE.value)
+
+        assert captured["method_id"] == RPCMethod.ADD_SOURCE.value
+
+    def test_from_api_response_default_method_id_is_get_notebook(self):
+        """Without an explicit ``method_id`` the row falls back to the
+        historical ``GET_NOTEBOOK`` default — preserving prior behavior for
+        callers that do not pass it (issue #1242 backward-compat)."""
+        from notebooklm._row_adapters.sources import SourceRow
+        from notebooklm.rpc import RPCMethod
+
+        entry = [["src_default"], "Default", [None, 5, [1704067200, 0]]]
+        row = SourceRow.from_unknown_shape([entry])
+
+        assert row.method_id == RPCMethod.GET_NOTEBOOK.value
+
+    def test_from_api_response_drift_tags_real_method_id(self, monkeypatch):
+        """A ``safe_index`` drift on an ADD_SOURCE-built row surfaces an
+        ``UnknownRPCMethodError`` tagged with ADD_SOURCE, not the default
+        ``GET_NOTEBOOK`` (issue #1242).
+
+        ``SourceRow.created_at_raw`` is the adapter's only ``safe_index``
+        call site; force it to drift so we can assert the tagged method id
+        flows from ``from_api_response``'s ``method_id`` argument.
+        """
+        from notebooklm._row_adapters import sources as _row_adapters_sources
+        from notebooklm.exceptions import UnknownRPCMethodError
+        from notebooklm.rpc import RPCMethod
+
+        def _drift(data, *path, method_id, source):
+            raise UnknownRPCMethodError(
+                "forced drift",
+                method_id=method_id,
+                path=tuple(path),
+                source=source,
+            )
+
+        monkeypatch.setattr(_row_adapters_sources, "safe_index", _drift)
+
+        # metadata[2] is a non-empty list so created_at_raw reaches safe_index.
+        entry = [["src_drift"], "Drift", [None, 5, [1704067200, 0]]]
+        row = _row_adapters_sources.SourceRow.from_unknown_shape(
+            [entry], method_id=RPCMethod.ADD_SOURCE.value
+        )
+        with pytest.raises(UnknownRPCMethodError) as exc_info:
+            _ = row.created_at_raw
+
+        assert exc_info.value.method_id == RPCMethod.ADD_SOURCE.value
+
+    def test_from_api_response_accepts_unused_notebook_id(self):
+        """``notebook_id`` is retained for call-site symmetry / forward-compat
+        but does not influence the parsed source (issue #1241).
+
+        It is kept (not dropped) because ``Source.from_api_response`` is
+        tracked public surface; ``scripts/audit_public_api_compat.py`` flags
+        removing the parameter as a backward-incompatible signature change.
+        """
+        data = [[["src_nb"], "With Notebook Id", [None, 5, [1704067200, 0]]]]
+
+        without_id = Source.from_api_response(data)
+        with_id = Source.from_api_response(data, "nb_ignored")
+        with_keyword = Source.from_api_response(data, notebook_id="nb_ignored")
+
+        assert without_id == with_id == with_keyword
+
 
 class TestSourceTypeCompatMapping:
     """Tests for the _SOURCE_TYPE_COMPAT_MAP backward-compatible mapping."""
@@ -779,6 +1164,36 @@ class TestArtifact:
 
         assert artifact is not None
         assert artifact.created_at is None
+
+    def test_from_mind_map_deleted_tombstone_is_silent_none(self, caplog):
+        """The recognised ``[id, None, 2]`` tombstone filters silently."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            assert Artifact.from_mind_map(["mm_gone", None, 2]) is None
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_from_mind_map_unrecognized_tombstone_warns_and_stays_live(self, caplog):
+        """A null content slot WITHOUT the soft-delete sentinel WARNS (#1485).
+
+        This is the deleted-map-leaking-as-live bug class: were Google to
+        rotate the sentinel value, every deleted mind map would flow through
+        as a live artifact. The historical treat-as-live fallthrough is kept
+        (conservative), but it is no longer silent.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="notebooklm"):
+            artifact = Artifact.from_mind_map(["mm_drift", None, 7])
+
+        assert artifact is not None
+        assert artifact.id == "mm_drift"
+        assert artifact.title == ""
+        assert any(
+            r.levelno == logging.WARNING and "soft-delete sentinel" in r.message
+            for r in caplog.records
+        )
 
     def test_from_api_response_audio_url(self):
         """Completed audio artifacts expose their download URL."""
@@ -1051,6 +1466,26 @@ class TestExtractArtifactUrlMalformedShapes:
         assert _extract_artifact_url(["any", "data"], None) is None
         assert _extract_artifact_url(["any", "data"], 99) is None
 
+    def test_extract_artifact_url_none_type_ignores_row_type_code(self):
+        from notebooklm.rpc import ArtifactTypeCode
+        from notebooklm.types import _extract_artifact_url
+
+        audio_row = [
+            "artifact_id",
+            "Audio",
+            ArtifactTypeCode.AUDIO.value,
+            None,
+            3,
+            None,
+            [None, None, None, None, None, [["https://example.com/audio.mp4", None, "audio/mp4"]]],
+        ]
+
+        assert _extract_artifact_url(audio_row, None) is None
+        assert (
+            _extract_artifact_url(audio_row, ArtifactTypeCode.AUDIO.value)
+            == "https://example.com/audio.mp4"
+        )
+
     def test_extract_audio_handles_short_or_non_list_data(self):
         from notebooklm.types import _extract_audio_artifact_url
 
@@ -1232,7 +1667,7 @@ class TestGenerationStatus:
         other_failure = GenerationStatus(
             task_id="",
             status="failed",
-            error="Generation failed - no artifact_id returned",
+            error="Some unrelated generation error",
         )
         assert other_failure.is_rate_limited is False
 
@@ -1294,43 +1729,6 @@ class TestReportSuggestion:
 
         assert suggestion.title == ""
         assert suggestion.audience_level == 2
-
-
-class TestNote:
-    def test_from_api_response(self):
-        """Test parsing Note."""
-        data = ["note_123", "Note Title", "Note content here"]
-        note = Note.from_api_response(data, "nb_123")
-
-        assert note.id == "note_123"
-        assert note.notebook_id == "nb_123"
-        assert note.title == "Note Title"
-        assert note.content == "Note content here"
-
-    def test_from_api_response_with_timestamp(self):
-        """Test parsing Note with timestamp."""
-        ts = 1704067200
-        data = ["note_123", "Title", "Content", [ts]]
-        note = Note.from_api_response(data, "nb_123")
-
-        assert note.created_at is not None
-        assert note.created_at.timestamp() == ts
-
-    def test_from_api_response_out_of_range_timestamp(self):
-        """Note timestamp range errors should produce None rather than raising."""
-        data = ["note_123", "Title", "Content", [float("inf")]]
-        note = Note.from_api_response(data, "nb_123")
-
-        assert note.created_at is None
-
-    def test_from_api_response_empty(self):
-        """Test parsing with minimal data."""
-        data = []
-        note = Note.from_api_response(data, "nb_123")
-
-        assert note.id == ""
-        assert note.title == ""
-        assert note.content == ""
 
 
 class TestChatMode:
@@ -1471,151 +1869,6 @@ class TestChatReference:
         # structural anchors that resolve to single-position ranges.
         ChatReference(source_id="x", start_char=5, end_char=5)
         ChatReference(source_id="x", answer_start_char=0, answer_end_char=0)
-
-
-class TestDeprecatedPropertyWarnOnce:
-    """Validate the shared dedupe set covering all 4 deprecated dataclass properties.
-
-    The four sites (``Source.source_type``, ``SourceFulltext.source_type``,
-    ``Artifact.artifact_type``, ``Artifact.variant``) all read through the
-    shared ``_warned_deprecated_properties`` set so each fires its
-    ``DeprecationWarning`` at-most-once per process regardless of how many
-    instances exist.
-    """
-
-    def _clear_state(self):
-        """Reset the dedupe set so each test starts with a clean slate."""
-        from notebooklm.types import _warned_deprecated_properties
-
-        _warned_deprecated_properties.clear()
-
-    def test_source_source_type_warns_once_across_instances(self):
-        """Two ``Source`` instances accessing ``.source_type`` produce one warning."""
-        self._clear_state()
-        s1 = Source(id="a", _type_code=5)
-        s2 = Source(id="b", _type_code=5)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _ = s1.source_type
-            _ = s1.source_type  # second access, same instance
-            _ = s2.source_type  # different instance
-
-        dep_warnings = [
-            x
-            for x in w
-            if issubclass(x.category, DeprecationWarning) and "Source.source_type" in str(x.message)
-        ]
-        assert len(dep_warnings) == 1
-
-    def test_source_fulltext_source_type_warns_once_across_instances(self):
-        """``SourceFulltext.source_type`` participates in the same dedupe set."""
-        self._clear_state()
-        f1 = SourceFulltext(source_id="a", title="t1", content="c1", _type_code=5)
-        f2 = SourceFulltext(source_id="b", title="t2", content="c2", _type_code=5)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _ = f1.source_type
-            _ = f2.source_type
-
-        dep_warnings = [
-            x
-            for x in w
-            if issubclass(x.category, DeprecationWarning)
-            and "SourceFulltext.source_type" in str(x.message)
-        ]
-        assert len(dep_warnings) == 1
-
-    def test_artifact_artifact_type_warns_once_across_instances(self):
-        """``Artifact.artifact_type`` participates in the same dedupe set."""
-        self._clear_state()
-        a1 = Artifact(id="a", title="t1", _artifact_type=1, status=3)
-        a2 = Artifact(id="b", title="t2", _artifact_type=1, status=3)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _ = a1.artifact_type
-            _ = a2.artifact_type
-
-        dep_warnings = [
-            x
-            for x in w
-            if issubclass(x.category, DeprecationWarning)
-            and "Artifact.artifact_type" in str(x.message)
-        ]
-        assert len(dep_warnings) == 1
-
-    def test_artifact_variant_warns_once_across_instances(self):
-        """``Artifact.variant`` participates in the same dedupe set."""
-        self._clear_state()
-        a1 = Artifact(id="a", title="t1", _artifact_type=4, status=3, _variant=2)
-        a2 = Artifact(id="b", title="t2", _artifact_type=4, status=3, _variant=1)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _ = a1.variant
-            _ = a2.variant
-
-        dep_warnings = [
-            x
-            for x in w
-            if issubclass(x.category, DeprecationWarning) and "Artifact.variant" in str(x.message)
-        ]
-        assert len(dep_warnings) == 1
-
-    def test_each_deprecated_property_warns_independently(self):
-        """The dedupe is per-property-tag, not global — all 4 fire on first access."""
-        self._clear_state()
-        s = Source(id="a", _type_code=5)
-        f = SourceFulltext(source_id="b", title="t", content="c", _type_code=5)
-        a = Artifact(id="c", title="t", _artifact_type=4, status=3, _variant=2)
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _ = s.source_type
-            _ = f.source_type
-            _ = a.artifact_type
-            _ = a.variant
-
-        dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-        messages = {str(x.message) for x in dep_warnings}
-        # Each of the four property tags fires exactly once.
-        assert sum("Source.source_type is deprecated" in m for m in messages) == 1
-        assert sum("SourceFulltext.source_type is deprecated" in m for m in messages) == 1
-        assert sum("Artifact.artifact_type is deprecated" in m for m in messages) == 1
-        assert sum("Artifact.variant is deprecated" in m for m in messages) == 1
-
-    def test_public_facade_rebind_honored(self):
-        """Rebinding ``notebooklm.types._warned_deprecated_properties`` propagates.
-
-        The private resolver in ``_types/common.py`` reads through
-        ``sys.modules['notebooklm.types']`` so monkeypatching the public facade
-        attribute redirects the dedupe surface — same pattern as
-        ``_warned_source_types`` / ``_warned_artifact_types``.
-        """
-        import notebooklm.types as public_types
-
-        self._clear_state()
-        # Pre-populate the public surface so a fresh set bypasses any
-        # already-warned tags from prior tests.
-        original = public_types._warned_deprecated_properties
-        fresh: set[str] = set()
-        try:
-            public_types._warned_deprecated_properties = fresh
-            s = Source(id="a", _type_code=5)
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                _ = s.source_type
-            # The fresh set should now contain the tag — confirms the private
-            # resolver wrote through the public-facade binding.
-            assert "Source.source_type" in fresh
-            # And the original set was NOT touched.
-            assert "Source.source_type" not in original
-            dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(dep_warnings) == 1
-        finally:
-            public_types._warned_deprecated_properties = original
 
 
 class TestSourceFulltext:
@@ -1823,6 +2076,7 @@ class TestNotebookMetadata:
             title="Test Notebook",
             created_at=datetime(2024, 1, 1, 12, 0),
             is_owner=True,
+            modified_at=datetime(2024, 1, 2, 9, 30),
         )
         metadata = NotebookMetadata(
             notebook=notebook,
@@ -1837,6 +2091,7 @@ class TestNotebookMetadata:
             "id": "nb_123",
             "title": "Test Notebook",
             "created_at": "2024-01-01T12:00:00",
+            "modified_at": "2024-01-02T09:30:00",
             "is_owner": True,
             "sources": [
                 {"type": "pdf", "title": "test.pdf", "url": None},
@@ -1855,12 +2110,14 @@ class TestNotebookMetadata:
             title="Proxy Test",
             created_at=datetime(2024, 2, 1),
             is_owner=False,
+            modified_at=datetime(2024, 3, 1),
         )
         metadata = NotebookMetadata(notebook=notebook)
 
         assert metadata.id == "nb_456"
         assert metadata.title == "Proxy Test"
         assert metadata.created_at == datetime(2024, 2, 1)
+        assert metadata.modified_at == datetime(2024, 3, 1)
         assert metadata.is_owner is False
 
     def test_to_dict_with_none_created_at(self):

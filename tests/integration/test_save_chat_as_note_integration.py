@@ -1,7 +1,7 @@
 """Integration-via-httpx-mock tests for saved-from-chat notes (issue #660).
 
-These exercise the full ``NotebookLMClient.notes.create_from_chat()``
-path: the encoder builds the 7-element params, ``ClientCore.rpc_call``
+These exercise the full ``NotebookLMClient.chat.save_answer_as_note()``
+path: the encoder builds the 7-element params, ``RpcExecutor.rpc_call``
 wraps them in the batchexecute envelope and POSTs to the server, and we
 assert (a) the wire body matches our captured request byte-for-byte and
 (b) the returned ``Note`` is parsed correctly from the captured response.
@@ -89,12 +89,12 @@ def _build_ask_result_from_request_params(params: list) -> AskResult:
 
 
 @pytest.mark.asyncio
-async def test_create_from_chat_wire_round_trip(
+async def test_save_answer_as_note_wire_round_trip(
     auth_tokens,
     httpx_mock: HTTPXMock,
     build_rpc_response,
 ):
-    """End-to-end: client.notes.create_from_chat() POSTs the captured
+    """End-to-end: client.chat.save_answer_as_note() POSTs the captured
     wire format and parses the captured response into a Note."""
     request_params = _load_request_params()
     response_note = _load_response_note()
@@ -109,7 +109,7 @@ async def test_create_from_chat_wire_round_trip(
     ask_result = _build_ask_result_from_request_params(request_params)
 
     async with NotebookLMClient(auth_tokens) as client:
-        note = await client.notes.create_from_chat(notebook_id, ask_result, title=requested_title)
+        note = await client.chat.save_answer_as_note(notebook_id, ask_result, title=requested_title)
 
     # Assert the request body carried the exact captured params.
     request = httpx_mock.get_request()
@@ -137,3 +137,11 @@ async def test_create_from_chat_wire_round_trip(
     assert note.notebook_id == notebook_id
     # Content is the answer text WITH [N] markers (rich anchors live server-side).
     assert note.content == ask_result.answer
+    # The captured response carries the creation timestamp in the note metadata
+    # envelope (``note[2][2][0]``); save_answer_as_note now decodes it through
+    # NoteRow.created_at (issue #1529). Pin the EPOCH INT (TZ-invariant) — the
+    # fixture's [1778936820, 976814000] timestamp — never the wall-time string.
+    expected_epoch = response_note[2][2][0]
+    assert expected_epoch == 1778936820
+    assert note.created_at is not None
+    assert int(note.created_at.timestamp()) == expected_epoch

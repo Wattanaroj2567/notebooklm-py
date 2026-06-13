@@ -25,7 +25,7 @@ from notebooklm import NotebookLMClient
 async def main():
     print("=== NotebookLM Quickstart ===\n")
 
-    async with await NotebookLMClient.from_storage() as client:
+    async with NotebookLMClient.from_storage() as client:
         # 1. Create a notebook
         print("Creating notebook...")
         nb = await client.notebooks.create("Quickstart Demo")
@@ -51,7 +51,7 @@ async def main():
 
         # Wait for completion
         final = await client.artifacts.wait_for_completion(
-            nb.id, status.task_id, timeout=300, poll_interval=10
+            nb.id, status.task_id, timeout=300, initial_interval=10
         )
 
         if final.is_complete:
