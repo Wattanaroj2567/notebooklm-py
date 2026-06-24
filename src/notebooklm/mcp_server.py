@@ -407,6 +407,8 @@ def _is_hard_auth_failure(exc: BaseException) -> bool:
         or "accounts.google.com/v3/signin" in message
         or "signin/accountchooser" in message
         or "run 'notebooklm login'" in message
+        or "401" in message
+        or "unauthenticated" in message
     )
 
 
@@ -584,6 +586,7 @@ async def _auth_watcher(interval_seconds: int = 3600) -> None:
 
 async def get_client() -> NotebookLMClient:
     global _client, _client_storage_signature
+    logger.warning("DEBUG: get_client() called")
     async with _client_lock:
         storage_signature = _storage_state_signature()
         if _client is not None and _client_storage_signature != storage_signature:
@@ -597,10 +600,43 @@ async def get_client() -> NotebookLMClient:
 
         if _client is None:
             try:
-                client = await NotebookLMClient.from_storage(
-                    timeout=120.0, keepalive=_CONTAINER_KEEPALIVE_SECONDS
-                )
-                await client.__aenter__()
+                # Attempt to create client. from_storage does a token refresh fetch.
+                try:
+                    client = await NotebookLMClient.from_storage(
+                        timeout=120.0, keepalive=_CONTAINER_KEEPALIVE_SECONDS
+                    )
+                except Exception as load_exc:
+                    if _is_hard_auth_failure(load_exc):
+                        logger.warning(
+                            "Proactive rescue: from_storage failed with hard auth error. "
+                            "This usually means cookies are present but Google rejected the refresh."
+                        )
+                    raise load_exc
+
+                # Attempt to enter (does a probe RPC).
+                try:
+                    await client.__aenter__()
+                except Exception as probe_exc:
+                    if _is_hard_auth_failure(probe_exc):
+                        logger.warning(
+                            "Proactive rescue: Live auth probe failed. Attempting one-shot refresh..."
+                        )
+                        try:
+                            # Attempt to rescue the session.
+                            await client.refresh_auth()
+                            # If refresh worked, retry probe.
+                            await client.__aenter__()
+                            logger.info("✅ Proactive rescue successful. Session health restored.")
+                        except Exception as rescue_exc:
+                            logger.error(
+                                "Proactive rescue failed: refresh/re-entry failed (%s). Original error: %s",
+                                rescue_exc,
+                                probe_exc,
+                            )
+                            raise probe_exc from rescue_exc
+                    else:
+                        raise
+
                 _client = client
                 _client_storage_signature = storage_signature
                 logger.info("NotebookLM client initialized successfully")
@@ -657,6 +693,80 @@ async def _session_refresh_task(interval_seconds: int = 600) -> None:
             raise
         except Exception as exc:
             logger.warning("[session-refresh] ⚠️ Failed to refresh session tokens: %s", exc)
+
+
+@mcp.tool()
+async def check_auth_status() -> dict[str, Any]:
+    """Check the health and expiry status of the current authentication. (ReadOnly)"""
+    health = _check_auth_health()
+    client_status = "Not Initialized"
+    if _client:
+        client_status = "Connected" if _client.is_connected else "Initialized"
+
+    return {
+        "ok": health["status"] == "ok",
+        "auth_health": health,
+        "client_status": client_status,
+        "advice": (
+            "If auth is expired or rejected, run: sync_auth_from_host "
+            "(after logging in on your host machine with 'notebooklm login')"
+        ),
+    }
+
+
+@mcp.tool()
+async def sync_auth_from_host(force: bool = False) -> dict[str, Any]:
+    """Manually sync authentication files from the host machine to Docker.
+
+    Use this if you just logged in on your host machine and want Docker to pick up
+    the fresh credentials immediately without restarting.
+    """
+    import shutil
+
+    from .paths import get_home_dir, resolve_profile
+
+    profile = resolve_profile()
+    host_root = "/host-notebooklm"
+    host_storage = f"{host_root}/profiles/{profile}/storage_state.json"
+    host_context = f"{host_root}/profiles/{profile}/context.json"
+    host_config = f"{host_root}/config.json"
+
+    target_root = get_home_dir()
+    target_profile_dir = target_root / "profiles" / profile
+
+    results = []
+
+    try:
+        target_profile_dir.mkdir(parents=True, exist_ok=True)
+
+        if os.path.exists(host_storage):
+            shutil.copy2(host_storage, target_profile_dir / "storage_state.json")
+            results.append("✅ Synced storage_state.json")
+
+        if os.path.exists(host_context):
+            shutil.copy2(host_context, target_profile_dir / "context.json")
+            results.append("✅ Synced context.json")
+
+        if os.path.exists(host_config):
+            shutil.copy2(host_config, target_root / "config.json")
+            results.append("✅ Synced config.json")
+
+        # Invalidate the client so it reloads on next call
+        global _client
+        if _client:
+            await _client.__aexit__(None, None, None)
+            _client = None
+            results.append("ℹ️ Existing client invalidated (will reload on next call)")
+
+        _invalidate_auth_notice_cache()
+
+        return {
+            "ok": True,
+            "actions_taken": results,
+            "message": "Auth files synced from host. Try running a command now.",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 # --- Framework Tools ---

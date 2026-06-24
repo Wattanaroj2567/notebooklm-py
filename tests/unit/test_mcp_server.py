@@ -100,6 +100,7 @@ EXPECTED_TOOLS = frozenset(
         "add_import_file",
         "check_auth_status",
         "check_mcp_readiness",
+        "sync_auth_from_host",
     }
 )
 
@@ -541,7 +542,7 @@ class TestAuthStatus:
 
         import notebooklm.mcp_server as srv
 
-        source = Path(srv.__file__).read_text()
+        source = Path(srv.__file__).read_text(encoding="utf-8")
         assert "logging.basicConfig(" not in source
 
     def test_mcp_logging_suppresses_tolerant_decoder_noise_by_default(self, monkeypatch):
@@ -1010,6 +1011,8 @@ class TestToolLogic:
     async def test_add_file_reports_actionable_diagnostics_for_chat_sandbox_path(
         self, patch_client, monkeypatch
     ):
+        from pathlib import Path
+
         import notebooklm.mcp_server as srv
 
         monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", "/imports")
@@ -1019,7 +1022,7 @@ class TestToolLogic:
         assert result["ok"] is False
         assert result["error"]["code"] == "FILE_OUTSIDE_ALLOWED_ROOT"
         assert result["diagnostics"]["requested_path"] == "/mnt/data/report.md"
-        assert result["diagnostics"]["allowed_root"] == "/imports"
+        assert result["diagnostics"]["allowed_root"] == str(Path("/imports").resolve())
         assert result["diagnostics"]["host_import_dir"] == "./mcp_imports"
         assert "copy" in result["next_action"]["message"].lower()
         assert "add_text_source" in result["next_action"]["fallback_tool"]
@@ -1044,6 +1047,8 @@ class TestToolLogic:
     async def test_add_file_reports_missing_file_inside_import_root(
         self, patch_client, monkeypatch
     ):
+        from pathlib import Path
+
         import notebooklm.mcp_server as srv
 
         monkeypatch.setenv("NOTEBOOKLM_MCP_FILE_ROOT", "/imports")
@@ -1052,7 +1057,7 @@ class TestToolLogic:
 
         assert result["ok"] is False
         assert result["error"]["code"] == "FILE_NOT_FOUND_INSIDE_ALLOWED_ROOT"
-        assert "/imports" in result["diagnostics"]["allowed_root"]
+        assert str(Path("/imports").resolve()) in result["diagnostics"]["allowed_root"]
         assert "./mcp_imports" in result["next_action"]["message"]
         patch_client.sources.add_file.assert_not_awaited()
 

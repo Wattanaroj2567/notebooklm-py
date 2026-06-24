@@ -148,9 +148,7 @@ class TestLoginCommand:
             [sys.executable, "-m", "playwright", "install", "chromium"],
         ]
 
-    def test_chromium_preflight_skips_install_when_executable_exists(
-        self, tmp_path, monkeypatch
-    ):
+    def test_chromium_preflight_skips_install_when_executable_exists(self, tmp_path, monkeypatch):
         from notebooklm.cli import session
 
         install_location = tmp_path / "chromium-1200"
@@ -176,9 +174,7 @@ class TestLoginCommand:
 
         session._ensure_chromium_installed()
 
-        assert calls == [
-            [sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"]
-        ]
+        assert calls == [[sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"]]
 
     def test_login_playwright_import_error_handling(self, runner, tmp_path, monkeypatch):
         """Test that ImportError for playwright is handled gracefully.

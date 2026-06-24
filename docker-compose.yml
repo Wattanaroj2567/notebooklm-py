@@ -18,6 +18,18 @@ services:
       - |
         set -eu
 
+        TARGET_PROFILE_DIR="/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}"
+        TARGET_STORAGE="$$TARGET_PROFILE_DIR/storage_state.json"
+
+        # Smart Init: If Docker already has a healthy session, skip syncing from host.
+        if [ -f "$$TARGET_STORAGE" ]; then
+          if NOTEBOOKLM_HOME=/target-notebooklm notebooklm auth check --test --json >/dev/null 2>&1; then
+            echo "✅ Existing Docker auth is healthy. Skipping sync from host to preserve session."
+            exit 0
+          fi
+          echo "⚠️  Existing Docker auth is unhealthy or expired. Proceeding with sync from host..."
+        fi
+
         rm -rf "/target-notebooklm/.sync-tmp"
 
         if [ ! -f "/host-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json" ]; then
@@ -42,7 +54,9 @@ services:
           chmod 600 "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/context.json"
         fi
 
-        NOTEBOOKLM_HOME=/target-notebooklm/.sync-tmp notebooklm auth check --test --json >/dev/null
+        if ! NOTEBOOKLM_HOME=/target-notebooklm/.sync-tmp notebooklm auth check --test --json >/dev/null 2>&1; then
+          echo "⚠️  Synced host auth is also unhealthy. Proceeding anyway to allow Docker-side rescue."
+        fi
 
         mkdir -p "/target-notebooklm/profiles/${NOTEBOOKLM_PROFILE:-default}"
         cp "/target-notebooklm/.sync-tmp/profiles/${NOTEBOOKLM_PROFILE:-default}/storage_state.json" \
