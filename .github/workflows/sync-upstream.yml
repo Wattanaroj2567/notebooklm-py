@@ -1,0 +1,141 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Update main and prepare MCP sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_HEAD: teng-lin:main
+      MAIN_BRANCH: main
+      MCP_BRANCH: mcp
+      SYNC_BRANCH: sync/upstream-main-to-mcp-${{ github.run_id }}
+    steps:
+      - name: Merge upstream into main
+        id: sync_main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response="${RUNNER_TEMP}/main-merge.json"
+          if ! gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/merges" \
+            --field "base=${MAIN_BRANCH}" \
+            --field "head=${UPSTREAM_HEAD}" \
+            --field "commit_message=chore(sync): merge upstream main" \
+            >"${response}"; then
+            echo "::error::Unable to merge ${UPSTREAM_HEAD} into ${MAIN_BRANCH}."
+            exit 1
+          fi
+
+          if [[ -s "${response}" ]]; then
+            result="merged"
+          else
+            result="already-current"
+          fi
+
+          main_sha="$(
+            gh api \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/git/ref/heads/${MAIN_BRANCH}" \
+              --jq ".object.sha"
+          )"
+          echo "result=${result}" >>"${GITHUB_OUTPUT}"
+          echo "main_sha=${main_sha}" >>"${GITHUB_OUTPUT}"
+
+      - name: Create the run-specific sync branch
+        shell: bash
+        env:
+          MAIN_SHA: ${{ steps.sync_main.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/git/refs" \
+            --field "ref=refs/heads/${SYNC_BRANCH}" \
+            --field "sha=${MAIN_SHA}" \
+            >/dev/null
+
+      - name: Try to integrate MCP changes
+        id: integrate_mcp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          response="${RUNNER_TEMP}/mcp-merge.json"
+          error_log="${RUNNER_TEMP}/mcp-merge-error.log"
+          if gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/merges" \
+            --field "base=${SYNC_BRANCH}" \
+            --field "head=${MCP_BRANCH}" \
+            --field "commit_message=chore(sync): integrate mcp with upstream main" \
+            >"${response}" 2>"${error_log}"; then
+            state="clean"
+          elif grep -q "HTTP 409" "${error_log}"; then
+            cat "${error_log}" >&2
+            echo "::warning title=Manual conflict resolution required::The sync branch was preserved at updated main."
+            state="conflict"
+          else
+            cat "${error_log}" >&2
+            echo "::error::Unable to integrate ${MCP_BRANCH} into ${SYNC_BRANCH}."
+            exit 1
+          fi
+
+          echo "state=${state}" >>"${GITHUB_OUTPUT}"
+
+      - name: Write maintainer handoff
+        shell: bash
+        env:
+          MAIN_RESULT: ${{ steps.sync_main.outputs.result }}
+          MAIN_SHA: ${{ steps.sync_main.outputs.main_sha }}
+          INTEGRATION_STATE: ${{ steps.integrate_mcp.outputs.state }}
+        run: |
+          set -euo pipefail
+
+          compare_url="https://github.com/${GITHUB_REPOSITORY}/compare/${MCP_BRANCH}...${SYNC_BRANCH}?expand=1"
+          {
+            echo "## Manual upstream sync"
+            echo
+            echo "- Main result: \`${MAIN_RESULT}\`"
+            echo "- Main SHA: \`${MAIN_SHA}\`"
+            echo "- Sync branch: \`${SYNC_BRANCH}\`"
+            echo "- MCP integration: \`${INTEGRATION_STATE}\`"
+            echo
+            echo "[Open the comparison and create the MCP pull request](${compare_url})"
+            if [[ "${INTEGRATION_STATE}" == "conflict" ]]; then
+              echo
+              echo "The first sync needs manual conflict resolution:"
+              echo
+              echo '```bash'
+              echo "git fetch origin"
+              echo "git switch --track origin/${SYNC_BRANCH}"
+              echo "git merge origin/${MCP_BRANCH}"
+              echo "# Resolve conflicts, test, commit, then:"
+              echo "git push origin ${SYNC_BRANCH}"
+              echo '```'
+            fi
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+          echo "::notice title=Open MCP sync PR::${compare_url}"
