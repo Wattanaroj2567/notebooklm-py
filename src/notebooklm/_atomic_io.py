@@ -79,6 +79,7 @@ logger = logging.getLogger(__name__)
 # it directly (case-insensitive filesystems resolve casing variants to the same
 # file).
 _STORAGE_STATE_FILENAME = "storage_state.json"
+
 # Errnos that mean "this fd/filesystem does not support fsync" rather than
 # "the writeback failed". Only these are swallowed so durability degrades
 # gracefully on filesystems that reject fsync (e.g. some network/virtual
@@ -211,7 +212,6 @@ def _atomic_write_json_unchecked(path: Path, data: Any, *, mode: int = 0o600) ->
     for the lost-update rationale, #1215). The boundary is enforced by
     ``tests/_guardrails/test_storage_writer_boundary.py`` (an equality-asserted
     allowlist of this private symbol's importer and its two typed callers).
-    """
 
     Steps:
 
@@ -422,11 +422,7 @@ def atomic_update_json(
             "diverges from the canonical dotted '.storage_state.json.lock' sentinel "
             "(_storage_state_lock_path, #1215), so it would acquire the wrong lock "
             "and risk a lost-update race. Use the dedicated notebooklm._auth writers "
-<<<<<<< HEAD
-            "(save_cookies_to_storage / write_account_metadata / _clear_in_band_account) "
-=======
             "(save_cookies_to_storage / write_account_metadata / clear_in_band_account) "
->>>>>>> upstream-tracking
             "instead."
         )
     lock_path = path.with_suffix(path.suffix + ".lock")

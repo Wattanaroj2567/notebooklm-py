@@ -127,9 +127,7 @@ def test_sync_upstream_uses_minimal_permissions_and_fixed_refs():
     assert job["env"]["UPSTREAM_HEAD"] == "teng-lin:main"
     assert job["env"]["MAIN_BRANCH"] == "main"
     assert job["env"]["MCP_BRANCH"] == "mcp"
-    assert job["env"]["SYNC_BRANCH"] == (
-        "sync/upstream-main-to-mcp-${{ github.run_id }}"
-    )
+    assert job["env"]["SYNC_BRANCH"] == ("sync/upstream-main-to-mcp-${{ github.run_id }}")
 
 
 def test_sync_upstream_never_updates_mcp_and_hands_off_by_compare_url():

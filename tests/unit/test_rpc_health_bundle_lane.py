@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ pytestmark = pytest.mark.repo_lint
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "rpc-health.yml"
-BASH = shutil.which("bash")
+BASH = shutil.which("bash") if sys.platform != "win32" else None
 
 
 def _steps() -> list[dict[str, Any]]:

@@ -153,7 +153,16 @@ TOOLS_WITH_NOTEBOOK_ID = frozenset(
 
 def _make_mock_client():
     """Build a NotebookLMClient mock covering all MCP tool code paths."""
-    client = AsyncMock()
+    client = MagicMock()
+
+    async def _async_self():
+        return client
+
+    client.__await__ = lambda: _async_self().__await__()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.is_connected = True
+    client.refresh_auth = AsyncMock()
 
     nb = MagicMock(id="nb-1", title="Test Notebook")
     client.notebooks.list = AsyncMock(return_value=[nb])
@@ -470,7 +479,7 @@ class TestGetClient:
                 patch("notebooklm.mcp_server._storage_state_signature", return_value=None),
                 patch(
                     "notebooklm.mcp_server.NotebookLMClient.from_storage",
-                    return_value=mock_client,
+                    new=AsyncMock(return_value=mock_client),
                 ),
             ):
                 c1 = await srv.get_client()
@@ -495,6 +504,7 @@ class TestGetClient:
         srv._client = None
         srv._client_storage_signature = None
         try:
+            from_storage = AsyncMock(side_effect=[first_client, second_client])
             with (
                 patch(
                     "notebooklm.mcp_server._storage_state_signature",
@@ -506,8 +516,8 @@ class TestGetClient:
                 ),
                 patch(
                     "notebooklm.mcp_server.NotebookLMClient.from_storage",
-                    side_effect=[first_client, second_client],
-                ) as from_storage,
+                    new=from_storage,
+                ),
             ):
                 c1 = await srv.get_client()
                 c2 = await srv.get_client()

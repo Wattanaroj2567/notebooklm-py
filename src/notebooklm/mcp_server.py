@@ -23,6 +23,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import Icon
 
 from notebooklm import NotebookLMClient
+from notebooklm._app.serialize import to_jsonable
 from notebooklm.exceptions import ValidationError
 from notebooklm.paths import get_storage_path
 from notebooklm.rpc import (
@@ -41,6 +42,8 @@ from notebooklm.rpc import (
     VideoStyle,
 )
 from notebooklm.types import Artifact, ShareStatus, source_status_to_str
+
+__all__ = ["main", "app", "mcp", "get_client"]
 
 # Configure logging
 _TOLERANT_DECODER_FILTER_MARKER = "_notebooklm_mcp_tolerant_decoder_filter"
@@ -649,6 +652,10 @@ async def get_client() -> NotebookLMClient:
                 # Force next _get_auth_notice() to re-read disk so callers
                 # immediately see the expired/unknown notice in their response.
                 _invalidate_auth_notice_cache()
+                if _is_hard_auth_failure(e):
+                    raise RuntimeError(
+                        f"NotebookLM client not ready. {_live_auth_failure_message(e)}"
+                    ) from e
                 auth_info = _check_auth_health()
                 if auth_info["status"] in ("expired", "unknown"):
                     logger.error("[auth] %s", auth_info["message"])
@@ -693,25 +700,6 @@ async def _session_refresh_task(interval_seconds: int = 600) -> None:
             raise
         except Exception as exc:
             logger.warning("[session-refresh] ⚠️ Failed to refresh session tokens: %s", exc)
-
-
-@mcp.tool()
-async def check_auth_status() -> dict[str, Any]:
-    """Check the health and expiry status of the current authentication. (ReadOnly)"""
-    health = _check_auth_health()
-    client_status = "Not Initialized"
-    if _client:
-        client_status = "Connected" if _client.is_connected else "Initialized"
-
-    return {
-        "ok": health["status"] == "ok",
-        "auth_health": health,
-        "client_status": client_status,
-        "advice": (
-            "If auth is expired or rejected, run: sync_auth_from_host "
-            "(after logging in on your host machine with 'notebooklm login')"
-        ),
-    }
 
 
 @mcp.tool()
@@ -1277,14 +1265,15 @@ async def start_research(
         return {"error": str(e)}
     if not task:
         return {"error": "Failed to start research"}
-    return task
+    return to_jsonable(task)
 
 
 @mcp.tool()
 async def poll_research_results(notebook_id: str) -> dict[str, Any]:
     """Poll research status and discovered sources (CLI: ``research status``). (ReadOnly)"""
     client = await get_client()
-    res = await client.research.poll(notebook_id)
+    task_obj = await client.research.poll(notebook_id)
+    res: dict[str, Any] = to_jsonable(task_obj)
 
     st = res.get("status", "unknown")
     if st == "completed" or st == "ready":
@@ -1297,7 +1286,7 @@ async def poll_research_results(notebook_id: str) -> dict[str, Any]:
         res["phase"] = "discovering_sources"
         res["estimated_remaining_steps"] = ["wait_for_discovery", "import_sources"]
 
-    if "sources" in res:
+    if "sources" in res and isinstance(res["sources"], list):
         res["sources_found"] = len(res["sources"])
 
     return res
@@ -1316,7 +1305,8 @@ async def import_research_sources(
     (Write)
     """
     client = await get_client()
-    results = await client.research.poll(notebook_id)
+    task_obj = await client.research.poll(notebook_id)
+    results: dict[str, Any] = to_jsonable(task_obj)
     if results.get("status") not in ("completed", "ready"):
         return {
             "error": "Research not ready to import",
@@ -1339,7 +1329,8 @@ async def import_research_sources(
             return {"error": "No valid source_indices"}
         sources = picked
     try:
-        return await client.research.import_sources(notebook_id, task_id, sources)
+        imported = await client.research.import_sources(notebook_id, task_id, sources)
+        return to_jsonable(imported)
     except ValidationError as e:
         return {"error": str(e)}
 
@@ -1357,7 +1348,8 @@ async def research_wait_and_import(
     interval = max(1, interval_seconds)
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = await client.research.poll(notebook_id)
+        task_poll = await client.research.poll(notebook_id)
+        last = to_jsonable(task_poll)
         st = last.get("status")
         if st == "no_research":
             return {"error": "No research running", "status": "no_research"}
@@ -2008,9 +2000,9 @@ async def add_text_source(notebook_id: str, title: str, text: str) -> dict[str, 
 async def refresh_source(notebook_id: str, source_id: str) -> dict[str, Any]:
     """Refresh an existing source. (Write)"""
     client = await get_client()
-    ok = await client.sources.refresh(notebook_id, source_id)
+    await client.sources.refresh(notebook_id, source_id)
     return with_notebook_url(
-        {"result": bool(ok), "source_id": source_id},
+        {"result": True, "source_id": source_id},
         notebook_id,
     )
 
@@ -2101,8 +2093,8 @@ async def delete_source(
             notebook_id,
         )
 
-    deleted = await client.sources.delete(notebook_id, source_id)
-    result: dict[str, Any] = {"result": bool(deleted), "deleted": _source_to_delete_info(source)}
+    await client.sources.delete(notebook_id, source_id)
+    result: dict[str, Any] = {"result": True, "deleted": _source_to_delete_info(source)}
     if verify:
         remaining = await client.sources.list(notebook_id)
         result["verified"] = True
@@ -2549,7 +2541,7 @@ async def generate_mind_map(notebook_id: str) -> dict[str, Any]:
     """Generate interactive Mind Map saved as a note. (Write)"""
     client = await get_client()
     result = await client.artifacts.generate_mind_map(notebook_id)
-    return with_notebook_url(result, notebook_id)
+    return with_notebook_url(to_jsonable(result), notebook_id)
 
 
 @mcp.tool()
@@ -2811,8 +2803,8 @@ async def delete_note(
             notebook_id,
         )
 
-    deleted = await client.notes.delete(notebook_id, note_id)
-    result: dict[str, Any] = {"result": bool(deleted), "deleted": _note_to_delete_info(note)}
+    await client.notes.delete(notebook_id, note_id)
+    result: dict[str, Any] = {"result": True, "deleted": _note_to_delete_info(note)}
     if verify:
         remaining = await client.notes.get(notebook_id, note_id)
         result["verified"] = True

@@ -1084,6 +1084,7 @@ src/notebooklm/
 ├── research.py                  # Public research citation/report helpers
 ├── urls.py                      # Public URL helper facade
 ├── utils.py                     # Public async utility helpers
+├── mcp_server.py                # Standalone MCP server adapter
 ├── _atomic_io.py                # Atomic JSON write/update helpers
 ├── _auth_refresh_retry.py       # Shared auth refresh-and-retry core (RefreshBudget + refresh_and_count) for both retry layers
 ├── _backoff.py                  # Shared retry backoff calculation

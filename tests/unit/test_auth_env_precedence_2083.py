@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -229,7 +230,10 @@ async def test_explicit_cookies_still_refresh_when_env_var_is_merely_present(
     # silently and leave the test passing for the wrong reason.
     assert _ENV in os.environ, "this test is only meaningful with ambient env auth set"
     marker = tmp_path / "refresh-cmd-ran"
-    monkeypatch.setenv("NOTEBOOKLM_REFRESH_CMD", f"touch {marker}")
+    monkeypatch.setenv(
+        "NOTEBOOKLM_REFRESH_CMD",
+        f"{sys.executable} -c \"from pathlib import Path; Path(r'{marker}').touch()\"",
+    )
     # Two rounds: the initial fetch, then the post-refresh retry.
     for _ in range(2):
         httpx_mock.add_response(

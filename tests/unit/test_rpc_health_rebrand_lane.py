@@ -207,7 +207,7 @@ def test_main_issue_lanes_are_untouched_by_the_rebrand_lane() -> None:
 # visible in the wiring alone.
 # ---------------------------------------------------------------------------
 
-BASH = shutil.which("bash")
+BASH = shutil.which("bash") if sys.platform != "win32" else None
 requires_bash = pytest.mark.skipif(BASH is None, reason="needs bash to run the step scripts")
 
 # A ``gh`` stand-in: records every invocation, and answers ``issue list`` from
