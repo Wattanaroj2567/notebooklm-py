@@ -3,8 +3,7 @@
 Moved from ``tests/unit/`` to ``tests/integration/``.
 Mock-backed (``pytest_httpx``); ``allow_no_vcr`` opts out of the
 integration-tree VCR enforcement hook in ``tests/integration/conftest.py``.
-Cassette-backed coverage lives in ``tests/integration/test_sharing_vcr.py``
-and ``tests/integration/test_vcr_comprehensive.py``.
+Cassette-backed coverage lives in ``tests/integration/test_vcr_comprehensive.py``.
 """
 
 import pytest
@@ -47,7 +46,7 @@ class TestGetShareStatus:
         assert status.is_public is True
         assert len(status.shared_users) == 2
         assert status.shared_users[0].email == "owner@example.com"
-        assert status.share_url == "https://notebooklm.google.com/notebook/nb_123"
+        assert status.share_url == "https://notebook.google.com/notebook/nb_123"
 
     @pytest.mark.asyncio
     async def test_get_status_private_notebook(
@@ -224,6 +223,7 @@ class TestAddUser:
         auth_tokens,
         httpx_mock: HTTPXMock,
         build_rpc_response,
+        rpc_request_params,
     ):
         """Test adding a user as viewer."""
         share_response = build_rpc_response(RPCMethod.SHARE_NOTEBOOK, [])
@@ -253,6 +253,21 @@ class TestAddUser:
         assert len(status.shared_users) == 2
         assert status.shared_users[1].email == "new@example.com"
         assert status.shared_users[1].permission == SharePermission.VIEWER
+
+        requests = httpx_mock.get_requests()
+        assert rpc_request_params(requests[0]) == [
+            [
+                [
+                    "nb_123",
+                    [["new@example.com", None, SharePermission.VIEWER.value]],
+                    None,
+                    [1, ""],
+                ]
+            ],
+            1,
+            None,
+            [2],
+        ]
 
     @pytest.mark.asyncio
     async def test_add_user_as_editor(
@@ -367,6 +382,7 @@ class TestRemoveUser:
         auth_tokens,
         httpx_mock: HTTPXMock,
         build_rpc_response,
+        rpc_request_params,
     ):
         """Test removing a user."""
         share_response = build_rpc_response(RPCMethod.SHARE_NOTEBOOK, [])
@@ -389,6 +405,22 @@ class TestRemoveUser:
         assert len(status.shared_users) == 1
         assert status.shared_users[0].email == "owner@example.com"
 
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 2
+        assert rpc_request_params(requests[0]) == [
+            [
+                [
+                    "nb_123",
+                    [["removed@example.com", None, SharePermission._REMOVE.value]],
+                    None,
+                    [0, ""],
+                ]
+            ],
+            0,
+            None,
+            [2],
+        ]
+
 
 class TestSharingAPIIntegration:
     """Additional integration tests for SharingAPI."""
@@ -406,5 +438,6 @@ class TestSharingAPIIntegration:
             assert hasattr(client.sharing, "set_public")
             assert hasattr(client.sharing, "set_view_level")
             assert hasattr(client.sharing, "add_user")
+            assert hasattr(client.sharing, "set_users")
             assert hasattr(client.sharing, "update_user")
             assert hasattr(client.sharing, "remove_user")

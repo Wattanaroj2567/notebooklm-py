@@ -8,7 +8,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
-import click
 from filelock import FileLock, Timeout
 
 from ..io import atomic_update_json, atomic_write_json
@@ -25,14 +24,20 @@ def _describe_json_shape(value: Any) -> str:
 
 
 def _current_storage_override() -> Path | None:
-    """Resolve the active ``--storage`` override from the current Click context."""
+    """Resolve the active ``--storage`` override from the current Click context.
+
+    Reads the live Click context here (in the command layer) and passes it
+    explicitly into the :class:`AuthSource` resolver, keeping the
+    Click-context read out of ``cli/services`` per ADR-0008. New callers
+    should use the :class:`AuthSource` resolver directly so they pick up the
+    full precedence chain (env-var fast path etc.).
+    """
+    import click
+
+    from .services.auth_source import current_storage_override
+
     ctx = click.get_current_context(silent=True)
-    if ctx is None or not ctx.obj:
-        return None
-    storage = ctx.obj.get("storage_path")
-    if storage is None:
-        return None
-    return Path(storage).expanduser().resolve()
+    return current_storage_override(ctx)
 
 
 def _resolve_context_path(context_path_fn: ContextPathFn | None = None) -> Path:
@@ -108,6 +113,7 @@ def set_current_notebook(
     is_owner: bool | None = None,
     created_at: str | None = None,
     *,
+    role: str | None = None,
     context_path_fn: ContextPathFn | None = None,
 ) -> None:
     """Set the current notebook context."""
@@ -123,6 +129,8 @@ def set_current_notebook(
             data["title"] = title
         if is_owner is not None:
             data["is_owner"] = is_owner
+        if role:
+            data["role"] = role
         if created_at:
             data["created_at"] = created_at
         return data

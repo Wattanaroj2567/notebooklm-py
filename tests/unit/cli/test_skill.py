@@ -1,5 +1,8 @@
 """Tests for skill CLI commands."""
 
+import importlib
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -7,10 +10,8 @@ from click.testing import CliRunner
 
 from notebooklm.notebooklm_cli import cli
 
-from .conftest import get_cli_module
-
 # Get the actual skill module (not the click group that shadows it)
-skill_module = get_cli_module("skill")
+skill_module = importlib.import_module("notebooklm.cli.skill_cmd")
 
 
 @pytest.fixture
@@ -109,6 +110,366 @@ class TestSkillInstall:
         assert (home / ".agents" / "skills" / "notebooklm" / "SKILL.md").exists()
 
 
+class TestSkillInstallProjectHardening:
+    """Tests for the project-scope hardening flags (--dry-run / --no-clobber / --force).
+
+    Every test in this class uses ``--scope project`` and patches ``Path.cwd()``
+    so the install rooted under ``tmp_path``.
+    """
+
+    SOURCE_CONTENT = "---\nname: notebooklm\n---\n# Source body v1"
+
+    def _stamped(self, version: str = "1.0.0") -> str:
+        return skill_module.add_version_comment(self.SOURCE_CONTENT, version)
+
+    def _seed(self, project: Path, *, claude: str | None, agents: str | None) -> None:
+        """Pre-create one or both target files with the supplied content."""
+        if claude is not None:
+            path = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(claude, encoding="utf-8")
+        if agents is not None:
+            path = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(agents, encoding="utf-8")
+
+    def _invoke(self, runner, project: Path, *extra_args: str):
+        """Run ``skill install --scope project`` with the patched cwd."""
+        with (
+            patch.object(
+                skill_module, "get_skill_source_content", return_value=self.SOURCE_CONTENT
+            ),
+            patch.object(skill_module, "get_package_version", return_value="1.0.0"),
+            patch.object(skill_module.Path, "cwd", return_value=project),
+        ):
+            return runner.invoke(cli, ["skill", "install", "--scope", "project", *extra_args])
+
+    # --- fresh install (no existing files) -----------------------------------
+
+    def test_fresh_install_creates_both_targets(self, runner, tmp_path):
+        """No existing files: install writes both targets with stamped content."""
+        project = tmp_path / "project"
+        result = self._invoke(runner, project)
+
+        assert result.exit_code == 0, result.output
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == self._stamped()
+        assert agents.read_text(encoding="utf-8") == self._stamped()
+        assert "installed" in result.output.lower()
+
+    # --- unchanged content (no-op) -------------------------------------------
+
+    def test_unchanged_content_is_noop(self, runner, tmp_path):
+        """Both targets already contain stamped content: no write, exit 0, 'up to date'."""
+        project = tmp_path / "project"
+        stamped = self._stamped()
+        self._seed(project, claude=stamped, agents=stamped)
+
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        claude_mtime = claude.stat().st_mtime_ns
+        agents_mtime = agents.stat().st_mtime_ns
+
+        result = self._invoke(runner, project)
+
+        assert result.exit_code == 0, result.output
+        # No write happened: mtime is preserved (atomic_write would have replaced inode).
+        assert claude.stat().st_mtime_ns == claude_mtime
+        assert agents.stat().st_mtime_ns == agents_mtime
+        assert "up to date" in result.output.lower()
+
+    # --- differing content, default mode (refuse + exit 1) -------------------
+
+    def test_default_refuses_to_clobber_differing_targets(self, runner, tmp_path):
+        """Differing content + no flags: exit 1, list differing files, no writes."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old claude content", agents="old agents content")
+
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+
+        result = self._invoke(runner, project)
+
+        assert result.exit_code == 1, result.output
+        # Files are not modified.
+        assert claude.read_text(encoding="utf-8") == "old claude content"
+        assert agents.read_text(encoding="utf-8") == "old agents content"
+        # Error mentions both targets and surfaces the canonical flag hint.
+        assert "claude code" in result.output.lower()
+        assert "agent skills" in result.output.lower()
+        assert "--force" in result.output
+        assert "--no-clobber" in result.output
+
+    # --- --dry-run -----------------------------------------------------------
+
+    def test_dry_run_on_fresh_project_writes_nothing(self, runner, tmp_path):
+        """--dry-run on a fresh project prints intended creates without writing."""
+        project = tmp_path / "project"
+        result = self._invoke(runner, project, "--dry-run")
+
+        assert result.exit_code == 0, result.output
+        assert "dry run" in result.output.lower()
+        assert "would create" in result.output.lower()
+        # No filesystem changes -- the skill files do not exist.
+        assert not (project / ".claude" / "skills" / "notebooklm" / "SKILL.md").exists()
+        assert not (project / ".agents" / "skills" / "notebooklm" / "SKILL.md").exists()
+
+    def test_dry_run_with_differing_files_writes_nothing(self, runner, tmp_path):
+        """--dry-run with differing files: announces refuse, exit 0, no writes."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old claude content", agents=self._stamped())
+
+        result = self._invoke(runner, project, "--dry-run")
+
+        assert result.exit_code == 0, result.output
+        output = result.output.lower()
+        assert "dry run" in output
+        # The differing target is flagged as would-refuse (or similar wording).
+        assert "would refuse" in output
+        # The matching target appears as up-to-date.
+        assert "up to date" in output
+        # Differing file is unchanged.
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == "old claude content"
+
+    def test_dry_run_with_force_previews_overwrite(self, runner, tmp_path):
+        """--dry-run --force: previews overwrites without writing."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old", agents=None)
+
+        result = self._invoke(runner, project, "--dry-run", "--force")
+
+        assert result.exit_code == 0, result.output
+        output = result.output.lower()
+        assert "would overwrite" in output
+        assert "would create" in output
+        # Nothing actually written.
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == "old"
+        assert not agents.exists()
+
+    def test_dry_run_with_no_clobber_previews_skip(self, runner, tmp_path):
+        """--dry-run --no-clobber: previews which differing files would be skipped."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old", agents=None)
+
+        result = self._invoke(runner, project, "--dry-run", "--no-clobber")
+
+        assert result.exit_code == 0, result.output
+        output = result.output.lower()
+        assert "would skip" in output
+        assert "would create" in output
+        # Nothing actually written.
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == "old"
+        assert not agents.exists()
+
+    def test_dry_run_all_up_to_date_reports_each_target(self, runner, tmp_path):
+        """--dry-run with both targets already stamped reports the no-op targets."""
+        project = tmp_path / "project"
+        stamped = self._stamped()
+        self._seed(project, claude=stamped, agents=stamped)
+
+        result = self._invoke(runner, project, "--dry-run")
+
+        assert result.exit_code == 0, result.output
+        output = result.output.lower()
+        assert "dry run" in output
+        assert output.count("up to date") >= 2
+        assert "claude code" in output
+        assert "agent skills" in output
+
+    # --- --no-clobber --------------------------------------------------------
+
+    def test_no_clobber_skips_differing_creates_missing(self, runner, tmp_path):
+        """--no-clobber: skip differing files, still create missing targets."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old claude content", agents=None)
+
+        result = self._invoke(runner, project, "--no-clobber")
+
+        assert result.exit_code == 0, result.output
+        # Existing differing file is preserved.
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == "old claude content"
+        # Missing target was created with stamped content.
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert agents.read_text(encoding="utf-8") == self._stamped()
+        # Informative summary surfaces the skip count.
+        assert "skipped" in result.output.lower()
+        assert "--no-clobber" in result.output
+
+    def test_no_clobber_all_differing_writes_nothing(self, runner, tmp_path):
+        """--no-clobber with both targets differing: no writes, exit 0, summary printed."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old claude", agents="old agents")
+
+        result = self._invoke(runner, project, "--no-clobber")
+
+        assert result.exit_code == 0, result.output
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == "old claude"
+        assert agents.read_text(encoding="utf-8") == "old agents"
+        assert "skipped" in result.output.lower()
+        assert "2" in result.output  # count surfaced
+
+    # --- --force -------------------------------------------------------------
+
+    def test_force_overwrites_differing_targets(self, runner, tmp_path):
+        """--force: overwrites differing content unconditionally."""
+        project = tmp_path / "project"
+        self._seed(project, claude="old claude", agents="old agents")
+
+        result = self._invoke(runner, project, "--force")
+
+        assert result.exit_code == 0, result.output
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert claude.read_text(encoding="utf-8") == self._stamped()
+        assert agents.read_text(encoding="utf-8") == self._stamped()
+        assert "installed" in result.output.lower()
+
+    # --- mixed (per-target diff detection) -----------------------------------
+
+    def test_mixed_one_identical_one_differing_default_refuses(self, runner, tmp_path):
+        """Mixed targets: identical claude + differing agents -> default refuses, lists agents only."""
+        project = tmp_path / "project"
+        self._seed(project, claude=self._stamped(), agents="old agents")
+
+        result = self._invoke(runner, project)
+
+        assert result.exit_code == 1, result.output
+        # The error lists the differing target.
+        assert "agent skills" in result.output.lower()
+        # The identical target should NOT appear in the differing list.
+        differing_section = (
+            result.output.split("Refusing")[1] if "Refusing" in result.output else ""
+        )
+        assert "Claude Code:" not in differing_section
+        # No mutation.
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        assert agents.read_text(encoding="utf-8") == "old agents"
+
+    def test_mixed_no_clobber_skips_differing_only(self, runner, tmp_path):
+        """Mixed targets: --no-clobber preserves the differing one, leaves identical untouched."""
+        project = tmp_path / "project"
+        self._seed(project, claude=self._stamped(), agents="old agents")
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        claude_mtime = claude.stat().st_mtime_ns
+
+        result = self._invoke(runner, project, "--no-clobber")
+
+        assert result.exit_code == 0, result.output
+        # Identical target: byte-equal, mtime preserved (no rewrite).
+        assert claude.read_text(encoding="utf-8") == self._stamped()
+        assert claude.stat().st_mtime_ns == claude_mtime
+        # Differing target preserved as-is.
+        assert agents.read_text(encoding="utf-8") == "old agents"
+        assert "skipped" in result.output.lower()
+        assert "up to date" in result.output.lower()
+
+    def test_mixed_force_overwrites_differing_only(self, runner, tmp_path):
+        """Mixed targets: --force overwrites differing, identical target is a no-op."""
+        project = tmp_path / "project"
+        self._seed(project, claude=self._stamped(), agents="old agents")
+        claude = project / ".claude" / "skills" / "notebooklm" / "SKILL.md"
+        agents = project / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        claude_mtime = claude.stat().st_mtime_ns
+
+        result = self._invoke(runner, project, "--force")
+
+        assert result.exit_code == 0, result.output
+        # Identical target untouched (mtime preserved).
+        assert claude.stat().st_mtime_ns == claude_mtime
+        # Differing target overwritten.
+        assert agents.read_text(encoding="utf-8") == self._stamped()
+
+    # --- flag validation -----------------------------------------------------
+
+    def test_user_scope_rejects_dry_run(self, runner, tmp_path):
+        """--scope user + --dry-run is rejected (hardening is project-only)."""
+        home = tmp_path / "home"
+        with (
+            patch.object(
+                skill_module, "get_skill_source_content", return_value=self.SOURCE_CONTENT
+            ),
+            patch.object(skill_module.Path, "home", return_value=home),
+        ):
+            result = runner.invoke(cli, ["skill", "install", "--scope", "user", "--dry-run"])
+
+        assert result.exit_code == 1
+        assert "--scope project" in result.output
+
+    def test_user_scope_rejects_force(self, runner, tmp_path):
+        """--scope user + --force is rejected."""
+        home = tmp_path / "home"
+        with (
+            patch.object(
+                skill_module, "get_skill_source_content", return_value=self.SOURCE_CONTENT
+            ),
+            patch.object(skill_module.Path, "home", return_value=home),
+        ):
+            result = runner.invoke(cli, ["skill", "install", "--scope", "user", "--force"])
+
+        assert result.exit_code == 1
+        assert "--scope project" in result.output
+
+    def test_user_scope_rejects_no_clobber(self, runner, tmp_path):
+        """--scope user + --no-clobber is rejected."""
+        home = tmp_path / "home"
+        with (
+            patch.object(
+                skill_module, "get_skill_source_content", return_value=self.SOURCE_CONTENT
+            ),
+            patch.object(skill_module.Path, "home", return_value=home),
+        ):
+            result = runner.invoke(cli, ["skill", "install", "--scope", "user", "--no-clobber"])
+
+        assert result.exit_code == 1
+        assert "--scope project" in result.output
+
+    def test_force_and_no_clobber_are_mutually_exclusive(self, runner, tmp_path):
+        """--force + --no-clobber together is rejected."""
+        project = tmp_path / "project"
+        result = self._invoke(runner, project, "--force", "--no-clobber")
+
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output.lower()
+
+    def test_atomic_write_no_partial_on_fresh_install(self, runner, tmp_path):
+        """Successful install leaves no temp files in the target directory."""
+        project = tmp_path / "project"
+        result = self._invoke(runner, project)
+
+        assert result.exit_code == 0, result.output
+        claude_dir = project / ".claude" / "skills" / "notebooklm"
+        # No stray ``.SKILL.md.*.tmp`` siblings should remain.
+        leftovers = [p.name for p in claude_dir.iterdir() if p.name != "SKILL.md"]
+        assert leftovers == [], f"unexpected leftover files: {leftovers}"
+
+    def test_atomic_write_text_uses_shared_replace_helper(self, tmp_path, monkeypatch):
+        """Text skill writes share the Windows transient-retry replace helper."""
+        calls: list[tuple[Path, Path]] = []
+
+        def fake_replace(temp_path: Path, path: Path) -> None:
+            calls.append((temp_path, path))
+            temp_path.replace(path)
+
+        monkeypatch.setattr(skill_module, "replace_file_atomically", fake_replace)
+        target = tmp_path / "skills" / "SKILL.md"
+
+        skill_module.atomic_write_text(target, "content")
+
+        assert target.read_text(encoding="utf-8") == "content"
+        assert len(calls) == 1
+        assert calls[0][1] == target
+
+
 class TestSkillStatus:
     """Tests for skill status command."""
 
@@ -159,6 +520,28 @@ class TestSkillStatus:
         assert result.exit_code == 0
         assert "version mismatch" not in result.output.lower()
         assert result.output.count("Installed") >= 2
+
+    def test_skill_status_json(self, runner, tmp_path):
+        """``skill status --json`` emits a single structured document."""
+        home = tmp_path / "home"
+        version = "1.2.3"
+        dest = home / ".agents" / "skills" / "notebooklm" / "SKILL.md"
+        dest.parent.mkdir(parents=True)
+        dest.write_text(f"<!-- notebooklm-py v{version} -->\n# Test")
+
+        with (
+            patch.object(skill_module.Path, "home", return_value=home),
+            patch.object(skill_module, "get_package_version", return_value=version),
+        ):
+            result = runner.invoke(cli, ["skill", "status", "--target", "agents", "--json"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["cli_version"] == version
+        agents = next(t for t in payload["targets"] if t["target"] == "agents")
+        assert agents["installed"] is True
+        assert agents["skill_version"] == version
+        assert agents["version_mismatch"] is False
 
 
 class TestSkillUninstall:
@@ -257,38 +640,6 @@ class TestSkillShow:
         assert "not installed" in result.output.lower()
 
 
-class TestSkillVersionExtraction:
-    """Tests for version extraction logic."""
-
-    def test_get_skill_version_extracts_version(self, tmp_path):
-        """Test version extraction from skill file."""
-        from notebooklm.cli.skill import get_skill_version
-
-        skill_file = tmp_path / "SKILL.md"
-        skill_file.write_text("---\nname: test\n---\n<!-- notebooklm-py v1.2.3 -->\n# Test")
-
-        version = get_skill_version(skill_file)
-        assert version == "1.2.3"
-
-    def test_get_skill_version_no_version(self, tmp_path):
-        """Test version extraction when no version present."""
-        from notebooklm.cli.skill import get_skill_version
-
-        skill_file = tmp_path / "SKILL.md"
-        skill_file.write_text("# Test\nNo version here")
-
-        version = get_skill_version(skill_file)
-        assert version is None
-
-    def test_get_skill_version_file_not_exists(self, tmp_path):
-        """Test version extraction when file doesn't exist."""
-        from notebooklm.cli.skill import get_skill_version
-
-        skill_file = tmp_path / "nonexistent.md"
-        version = get_skill_version(skill_file)
-        assert version is None
-
-
 class TestSkillSourceFallback:
     """Tests for resolving the canonical repository skill."""
 
@@ -305,82 +656,196 @@ class TestSkillSourceFallback:
             assert skill_module.get_skill_source_content() is None
 
 
-class TestAddVersionComment:
-    """Tests for add_version_comment."""
-
-    def test_inserts_after_frontmatter(self):
-        """Version comment is inserted after closing --- preserving surrounding whitespace."""
-        from notebooklm.cli.skill import add_version_comment
-
-        content = "---\nname: notebooklm\n---\n# Body"
-        result = add_version_comment(content, "1.2.3")
-        assert result == "---\nname: notebooklm\n---\n<!-- notebooklm-py v1.2.3 -->\n# Body"
-
-    def test_prepends_when_no_frontmatter(self):
-        """Version comment is prepended when no frontmatter delimiters exist."""
-        from notebooklm.cli.skill import add_version_comment
-
-        content = "# No Frontmatter\nBody text"
-        result = add_version_comment(content, "2.0.0")
-        assert result == "<!-- notebooklm-py v2.0.0 -->\n# No Frontmatter\nBody text"
-
-    def test_prepends_with_incomplete_frontmatter(self):
-        """Version comment is prepended when only one --- delimiter exists."""
-        from notebooklm.cli.skill import add_version_comment
-
-        content = "---\nbroken frontmatter"
-        result = add_version_comment(content, "1.0.0")
-        assert result == "<!-- notebooklm-py v1.0.0 -->\n---\nbroken frontmatter"
+# NOTE: ``TestSkillVersionExtraction`` / ``TestAddVersionComment`` /
+# ``TestRemoveEmptyParents`` (and ``TestSkillInstallReporting``) tested
+# functions that now live in the transport-neutral ``_app.skill`` core. They
+# were MOVED down to ``tests/unit/app/test_app_skill.py`` (direct calls, no
+# Click). ``TestSkillSourceFallback`` stays here because ``get_skill_source_content``
+# is CLI-owned (the packaged-source loader is not part of ``_app.skill``).
 
 
-class TestRemoveEmptyParents:
-    """Tests for remove_empty_parents."""
+class TestSkillPackage:
+    """Tests for skill package (Claude-uploadable archive for chat/Cowork)."""
 
-    def test_cleans_empty_intermediate_directories(self, tmp_path):
-        """Empty parent directories up to scope root are removed."""
-        from notebooklm.cli.skill import remove_empty_parents
+    SOURCE_CONTENT = "---\nname: notebooklm\ndescription: test skill\n---\n# Source body v1"
 
-        home = tmp_path / "home"
-        skill_path = home / ".claude" / "skills" / "notebooklm" / "SKILL.md"
-        skill_path.parent.mkdir(parents=True)
-        skill_path.write_text("# Test")
-        skill_path.unlink()
+    def _stamped(self, source: str | None = None, version: str = "1.0.0") -> str:
+        return skill_module.add_version_comment(source or self.SOURCE_CONTENT, version)
 
-        with patch.object(skill_module.Path, "home", return_value=home):
-            remove_empty_parents(skill_path, "user")
+    def _invoke(self, runner, *extra_args: str, source: str | None = None):
+        with (
+            patch.object(
+                skill_module,
+                "get_skill_source_content",
+                return_value=source or self.SOURCE_CONTENT,
+            ),
+            patch.object(skill_module, "get_package_version", return_value="1.0.0"),
+        ):
+            return runner.invoke(cli, ["skill", "package", *extra_args])
 
-        assert not (home / ".claude" / "skills" / "notebooklm").exists()
-        assert not (home / ".claude" / "skills").exists()
-        assert home.exists()  # scope root must survive
+    def _read_entry(self, archive_path: Path) -> str:
+        import io
+        import zipfile
 
-    def test_stops_at_non_empty_directory(self, tmp_path):
-        """Removal stops when a directory is non-empty."""
-        from notebooklm.cli.skill import remove_empty_parents
+        with zipfile.ZipFile(io.BytesIO(archive_path.read_bytes())) as archive:
+            assert archive.namelist() == [skill_module.SKILL_ARCHIVE_ENTRY]
+            return archive.read(skill_module.SKILL_ARCHIVE_ENTRY).decode("utf-8")
 
-        home = tmp_path / "home"
-        skill_path = home / ".agents" / "skills" / "notebooklm" / "SKILL.md"
-        skill_path.parent.mkdir(parents=True)
-        skill_path.write_text("# Test")
-        # Create a sibling file to make skills/ non-empty after notebooklm/ is gone
-        (home / ".agents" / "skills" / "other.md").write_text("keep me")
-        skill_path.unlink()
-        skill_path.parent.rmdir()  # notebooklm/ is empty, remove it manually
+    def test_package_default_output_in_cwd(self, runner, tmp_path):
+        with runner.isolated_filesystem(temp_dir=tmp_path):
+            result = self._invoke(runner)
 
-        with patch.object(skill_module.Path, "home", return_value=home):
-            remove_empty_parents(skill_path.parent, "user")
+            assert result.exit_code == 0, result.output
+            archive = Path(skill_module.DEFAULT_ARCHIVE_FILENAME)
+            assert archive.exists()
+            assert self._read_entry(archive) == self._stamped()
+            assert "Packaged" in result.output
+            assert "Capabilities" in result.output
 
-        assert (home / ".agents" / "skills").exists()  # non-empty, should not be removed
+    def test_package_output_file_path(self, runner, tmp_path):
+        target = tmp_path / "custom-name.zip"
+        result = self._invoke(runner, "--output", str(target))
 
-    def test_scope_root_is_never_removed(self, tmp_path):
-        """The scope root directory itself is never deleted."""
-        from notebooklm.cli.skill import remove_empty_parents
+        assert result.exit_code == 0, result.output
+        assert self._read_entry(target) == self._stamped()
 
-        home = tmp_path / "home"
-        home.mkdir()
-        # Simulate a skill directly one level inside home (no intermediates)
-        skill_path = home / "SKILL.md"
+    def test_package_output_directory_uses_default_filename(self, runner, tmp_path):
+        result = self._invoke(runner, "--output", str(tmp_path))
 
-        with patch.object(skill_module.Path, "home", return_value=home):
-            remove_empty_parents(skill_path, "user")
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / skill_module.DEFAULT_ARCHIVE_FILENAME).exists()
 
-        assert home.exists()
+    def test_package_output_directory_with_existing_archive_refuses(self, runner, tmp_path):
+        (tmp_path / skill_module.DEFAULT_ARCHIVE_FILENAME).write_bytes(b"old")
+        result = self._invoke(runner, "--output", str(tmp_path))
+
+        assert result.exit_code == 1
+        assert (tmp_path / skill_module.DEFAULT_ARCHIVE_FILENAME).read_bytes() == b"old"
+
+    def test_package_refuses_overwrite_without_force(self, runner, tmp_path):
+        target = tmp_path / "skill.zip"
+        target.write_bytes(b"old")
+        result = self._invoke(runner, "--output", str(target))
+
+        assert result.exit_code == 1
+        assert target.read_bytes() == b"old"
+
+    def test_package_force_overwrites(self, runner, tmp_path):
+        target = tmp_path / "skill.zip"
+        target.write_bytes(b"old")
+        result = self._invoke(runner, "--output", str(target), "--force")
+
+        assert result.exit_code == 0, result.output
+        assert self._read_entry(target) == self._stamped()
+
+    def test_package_missing_source_errors(self, runner, tmp_path):
+        with (
+            patch.object(skill_module, "get_skill_source_content", return_value=None),
+            patch.object(skill_module, "get_package_version", return_value="1.0.0"),
+        ):
+            result = runner.invoke(
+                cli, ["skill", "package", "--output", str(tmp_path / "skill.zip")]
+            )
+
+        assert result.exit_code == 1
+        assert not (tmp_path / "skill.zip").exists()
+
+    def test_package_json_success_shape(self, runner, tmp_path):
+        target = tmp_path / "skill.zip"
+        result = self._invoke(runner, "--output", str(target), "--json")
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["path"] == str(target)
+        assert payload["version"] == "1.0.0"
+        assert payload["entries"] == [skill_module.SKILL_ARCHIVE_ENTRY]
+        assert payload["size_bytes"] == len(target.read_bytes())
+
+    def test_package_json_failure_output_exists_envelope(self, runner, tmp_path):
+        target = tmp_path / "skill.zip"
+        target.write_bytes(b"old")
+        result = self._invoke(runner, "--output", str(target), "--json")
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["error"] is True
+        assert payload["code"] == "OUTPUT_EXISTS"
+        assert "message" in payload
+
+    def test_package_json_failure_missing_source_envelope(self, runner, tmp_path):
+        with (
+            patch.object(skill_module, "get_skill_source_content", return_value=None),
+            patch.object(skill_module, "get_package_version", return_value="1.0.0"),
+        ):
+            result = runner.invoke(
+                cli, ["skill", "package", "--output", str(tmp_path / "skill.zip"), "--json"]
+            )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["error"] is True
+        assert payload["code"] == "SKILL_SOURCE_MISSING"
+
+    def test_package_is_deterministic_across_paths(self, runner, tmp_path):
+        first = tmp_path / "one.zip"
+        second = tmp_path / "two.zip"
+        assert self._invoke(runner, "--output", str(first)).exit_code == 0
+        assert self._invoke(runner, "--output", str(second)).exit_code == 0
+
+        assert first.read_bytes() == second.read_bytes()
+
+    def test_package_long_description_warns_on_stderr_in_json_mode(self, runner, tmp_path):
+        long_source = f"---\nname: notebooklm\ndescription: {'x' * 1100}\n---\n# Body"
+        target = tmp_path / "skill.zip"
+        result = self._invoke(runner, "--output", str(target), "--json", source=long_source)
+
+        assert result.exit_code == 0, result.output
+        json.loads(result.stdout)  # stdout stays pure JSON
+        assert "1100 characters" in result.stderr
+
+    def test_package_short_description_does_not_warn(self, runner, tmp_path):
+        target = tmp_path / "skill.zip"
+        result = self._invoke(runner, "--output", str(target), "--json")
+
+        assert result.exit_code == 0, result.output
+        assert result.stderr == ""
+
+    def test_atomic_write_bytes_uses_shared_replace_helper(self, tmp_path, monkeypatch):
+        """Binary skill writes share the Windows transient-retry replace helper."""
+        calls: list[tuple[Path, Path]] = []
+
+        def fake_replace(temp_path: Path, path: Path) -> None:
+            calls.append((temp_path, path))
+            temp_path.replace(path)
+
+        monkeypatch.setattr(skill_module, "replace_file_atomically", fake_replace)
+        target = tmp_path / "skills" / "archive.zip"
+
+        skill_module.atomic_write_bytes(target, b"content")
+
+        assert target.read_bytes() == b"content"
+        assert len(calls) == 1
+        assert calls[0][1] == target
+
+    def test_package_write_failure_emits_envelope(self, runner, tmp_path, monkeypatch):
+        """An OSError from the archive write surfaces as WRITE_FAILED, not a traceback."""
+
+        def boom(path: Path, data: bytes) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(skill_module, "atomic_write_bytes", boom)
+        result = self._invoke(runner, "--output", str(tmp_path / "skill.zip"), "--json")
+
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["error"] is True
+        assert payload["code"] == "WRITE_FAILED"
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+
+    def test_package_trailing_slash_directory_intent(self, runner, tmp_path):
+        """A nonexistent --output ending in a separator creates the directory and
+        writes the default filename inside it (Path would silently drop the slash)."""
+        result = self._invoke(runner, "--output", str(tmp_path / "newdir") + "/")
+
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "newdir" / skill_module.DEFAULT_ARCHIVE_FILENAME).exists()

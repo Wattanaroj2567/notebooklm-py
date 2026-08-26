@@ -6,10 +6,10 @@ This guardrail prevents help-text drift: when a new subcommand is added to a
 block. Without this test, contributors could silently land a new subcommand
 that ``--help`` users would never discover from the group's overview.
 
-Coverage scope: the four CLI groups whose docstrings explicitly list their
-subcommands as a discoverability aid (``source``, ``artifact``, ``note``,
-``download``). Other groups (``profile``, ``share``, ``research``, etc.) rely
-on Click's auto-generated subcommand table and are not in scope here.
+Coverage scope: the three CLI groups whose docstrings explicitly list their
+subcommands as a discoverability aid (``source``, ``artifact``, ``note``).
+Other groups (including ``download``, whose commands are registry-generated)
+rely on Click's auto-generated subcommand table and are not in scope here.
 
 Hidden subcommands: none of the in-scope groups currently mark any subcommand
 ``hidden=True``. If a future contributor adds one, this test will require it
@@ -25,10 +25,9 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from notebooklm.cli.artifact import artifact
-from notebooklm.cli.download import download
-from notebooklm.cli.note import note
-from notebooklm.cli.source import source
+from notebooklm.cli.artifact_cmd import artifact
+from notebooklm.cli.note_cmd import note
+from notebooklm.cli.source_cmd import source
 
 
 @pytest.fixture
@@ -42,7 +41,6 @@ GROUPS: list[tuple[str, click.Group]] = [
     ("source", source),
     ("artifact", artifact),
     ("note", note),
-    ("download", download),
 ]
 
 
@@ -84,7 +82,7 @@ def test_group_help_lists_every_subcommand(
     assert not missing, (
         f"`{group_name} --help` is missing subcommand(s): {missing}. "
         f"Update the group docstring 'Commands:' block in "
-        f"src/notebooklm/cli/{group_name}.py to include them."
+        f"src/notebooklm/cli/{group_name}_cmd.py to include them."
     )
 
 
@@ -110,5 +108,5 @@ def test_group_docstring_lists_every_subcommand(
     assert not missing, (
         f"`{group_name}` group docstring is missing subcommand(s): {missing}. "
         f"Update the docstring 'Commands:' / 'Types:' block in "
-        f"src/notebooklm/cli/{group_name}.py."
+        f"src/notebooklm/cli/{group_name}_cmd.py."
     )

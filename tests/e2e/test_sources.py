@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from notebooklm import Source, SourceStatus
+from notebooklm import Source, SourceGuide, SourceNotFoundError, SourceStatus
 
 from .conftest import requires_auth
 
@@ -30,11 +30,11 @@ class TestSourceOperations:
     @pytest.mark.asyncio
     async def test_add_url_source(self, client, temp_notebook):
         """Test adding a URL source to an owned notebook."""
-        source = await client.sources.add_url(temp_notebook.id, "https://httpbin.org/html")
+        source = await client.sources.add_url(temp_notebook.id, "https://example.com")
         assert isinstance(source, Source)
         assert source.id is not None
         # URL may or may not be returned in response
-        # assert source.url == "https://httpbin.org/html"
+        # assert source.url == "https://example.com"
 
     @pytest.mark.asyncio
     async def test_add_youtube_source(self, client, temp_notebook):
@@ -88,9 +88,10 @@ class TestSourceRetrieval:
 
     @pytest.mark.asyncio
     async def test_get_source_not_found(self, client, read_only_notebook_id):
-        """Test getting a non-existent source returns None."""
-        source = await client.sources.get(read_only_notebook_id, "nonexistent_source_id")
-        assert source is None
+        """Test getting a non-existent source raises SourceNotFoundError."""
+        # v0.8.0: a miss now raises SourceNotFoundError (issue #1247).
+        with pytest.raises(SourceNotFoundError):
+            await client.sources.get(read_only_notebook_id, "nonexistent_source_id")
 
     @pytest.mark.asyncio
     async def test_get_guide(self, client, read_only_notebook_id):
@@ -100,14 +101,14 @@ class TestSourceRetrieval:
             pytest.skip("No sources available for guide")
 
         guide = await client.sources.get_guide(read_only_notebook_id, sources[0].id)
-        # get_guide returns dict with summary and keywords
-        assert isinstance(guide, dict)
-        assert "summary" in guide
-        assert "keywords" in guide
+        # get_guide returns a SourceGuide dataclass (#1209). Use attribute access:
+        # v0.8.0 removed the deprecated dict-subscript MappingCompat bridge
+        # (guide["summary"]) so the dataclass is now attribute-only (#1251).
+        assert isinstance(guide, SourceGuide)
         # Verify values are actually populated (not empty due to parsing bugs)
-        assert guide["summary"], "Expected non-empty summary from source guide"
-        assert isinstance(guide["keywords"], list)
-        assert len(guide["keywords"]) > 0, "Expected non-empty keywords from source guide"
+        assert guide.summary, "Expected non-empty summary from source guide"
+        assert isinstance(guide.keywords, tuple)
+        assert len(guide.keywords) > 0, "Expected non-empty keywords from source guide"
 
 
 @requires_auth
@@ -125,9 +126,9 @@ class TestSourceMutations:
         )
         assert source.id is not None
 
-        # Delete it
+        # Delete it (v0.7.0: returns None, idempotent — issue #1211)
         deleted = await client.sources.delete(temp_notebook.id, source.id)
-        assert deleted is True
+        assert deleted is None
 
         # Verify it's gone
         sources = await client.sources.list(temp_notebook.id)
@@ -138,21 +139,21 @@ class TestSourceMutations:
     async def test_refresh_source(self, client, temp_notebook):
         """Test refreshing a URL source."""
         # Add a URL source
-        source = await client.sources.add_url(temp_notebook.id, "https://httpbin.org/html")
+        source = await client.sources.add_url(temp_notebook.id, "https://example.com")
         assert source.id is not None
 
         # Refresh it
         await asyncio.sleep(2)  # Wait for initial processing
 
         result = await client.sources.refresh(temp_notebook.id, source.id)
-        # refresh() always returns True if successful
-        assert result is True
+        # v0.8.0 (#1290): refresh() returns None on success
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_check_freshness(self, client, temp_notebook):
         """Test checking source freshness."""
         # Add a URL source
-        source = await client.sources.add_url(temp_notebook.id, "https://httpbin.org/html")
+        source = await client.sources.add_url(temp_notebook.id, "https://example.com")
         assert source.id is not None
 
         await asyncio.sleep(2)  # Wait for processing

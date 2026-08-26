@@ -9,8 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+from notebooklm.cli import helpers as helpers_module
+from notebooklm.exceptions import ValidationError
 from notebooklm.notebooklm_cli import cli
 from notebooklm.types import (
+    DriveSourceStatus,
     Source,
     SourceFulltext,
     SourceNotFoundError,
@@ -19,9 +23,52 @@ from notebooklm.types import (
     SourceTimeoutError,
 )
 
-from .conftest import create_mock_client, patch_client_for_module
+from .conftest import (
+    create_mock_client,
+    inject_client,
+    research_start,
+    research_task,
+    source_guide,
+)
 
-source_module = importlib.import_module("notebooklm.cli.source")
+#: Ids/titles copied from the live-captured Drive ``ADD_SOURCE`` response used by
+#: ``tests/unit/test_sources_row_adapter.py::_live_google_docs_row`` (itself taken
+#: verbatim from ``tests/cassettes/sources_add_drive.yaml``). Note the absent
+#: ``url``: a Drive source populates no URL slot, which is why
+#: ``drive_document_id`` is the only handle on it (#2113).
+_DRIVE_FILE_ID = "1oAk_INJHbIPsIh49jgNqj3FESSGHZrzxFY7t05Lvvl0"
+_DRIVE_SOURCE_ID = "ef72c03c-b429-41cb-ae79-8529d35d6d5b"
+
+
+def _drive_source(drive_status: DriveSourceStatus | None) -> Source:
+    """A realistic Google-native Drive source (type code 1, no URL)."""
+    return Source(
+        id=_DRIVE_SOURCE_ID,
+        title="Rubisco Research: Status and Future",
+        url=None,
+        _type_code=1,
+        # Ingestion completed and STAYS complete after the Drive file goes
+        # away — the #2111 trap the Drive axis exists to disambiguate.
+        status=SourceStatus.READY,
+        created_at=datetime(2026, 1, 23, 18, 42),
+        drive_document_id=_DRIVE_FILE_ID,
+        drive_status=drive_status,
+    )
+
+
+def _web_source() -> Source:
+    """A plain web-page source: no Drive claim on any axis."""
+    return Source(
+        id="9f1c2d34-5678-4abc-def0-112233445566",
+        title="Example Page",
+        url="https://example.com",
+        _type_code=5,
+        status=SourceStatus.READY,
+        created_at=datetime(2026, 1, 23, 18, 45),
+    )
+
+
+source_module = importlib.import_module("notebooklm.cli.source_cmd")
 research_import_module = importlib.import_module("notebooklm.cli.research_import")
 
 
@@ -32,7 +79,7 @@ def runner():
 
 @pytest.fixture
 def mock_auth():
-    with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock:
+    with patch.object(helpers_module, "load_auth_from_storage") as mock:
         mock.return_value = {
             "SID": "test",
             "HSID": "test",
@@ -49,90 +96,362 @@ def mock_auth():
 
 
 class TestSourceList:
-    def test_source_list(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[
-                    Source(id="src_1", title="Source One"),
-                ]
+    def test_source_list_composes_cli_service_and_client_boundary(self, runner, mock_auth):
+        """The CLI list path reaches the client-backed source-list service.
+
+        Output assertions alone could pass if the command fabricated a
+        response or bypassed the client. Invoke the real Click command and
+        service pipeline, then verify the client calls that supplied its
+        envelope.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_1", title="Source One", url="https://example.com")]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "list", "-n", "nb_123"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["notebook_id"] == "nb_123"
+        assert payload["count"] == 1
+        assert payload["sources"][0]["id"] == "src_1"
+        mock_client.sources.list.assert_awaited_once_with("nb_123")
+        mock_client.notebooks.get.assert_awaited_once_with("nb_123")
 
-            assert result.exit_code == 0
-            assert "Source One" in result.output or "src_1" in result.output
+    def test_source_list_status_preparing_surfaces_the_orphan(self, runner, mock_auth):
+        """``--status preparing`` finds a row a failed add left behind (#2138).
 
-    def test_source_list_json_output(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[
-                    Source(
-                        id="src_1",
-                        title="Test Source",
-                        url="https://example.com",
-                    ),
-                ]
+        The orphan sits at PREPARING, not ERROR, so before this option the CLI
+        had no way to reach it at all — ``source list`` showed it buried among
+        healthy rows and offered no filter, while the status a caller would
+        reach for (``error``) never matches it.
+
+        The ``count`` must narrow with the rows: the filter runs inside the
+        fetch precisely so the envelope and the listing cannot disagree.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(id="src_ok", title="Good", status=SourceStatus.READY),
+                Source(id="src_orphan", title="probe_excel.xlsx", status=SourceStatus.PREPARING),
+            ]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--status", "preparing", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "list", "-n", "nb_123", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["count"] == 1
+        assert [src["id"] for src in payload["sources"]] == ["src_orphan"]
 
-            assert result.exit_code == 0
+    def test_source_list_status_error_does_not_match_a_preparing_orphan(self, runner, mock_auth):
+        """The other half: ``error`` is where callers look, and it stays empty.
+
+        This is the gap #2138 reports, pinned so it cannot be "fixed" by
+        quietly reclassifying PREPARING as an error state — which would break
+        every genuinely mid-upload row.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(id="src_orphan", title="probe_excel.xlsx", status=SourceStatus.PREPARING)
+            ]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--status", "error", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["count"] == 0
+
+    def test_source_list_rejects_an_unknown_status(self, runner, mock_auth):
+        """``--status`` is constrained to the enum's labels, not free text."""
+        mock_client = create_mock_client()
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--status", "stuck"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code != 0
+        assert "stuck" in result.output
+
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_list(self, runner, mock_auth, output_mode):
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(
+                    id="src_1",
+                    title="Source One",
+                    url="https://example.com",
+                    _type_code=5,
+                ),
+            ]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        args = ["source", "list", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
+
+        assert result.exit_code == 0
+        if output_mode == "text":
+            assert "Sources in nb_123" in result.output
+            assert "src_1" in result.output
+            assert "Source One" in result.output
+        else:
             data = json.loads(result.output)
+            assert list(data) == ["notebook_id", "notebook_title", "sources", "count"]
+            assert data["notebook_id"] == "nb_123"
+            assert data["notebook_title"] == "Test Notebook"
             assert "sources" in data
             assert data["count"] == 1
+            assert list(data["sources"][0]) == [
+                "index",
+                "id",
+                "title",
+                "type",
+                "url",
+                "status",
+                "status_id",
+                "created_at",
+                # The Drive axis is emitted on EVERY row, null on non-Drive
+                # sources, so a jq filter needs no `// empty` guard (#2113/#2111).
+                "drive_document_id",
+                "drive_status",
+                "is_drive_degraded",
+            ]
             assert data["sources"][0]["id"] == "src_1"
+            assert data["sources"][0]["type"] == "web_page"
 
-    def test_source_list_limit_caps_rows(self, runner, mock_auth):
-        """`source list --limit N` returns at most N data rows."""
+    def test_source_list_json_carries_the_drive_axis(self, runner, mock_auth):
+        """``source list --json`` reports Drive identity + health (#2113/#2111).
+
+        Both fields shipped to MCP and REST but were invisible to the CLI,
+        because the CLI row is hand-composed rather than a dataclass dump. The
+        degraded row is the point: ``status`` still reads ``ready`` (ingestion
+        did finish), so without the Drive axis nothing in CLI output says the
+        Drive file is gone.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_drive_source(DriveSourceStatus.DELETED), _web_source()]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        drive_row, web_row = json.loads(result.output)["sources"]
+
+        assert drive_row["status"] == "ready"
+        assert drive_row["drive_document_id"] == _DRIVE_FILE_ID
+        assert drive_row["drive_status"] == "deleted"
+        assert drive_row["is_drive_degraded"] is True
+        # The Drive row carries no URL, so ``drive_document_id`` is the only
+        # thing tying it back to the file it was created from.
+        assert drive_row["url"] is None
+
+        # Non-Drive rows keep the keys with null values (stable row shape).
+        assert web_row["drive_document_id"] is None
+        assert web_row["drive_status"] is None
+        assert web_row["is_drive_degraded"] is False
+
+    def test_source_list_json_keeps_the_file_id_when_no_health_slot_is_sent(
+        self, runner, mock_auth
+    ):
+        """A Drive row with an id but NO health claim keeps its id (#2113).
+
+        This is the only Drive shape this project has actually captured: the
+        row in ``tests/cassettes/sources_add_drive.yaml`` carries a
+        ``documentId`` while its settings block is ``[None, 2]`` — no Drive
+        status slot at all. The two fields decode from structurally unrelated
+        slots, so gating the id on the status would blank #2113's entire reason
+        for existing on the most common real shape while every degraded-row
+        test above stayed green.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[_drive_source(None)])
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        row = json.loads(result.output)["sources"][0]
+        assert row["drive_document_id"] == _DRIVE_FILE_ID
+        # No claim on the health axis — and "no claim" is not "unknown".
+        assert row["drive_status"] is None
+        assert row["is_drive_degraded"] is False
+
+    def test_source_list_table_flags_only_the_degraded_drive_row(self, runner, mock_auth):
+        """The Status cell gains a Drive note ONLY where the two axes disagree.
+
+        Human output must stay readable for the overwhelming majority of
+        sources that are not Drive-backed, so there is no Drive column: a
+        healthy Drive row and a web row render exactly as they did before.
+        """
+
+        # Short ids/titles so the Status cell cannot wrap and split the
+        # annotation across lines on a narrow console.
+        def _short(sid, drive_status):
+            return Source(
+                id=sid,
+                title="Doc",
+                _type_code=1,
+                status=SourceStatus.READY,
+                drive_document_id="1AbC",
+                drive_status=drive_status,
+            )
+
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                _short("src_gone", DriveSourceStatus.DELETED),
+                _short("src_ok", DriveSourceStatus.ACTIVE),
+                Source(id="src_web", title="Page", _type_code=5, status=SourceStatus.READY),
+            ]
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "list", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        # One annotated cell for the deleted Drive file; the healthy Drive row
+        # and the web row leave the Status column untouched.
+        assert result.output.count("(drive: deleted)") == 1
+        assert "(drive: active)" not in result.output
+        assert result.output.count("ready") == 3
+        header = next(
+            line for line in result.output.splitlines() if "Title" in line and "Status" in line
+        )
+        assert "Drive" not in header  # no new column
+
+    def test_source_list_table_never_ellipsizes_the_drive_label(
+        self, runner, mock_auth, narrow_console
+    ):
+        """The longest Drive label survives a narrow terminal intact.
+
+        `ready (drive: gen_ai_access_denied)` is the widest annotation this can
+        produce. Under the Status column's default `overflow="ellipsis"` an
+        80-column table clips it to `gen_ai_acces…`, dropping the one word the
+        annotation exists to carry — so the spec pins `overflow="fold"`. The
+        other table tests run at the autouse 400-column width and cannot see
+        this.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                _drive_source(DriveSourceStatus.GEN_AI_ACCESS_DENIED),
+                _web_source(),
+            ]
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "list", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        # The cell folds over several visual lines, and the other columns sit
+        # between the fragments — so rebuild the Status column (the last cell
+        # of each body row) rather than squashing the whole table.
+        status_column = "".join(
+            line.split("│")[-2].strip()
+            for line in result.output.splitlines()
+            if line.count("│") >= 2
+        )
+        assert "ready (drive: gen_ai_access_denied)".replace(" ", "") in status_column.replace(
+            " ", ""
+        )
+        # Nothing in the folded cell was ellipsized away.
+        assert "…" not in status_column
+
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_list_limit_caps_rows(self, runner, mock_auth, output_mode):
+        """`source list --limit N` returns at most N data rows in both formats."""
         many = [Source(id=f"src_{i:02d}", title=f"Source {i:02d}") for i in range(20)]
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=many)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=many)
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test"))
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "list", "-n", "nb_123", "--limit", "4"])
+        limit = "4" if output_mode == "text" else "2"
+        args = ["source", "list", "-n", "nb_123", "--limit", limit]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 0, result.output
+        assert result.exit_code == 0, result.output
+        if output_mode == "text":
             for i in range(4):
                 assert f"src_{i:02d}" in result.output
             for i in range(4, 20):
                 assert f"src_{i:02d}" not in result.output
-
-    def test_source_list_limit_json_caps_rows(self, runner, mock_auth):
-        """`source list --limit N --json` caps the JSON `sources` array."""
-        many = [Source(id=f"src_{i:02d}", title=f"Source {i:02d}") for i in range(20)]
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=many)
-            mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test"))
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "list", "-n", "nb_123", "--limit", "2", "--json"]
-                )
-
-            assert result.exit_code == 0, result.output
+        else:
             data = json.loads(result.output)
             assert data["count"] == 2
             assert len(data["sources"]) == 2
@@ -147,42 +466,112 @@ class TestSourceList:
         so the title wraps instead, preserving every character.
         """
         long_title = "X" * 200
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_long", title=long_title)]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_long", title=long_title)])
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--no-truncate"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "list", "-n", "nb_123", "--no-truncate"])
+        assert result.exit_code == 0, result.output
+        assert result.output.count("X") >= 200
+        assert "…" not in result.output
 
-            assert result.exit_code == 0, result.output
-            assert result.output.count("X") >= 200
-            assert "…" not in result.output
-
-    def test_source_list_default_truncates_long_title(self, runner, mock_auth):
+    def test_source_list_default_truncates_long_title(self, runner, mock_auth, narrow_console):
         """Default rendering inserts an ellipsis for over-wide titles."""
         long_title = "X" * 200
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_long", title=long_title)]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_long", title=long_title)])
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "list", "-n", "nb_123"], obj=inject_client(mock_client)
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "list", "-n", "nb_123"])
+        assert result.exit_code == 0, result.output
+        assert result.output.count("X") < 200
+        assert "…" in result.output
 
-            assert result.exit_code == 0, result.output
-            assert result.output.count("X") < 200
-            assert "…" in result.output
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_list_label_filter_restricts_to_group(self, runner, mock_auth, output_mode):
+        """`source list --label <id>` returns only the label's sources.
+
+        The filter is injected into the fetch closure so the JSON ``count``/rows
+        match the filtered set (no post-filter desync). Resolution reuses
+        ``client.labels.sources()`` for the membership set.
+        """
+        from notebooklm.types import Label
+
+        all_sources = [
+            Source(id="src_1", title="In Group"),
+            Source(id="src_2", title="Not In Group"),
+        ]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=all_sources)
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test"))
+        mock_client.labels = MagicMock()
+        mock_client.labels.list = AsyncMock(
+            return_value=[Label(id="lblaaa111", name="Papers", source_ids=["src_1"])]
+        )
+        mock_client.labels.sources = AsyncMock(return_value=[all_sources[0]])
+
+        args = ["source", "list", "-n", "nb_123", "--label", "lblaaa111"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
+
+        assert result.exit_code == 0, result.output
+        if output_mode == "json":
+            data = json.loads(result.output)
+            # Envelope key stays "sources"; count + rows match filtered set.
+            assert "sources" in data
+            assert data["count"] == 1
+            assert [s["id"] for s in data["sources"]] == ["src_1"]
+        else:
+            assert "src_1" in result.output
+            assert "src_2" not in result.output
+
+    def test_source_list_label_filter_by_name(self, runner, mock_auth):
+        """`source list --label <name>` resolves the label name before filtering."""
+        from notebooklm.types import Label
+
+        all_sources = [Source(id="src_1", title="In Group"), Source(id="src_2", title="Out")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=all_sources)
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test"))
+        mock_client.labels = MagicMock()
+        mock_client.labels.list = AsyncMock(
+            return_value=[Label(id="lblaaa111", name="Papers", source_ids=["src_1"])]
+        )
+        mock_client.labels.sources = AsyncMock(return_value=[all_sources[0]])
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--label", "Papers", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_client.labels.sources.assert_awaited_once_with("nb_123", "lblaaa111")
+        data = json.loads(result.output)
+        assert [s["id"] for s in data["sources"]] == ["src_1"]
 
 
 # =============================================================================
@@ -191,286 +580,246 @@ class TestSourceList:
 
 
 class TestSourceAdd:
-    def test_source_add_url(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_url = AsyncMock(
-                return_value=Source(
-                    id="src_new",
-                    title="Example",
-                    url="https://example.com",
-                )
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_add_url(self, runner, mock_auth, output_mode):
+        mock_client = create_mock_client()
+        mock_client.sources.add_url = AsyncMock(
+            return_value=Source(
+                id="src_new",
+                title="Example",
+                url="https://example.com",
+                _type_code=5,
             )
-            mock_client_cls.return_value = mock_client
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "add", "https://example.com", "-n", "nb_123"]
-                )
+        args = ["source", "add", "https://example.com", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
+        if output_mode == "json":
+            data = json.loads(result.output)
+            assert data["source"]["id"] == "src_new"
+            assert data["source"]["type"] == "web_page"
 
     def test_source_add_youtube_url(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_url = AsyncMock(
-                return_value=Source(
-                    id="src_yt",
-                    title="YouTube Video",
-                    url="https://youtube.com/watch?v=abc",
-                )
+        mock_client = create_mock_client()
+        mock_client.sources.add_url = AsyncMock(
+            return_value=Source(
+                id="src_yt",
+                title="YouTube Video",
+                url="https://youtube.com/watch?v=abc",
             )
-            mock_client_cls.return_value = mock_client
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "add", "https://youtube.com/watch?v=abc123", "-n", "nb_123"]
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "https://youtube.com/watch?v=abc123", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 0
-            mock_client.sources.add_url.assert_called()
+        assert result.exit_code == 0
+        mock_client.sources.add_url.assert_called()
 
     def test_source_add_text(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="My Text Source")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="My Text Source")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "Some text content", "--type", "text", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", "Some text content", "--type", "text", "-n", "nb_123"],
-                )
-
-            assert result.exit_code == 0
+        assert result.exit_code == 0
 
     def test_source_add_text_with_title(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Custom Title")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Custom Title")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    "My notes",
+                    "--type",
+                    "text",
+                    "--title",
+                    "Custom Title",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        "My notes",
-                        "--type",
-                        "text",
-                        "--title",
-                        "Custom Title",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
-
-            assert result.exit_code == 0
+        assert result.exit_code == 0
 
     def test_source_add_file(self, runner, mock_auth, tmp_path):
         # Create a temp file
         test_file = tmp_path / "test.pdf"
         test_file.write_bytes(b"fake pdf content")
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_file = AsyncMock(
-                return_value=Source(id="src_file", title="test.pdf")
+        mock_client = create_mock_client()
+        mock_client.sources.add_file = AsyncMock(
+            return_value=Source(id="src_file", title="test.pdf")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", str(test_file), "--type", "file", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", str(test_file), "--type", "file", "-n", "nb_123"],
-                )
+        assert result.exit_code == 0
 
-            assert result.exit_code == 0
-
-    def test_source_add_file_with_mime_type_emits_deprecation(self, runner, mock_auth, tmp_path):
-        """``--mime-type`` on the file-source path is a no-op; warn user.
-
-        The Drive path keeps ``--mime-type`` as a live, functional option, so
-        the deprecation echo MUST be gated on ``detected_type == 'file'`` and
-        must not fire on Drive sources. ``add_file`` is called WITHOUT the
-        positional ``mime_type`` so the library-level ``DeprecationWarning``
-        does not double up the signal.
-        """
+    def test_source_add_file_with_mime_type_forwards_to_add_file(self, runner, mock_auth, tmp_path):
+        """``--mime-type`` on the file-source path controls upload content type."""
         test_file = tmp_path / "test.pdf"
         test_file.write_bytes(b"fake pdf content")
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_file = AsyncMock(
-                return_value=Source(id="src_file", title="test.pdf")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_file = AsyncMock(
+            return_value=Source(id="src_file", title="test.pdf")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        str(test_file),
-                        "--type",
-                        "file",
-                        "--mime-type",
-                        "application/pdf",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    str(test_file),
+                    "--type",
+                    "file",
+                    "--mime-type",
+                    "application/pdf",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 0
-        # ``click.echo(..., err=True)`` writes to stderr; Click's ``CliRunner``
-        # mixes stderr into ``result.output`` by default (``mix_stderr=True``).
-        # If the runner fixture is ever switched to ``mix_stderr=False`` this
-        # assertion would silently pass — flip to ``result.stderr`` if so.
-        assert "unused for file sources" in result.output
-        # ``add_file`` must NOT receive the unused mime_type — passing it would
-        # also trip the library-level DeprecationWarning, doubling the noise.
+        assert "unused for file sources" not in result.output
         call_kwargs = mock_client.sources.add_file.call_args.kwargs
         call_args = mock_client.sources.add_file.call_args.args
         assert "mime_type" not in call_kwargs
-        # Positional args: (notebook_id, file_path). The third positional slot
-        # is the deprecated mime_type; the CLI must not fill it.
-        assert len(call_args) == 2
+        assert call_args == ("nb_123", str(test_file.resolve()), "application/pdf")
 
     def test_source_add_file_mime_type_suppressed_by_env(
         self, runner, mock_auth, tmp_path, monkeypatch
     ):
-        """``NOTEBOOKLM_QUIET_DEPRECATIONS=1`` suppresses the file-source notice.
-
-        Keeps CI logs clean for projects that have already migrated off the
-        flag but cannot drop it from a shared invocation overnight.
-        """
+        """Legacy deprecation-suppression env does not disable live MIME forwarding."""
         test_file = tmp_path / "test.pdf"
         test_file.write_bytes(b"fake pdf content")
         monkeypatch.setenv("NOTEBOOKLM_QUIET_DEPRECATIONS", "1")
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_file = AsyncMock(
-                return_value=Source(id="src_file", title="test.pdf")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_file = AsyncMock(
+            return_value=Source(id="src_file", title="test.pdf")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        str(test_file),
-                        "--type",
-                        "file",
-                        "--mime-type",
-                        "application/pdf",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    str(test_file),
+                    "--type",
+                    "file",
+                    "--mime-type",
+                    "application/pdf",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 0
         assert "unused for file sources" not in result.output
-
-    def test_source_add_json_output(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_url = AsyncMock(
-                return_value=Source(
-                    id="src_new",
-                    title="Example",
-                    url="https://example.com",
-                )
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "add", "https://example.com", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 0
-            data = json.loads(result.output)
-            assert data["source"]["id"] == "src_new"
+        call_args = mock_client.sources.add_file.call_args.args
+        assert call_args == ("nb_123", str(test_file.resolve()), "application/pdf")
 
     def test_source_add_timeout_flag_threaded_to_client(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_url = AsyncMock(
-                return_value=Source(id="src_t", title="X", url="https://example.com")
+        client_calls: list = []
+        mock_client = create_mock_client()
+        mock_client.sources.add_url = AsyncMock(
+            return_value=Source(id="src_t", title="X", url="https://example.com")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    "https://example.com",
+                    "-n",
+                    "nb_123",
+                    "--timeout",
+                    "120",
+                ],
+                obj=inject_client(mock_client, recorder=client_calls),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        "https://example.com",
-                        "-n",
-                        "nb_123",
-                        "--timeout",
-                        "120",
-                    ],
-                )
-
-            assert result.exit_code == 0
-            assert mock_client_cls.call_args.kwargs["timeout"] == 120.0
+        assert result.exit_code == 0
+        assert client_calls[-1][1]["timeout"] == 120.0
 
     def test_source_add_default_does_not_override_client_timeout(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_url = AsyncMock(
-                return_value=Source(id="src_d", title="Y", url="https://example.com")
+        client_calls: list = []
+        mock_client = create_mock_client()
+        mock_client.sources.add_url = AsyncMock(
+            return_value=Source(id="src_d", title="Y", url="https://example.com")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "https://example.com", "-n", "nb_123"],
+                obj=inject_client(mock_client, recorder=client_calls),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "add", "https://example.com", "-n", "nb_123"]
-                )
-
-            assert result.exit_code == 0
-            assert "timeout" not in mock_client_cls.call_args.kwargs
+        assert result.exit_code == 0
+        assert "timeout" not in client_calls[-1][1]
 
 
 # =============================================================================
@@ -480,155 +829,257 @@ class TestSourceAdd:
 
 class TestSourceGet:
     def test_source_get(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list for resolve_source_id
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        # Mock sources.list for resolve_source_id
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_or_none = AsyncMock(
+            return_value=Source(
+                id="src_123",
+                title="Test Source",
+                url="https://example.com",
+                created_at=datetime(2024, 1, 1),
             )
-            mock_client.sources.get = AsyncMock(
-                return_value=Source(
-                    id="src_123",
-                    title="Test Source",
-                    url="https://example.com",
-                    created_at=datetime(2024, 1, 1),
-                )
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "get", "src_123", "-n", "nb_123"], obj=inject_client(mock_client)
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "get", "src_123", "-n", "nb_123"])
+        assert result.exit_code == 0
+        assert "Test Source" in result.output
+        assert "src_123" in result.output
 
-            assert result.exit_code == 0
-            assert "Test Source" in result.output
-            assert "src_123" in result.output
+    @pytest.mark.parametrize(
+        ("drive_status", "expected_label", "expect_stale_warning"),
+        [
+            (DriveSourceStatus.DELETED, "deleted", True),
+            (DriveSourceStatus.ACTIVE, "active", False),
+        ],
+    )
+    def test_source_get_text_reports_drive_file_and_status(
+        self, runner, mock_auth, drive_status, expected_label, expect_stale_warning
+    ):
+        """Text ``source get`` shows the Drive file id and its health.
+
+        A Drive source has no URL, so before this the text output had nothing
+        tying the row to its Drive file (#2113), and nothing at all about a
+        file that was deleted after ingestion completed (#2111).
+        """
+        drive = _drive_source(drive_status)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert f"Drive File ID: {_DRIVE_FILE_ID}" in output
+        assert f"Drive Status: {expected_label}" in output
+        # Only the degraded row earns the "may be stale" caveat.
+        # Status-neutral wording: a degraded Drive file can sit on a source
+        # that is still processing, so this must not claim ingestion finished.
+        assert ("may be stale" in output) is expect_stale_warning
+        assert "ingestion finished" not in output
+        # And it must not point at a "Status above" line — this view prints no
+        # ingestion status at all.
+        assert "Status above" not in output
+        assert "Status:" not in output.replace("Drive Status:", "")
+
+    def test_source_get_text_shows_the_file_id_when_no_health_slot_is_sent(self, runner, mock_auth):
+        """The captured Drive row — id present, health slot absent — still shows its id.
+
+        The two lines are gated independently; this pins that. Hoisting the
+        Drive-status guard above the file-id line would blank #2113 on the only
+        Drive shape this project has ever captured, and every degraded-row test
+        would stay green.
+        """
+        drive = _drive_source(None)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert f"Drive File ID: {_DRIVE_FILE_ID}" in output
+        # No health claim -> no status line at all (not "unknown", not blank).
+        assert "Drive Status" not in output
+
+    def test_source_get_text_omits_drive_lines_for_a_non_drive_source(self, runner, mock_auth):
+        """A web source's text output is unchanged — no empty Drive lines."""
+        web = _web_source()
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[web])
+        mock_client.sources.get_or_none = AsyncMock(return_value=web)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "get", web.id, "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Drive" not in result.output
 
     def test_source_get_not_found(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list to return empty (no match for resolve_source_id)
-            mock_client.sources.list = AsyncMock(return_value=[])
-            mock_client.sources.get = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        # Mock sources.list to return empty (no match for resolve_source_id)
+        mock_client.sources.list = AsyncMock(return_value=[])
+        mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "get", "nonexistent", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", "nonexistent", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
-            # Now exits with error from resolve_source_id (no match)
-            assert result.exit_code == 1
-            assert "No source found" in result.output
+        # Now exits with error from resolve_source_id (no match)
+        assert result.exit_code == 1
+        assert "No source found" in result.output
 
     # -------------------------------------------------------------------------
     # get-on-not-found now exits 1 (was 0). The tests below
     # cover BOTH code paths for the not-found branch:
     #
-    #   * Path A: input ID is ≥20 chars, so ``_resolve_partial_id`` skips the
-    #     list() round-trip (helpers.py:783-785) and returns the input as-is.
-    #     The backend ``client.sources.get`` then returns ``None``.
-    #   * Path B: input ID is <20 chars, ``_resolve_partial_id`` resolves it via
-    #     a list() match (so the partial-resolve "not found" ClickException
-    #     branch is intentionally NOT exercised here — that path is unchanged
-    #     and tested by ``test_source_get_not_found`` above), but the backend
-    #     get returns ``None`` (e.g. concurrent delete from another session).
+    #   * Path A: input ID matches ``FULL_ID_PATTERN`` (canonical 36-char UUID
+    #     in 8-4-4-4-12 layout), so ``_resolve_partial_id`` skips the list()
+    #     round-trip and returns the input as-is. The backend
+    #     ``client.sources.get`` then returns ``None``.
+    #   * Path B: input ID is NOT UUID-shaped, ``_resolve_partial_id`` resolves
+    #     it via a list() match (so the partial-resolve "not found"
+    #     ClickException branch is intentionally NOT exercised here — that
+    #     path is unchanged and tested by ``test_source_get_not_found``
+    #     above), but the backend get returns ``None`` (e.g. concurrent
+    #     delete from another session).
     #
     # Each path is exercised in text and ``--json`` mode.
     # -------------------------------------------------------------------------
 
     def test_source_get_not_found_pathA_long_id_text_exits_1(self, runner, mock_auth):
-        """Path A: ID ≥20 chars skips partial-resolve; backend None → exit 1."""
-        long_id = "a" * 24  # ≥20 chars triggers the skip in _resolve_partial_id
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # list() must NOT be called on this path; assert below.
-            mock_client.sources.list = AsyncMock(return_value=[])
-            mock_client.sources.get = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
+        """Path A: UUID-shaped ID skips partial-resolve; backend None → exit 1."""
+        # Canonical 36-char UUID — matches the resolver's full-ID fast-path so
+        # sources.list is bypassed and the backend ``get`` is hit directly.
+        long_id = "abc12345-6789-4abc-def0-1234567890ab"
+        mock_client = create_mock_client()
+        # list() must NOT be called on this path; assert below.
+        mock_client.sources.list = AsyncMock(return_value=[])
+        mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "get", long_id, "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "get", long_id, "-n", "nb_123"], obj=inject_client(mock_client)
+            )
 
-            assert result.exit_code == 1, result.output
-            assert "Source not found" in result.output
-            mock_client.sources.list.assert_not_called()
+        assert result.exit_code == 1, result.output
+        assert "Source not found" in result.output
+        mock_client.sources.list.assert_not_called()
 
     def test_source_get_not_found_pathA_long_id_json_exits_1(self, runner, mock_auth):
         """Path A under ``--json``: typed JSON error doc + exit 1."""
-        long_id = "a" * 24
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=[])
-            mock_client.sources.get = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
+        long_id = "abc12345-6789-4abc-def0-1234567890ab"
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[])
+        mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "get", long_id, "-n", "nb_123", "--json"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", long_id, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 1, result.output
-            data = json.loads(result.output)
-            assert data["error"] is True
-            assert data["code"] == "NOT_FOUND"
-            assert "Source not found" in data["message"]
-            assert data["source_id"] == long_id
-            mock_client.sources.list.assert_not_called()
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "NOT_FOUND"
+        assert "Source not found" in data["message"]
+        assert data["source_id"] == long_id
+        mock_client.sources.list.assert_not_called()
 
     def test_source_get_not_found_pathB_resolved_then_none_text_exits_1(self, runner, mock_auth):
         """Path B: partial-resolve succeeds, backend get() returns None → exit 1."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Resolution succeeds (list contains a matching item) but the
-            # subsequent get() returns None (race: source deleted between
-            # list and get).
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_resolved", title="Doomed")]
+        mock_client = create_mock_client()
+        # Resolution succeeds (list contains a matching item) but the
+        # subsequent get() returns None (race: source deleted between
+        # list and get).
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_resolved", title="Doomed")]
+        )
+        mock_client.sources.get_or_none = AsyncMock(return_value=None)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", "src_resolved", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.get = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "get", "src_resolved", "-n", "nb_123"])
-
-            assert result.exit_code == 1, result.output
-            assert "Source not found" in result.output
+        assert result.exit_code == 1, result.output
+        assert "Source not found" in result.output
 
     def test_source_get_not_found_pathB_resolved_then_none_json_exits_1(self, runner, mock_auth):
         """Path B under ``--json``: typed JSON error doc + exit 1."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_resolved", title="Doomed")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_resolved", title="Doomed")]
+        )
+        mock_client.sources.get_or_none = AsyncMock(return_value=None)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", "src_resolved", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.get = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "get", "src_resolved", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 1, result.output
-            data = json.loads(result.output)
-            assert data["error"] is True
-            assert data["code"] == "NOT_FOUND"
-            assert "Source not found" in data["message"]
-            assert data["source_id"] == "src_resolved"
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "NOT_FOUND"
+        assert "Source not found" in data["message"]
+        assert data["source_id"] == "src_resolved"
 
 
 # =============================================================================
@@ -638,238 +1089,272 @@ class TestSourceGet:
 
 class TestSourceDelete:
     def test_source_delete(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list for source delete resolution
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        # Mock sources.list for source delete resolution
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "src_123", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "delete", "src_123", "-n", "nb_123", "-y"])
+        assert result.exit_code == 0
+        assert "Deleted source" in result.output
+        mock_client.sources.delete.assert_called_once_with("nb_123", "src_123")
 
-            assert result.exit_code == 0
-            assert "Deleted source" in result.output
-            mock_client.sources.delete.assert_called_once_with("nb_123", "src_123")
+    def test_source_delete_cancelled(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "src_123", "-n", "nb_123"],
+                input="n\n",
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0
+        assert "Delete source src_123?" in result.output
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_delete_failure(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list for source delete resolution
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        """A real delete failure now raises (v0.7.0): delete() returns None and
+        propagates RPC/transport errors instead of signalling failure via a
+        falsy return (issue #1211)."""
+        from notebooklm.exceptions import RPCError
+
+        mock_client = create_mock_client()
+        # Mock sources.list for source delete resolution
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(side_effect=RPCError("delete blew up"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "src_123", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "delete", "src_123", "-n", "nb_123", "-y"])
-
-            assert result.exit_code == 0
-            assert "Delete may have failed" in result.output
+        assert result.exit_code == 1
 
     def test_source_delete_full_uuid_skips_source_list(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock()
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock()
+        mock_client.sources.delete = AsyncMock(return_value=True)
 
-            source_id = "03abe51c-d8df-43ba-ae2d-0efe02c71c4a"
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "delete", source_id, "-n", "nb_123", "-y"])
+        source_id = "03abe51c-d8df-43ba-ae2d-0efe02c71c4a"
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", source_id, "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 0
-            mock_client.sources.list.assert_not_called()
-            mock_client.sources.delete.assert_called_once_with("nb_123", source_id)
+        assert result.exit_code == 0
+        mock_client.sources.list.assert_not_called()
+        mock_client.sources.delete.assert_called_once_with("nb_123", source_id)
 
     def test_source_delete_long_hex_string_does_not_skip_source_list(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=[])
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[])
+        mock_client.sources.delete = AsyncMock(return_value=True)
 
-            source_id = "03abe51cd8df43baae2d0efe02c71c4a"
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "delete", source_id, "-n", "nb_123", "-y"])
+        source_id = "03abe51cd8df43baae2d0efe02c71c4a"
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", source_id, "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 1
-            mock_client.sources.list.assert_called_once_with("nb_123")
-            mock_client.sources.delete.assert_not_called()
+        assert result.exit_code == 1
+        mock_client.sources.list.assert_called_once_with("nb_123")
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_delete_title_suggests_delete_by_title(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[
-                    Source(
-                        id="03abe51c-d8df-43ba-ae2d-0efe02c71c4a",
-                        title="Emails_Verzonden_2026_02",
-                    )
-                ]
-            )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "delete", "Emails_Verzonden_2026_02", "-n", "nb_123", "-y"]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(
+                    id="03abe51c-d8df-43ba-ae2d-0efe02c71c4a",
+                    title="Emails_Verzonden_2026_02",
                 )
+            ]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
 
-            assert result.exit_code == 1
-            assert "delete-by-title" in result.output
-            mock_client.sources.delete.assert_not_called()
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "Emails_Verzonden_2026_02", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 1
+        assert "delete-by-title" in result.output
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_delete_unknown_long_string_fails_locally(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "Emails_Verzonden_2025-Q1.txt", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "delete", "Emails_Verzonden_2025-Q1.txt", "-n", "nb_123", "-y"],
-                )
-
-            assert result.exit_code == 1
-            assert "No source found starting with" in result.output
-            mock_client.sources.delete.assert_not_called()
+        assert result.exit_code == 1
+        assert "No source found starting with" in result.output
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_delete_ambiguous_partial_id(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[
-                    Source(id="src_123", title="First Source"),
-                    Source(id="src_456", title="Second Source"),
-                ]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(id="src_123", title="First Source"),
+                Source(id="src_456", title="Second Source"),
+            ]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "src", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "delete", "src", "-n", "nb_123", "-y"])
-
-            assert result.exit_code == 1
-            assert "Ambiguous ID 'src' matches 2 sources" in result.output
-            mock_client.sources.delete.assert_not_called()
+        assert result.exit_code == 1
+        assert "Ambiguous ID 'src' matches 2 sources" in result.output
+        mock_client.sources.delete.assert_not_called()
 
 
 class TestSourceDeleteByTitle:
     def test_source_delete_by_title(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete-by-title", "Test Source", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "delete-by-title", "Test Source", "-n", "nb_123", "-y"]
-                )
-
-            assert result.exit_code == 0
-            assert "Deleted source" in result.output
-            mock_client.sources.delete.assert_called_once_with("nb_123", "src_123")
+        assert result.exit_code == 0
+        assert "Deleted source" in result.output
+        mock_client.sources.delete.assert_called_once_with("nb_123", "src_123")
 
     def test_source_delete_by_title_duplicate_titles(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[
-                    Source(id="src_123", title="Duplicate"),
-                    Source(id="src_456", title="Duplicate"),
-                ]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(id="src_123", title="Duplicate"),
+                Source(id="src_456", title="Duplicate"),
+            ]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete-by-title", "Duplicate", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "delete-by-title", "Duplicate", "-n", "nb_123", "-y"]
-                )
-
-            assert result.exit_code == 1
-            assert "Delete by ID instead" in result.output
-            mock_client.sources.delete.assert_not_called()
+        assert result.exit_code == 1
+        assert "Delete by ID instead" in result.output
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_delete_by_title_not_found(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=[])
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[])
+        mock_client.sources.delete = AsyncMock(return_value=True)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "delete-by-title", "Missing", "-n", "nb_123", "-y"]
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete-by-title", "Missing", "-n", "nb_123", "-y"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 1
-            assert "No source found with title" in result.output
-            mock_client.sources.delete.assert_not_called()
+        assert result.exit_code == 1
+        assert "No source found with title" in result.output
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_delete_by_title_confirmation_shows_title_and_id(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "delete-by-title", "Test Source", "-n", "nb_123"],
+                input="y\n",
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "delete-by-title", "Test Source", "-n", "nb_123"],
-                    input="y\n",
-                )
-
-            assert result.exit_code == 0
-            assert "Delete source 'Test Source' (src_123)?" in result.output
-            mock_client.sources.delete.assert_called_once_with("nb_123", "src_123")
+        assert result.exit_code == 0
+        assert "Delete source 'Test Source' (src_123)?" in result.output
+        mock_client.sources.delete.assert_called_once_with("nb_123", "src_123")
 
 
 # =============================================================================
@@ -879,28 +1364,24 @@ class TestSourceDeleteByTitle:
 
 class TestSourceRename:
     def test_source_rename(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list for resolve_source_id
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Old Title")]
-            )
-            mock_client.sources.rename = AsyncMock(
-                return_value=Source(id="src_123", title="New Title")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        # Mock sources.list for resolve_source_id
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Old Title")])
+        mock_client.sources.rename = AsyncMock(return_value=Source(id="src_123", title="New Title"))
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "rename", "src_123", "New Title", "-n", "nb_123"]
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "rename", "src_123", "New Title", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 0
-            assert "Renamed source" in result.output
-            assert "New Title" in result.output
+        assert result.exit_code == 0
+        assert "Renamed source" in result.output
+        assert "New Title" in result.output
 
 
 # =============================================================================
@@ -910,44 +1391,51 @@ class TestSourceRename:
 
 class TestSourceRefresh:
     def test_source_refresh(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list for resolve_source_id
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Original Source")]
+        mock_client = create_mock_client()
+        # Mock sources.list for resolve_source_id
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Original Source")]
+        )
+        mock_client.sources.refresh = AsyncMock(
+            return_value=Source(id="src_123", title="Refreshed Source")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "refresh", "src_123", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.refresh = AsyncMock(
-                return_value=Source(id="src_123", title="Refreshed Source")
+
+        assert result.exit_code == 0
+        assert "Source refreshed" in result.output
+
+    def test_source_refresh_none_prints_refreshed(self, runner, mock_auth):
+        # v0.8.0 (#1290): refresh() returns None on success; the CLI must still
+        # render "Source refreshed", not "no result".
+        mock_client = create_mock_client()
+        # Mock sources.list for resolve_source_id
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Original Source")]
+        )
+        mock_client.sources.refresh = AsyncMock(return_value=None)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "refresh", "src_123", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "refresh", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0
-            assert "Source refreshed" in result.output
-
-    def test_source_refresh_no_result(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            # Mock sources.list for resolve_source_id
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Original Source")]
-            )
-            mock_client.sources.refresh = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "refresh", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0
-            assert "Refresh returned no result" in result.output
+        assert result.exit_code == 0
+        assert "Source refreshed" in result.output
+        assert "no result" not in result.output
 
 
 # =============================================================================
@@ -957,57 +1445,69 @@ class TestSourceRefresh:
 
 class TestSourceAddDrive:
     def test_source_add_drive_google_doc(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_drive = AsyncMock(
-                return_value=Source(
-                    id="src_drive",
-                    title="My Google Doc",
-                )
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive = AsyncMock(
+            return_value=Source(
+                id="src_drive",
+                title="My Google Doc",
             )
-            mock_client_cls.return_value = mock_client
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "add-drive", "drive_file_id", "My Google Doc", "-n", "nb_123"]
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add-drive", "drive_file_id", "My Google Doc", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 0
-            assert "Added Drive source" in result.output
+        assert result.exit_code == 0
+        assert "Added Drive source" in result.output
 
     def test_source_add_drive_pdf(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_drive = AsyncMock(
-                return_value=Source(
-                    id="src_drive",
-                    title="PDF from Drive",
-                )
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive = AsyncMock(
+            return_value=Source(
+                id="src_drive",
+                title="PDF from Drive",
             )
-            mock_client_cls.return_value = mock_client
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add-drive",
-                        "file_id",
-                        "PDF Title",
-                        "--mime-type",
-                        "pdf",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add-drive",
+                    "file_id",
+                    "PDF Title",
+                    "--mime-type",
+                    "pdf",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
+
+    def test_source_add_drive_unsupported_mime_hints_upload(self, runner, mock_auth):
+        """An unsupported Drive mime (e.g. ``epub``) is rejected at the CLI boundary
+        with the file-upload hint, not a bare Click choice error (#1827)."""
+        result = runner.invoke(
+            cli,
+            ["source", "add-drive", "file_id", "Book", "--mime-type", "epub", "-n", "nb_123"],
+        )
+        assert result.exit_code == 2
+        out = result.output.lower()
+        assert "not importable via drive" in out
+        assert "download" in out
+        assert "file" in out
 
     def test_source_add_drive_mime_type_no_deprecation_warning(self, runner, mock_auth):
         """Regression guard: Drive ``--mime-type`` MUST stay deprecation-free.
@@ -1019,36 +1519,112 @@ class TestSourceAddDrive:
         picks.
         """
         for choice in ("google-doc", "google-slides", "google-sheets", "pdf"):
-            with patch_client_for_module("source") as mock_client_cls:
-                mock_client = create_mock_client()
-                mock_client.sources.add_drive = AsyncMock(
-                    return_value=Source(id="src_drive", title="My Drive Source")
-                )
-                mock_client_cls.return_value = mock_client
+            mock_client = create_mock_client()
+            mock_client.sources.add_drive = AsyncMock(
+                return_value=Source(id="src_drive", title="My Drive Source")
+            )
 
-                with patch(
-                    "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-                ) as mock_fetch:
-                    mock_fetch.return_value = ("csrf", "session")
-                    result = runner.invoke(
-                        cli,
-                        [
-                            "source",
-                            "add-drive",
-                            "file_id",
-                            "Drive Title",
-                            "--mime-type",
-                            choice,
-                            "-n",
-                            "nb_123",
-                        ],
-                    )
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(
+                    cli,
+                    [
+                        "source",
+                        "add-drive",
+                        "file_id",
+                        "Drive Title",
+                        "--mime-type",
+                        choice,
+                        "-n",
+                        "nb_123",
+                    ],
+                    obj=inject_client(mock_client),
+                )
 
             assert result.exit_code == 0, f"Drive --mime-type {choice} failed: {result.output}"
             assert "unused for file sources" not in result.output, (
                 f"Drive --mime-type={choice} unexpectedly triggered the "
                 f"file-source deprecation notice"
             )
+
+
+class TestSourceAddDriveFile:
+    """The ``source add-drive-file`` command (#1884) — auto-route upload-only types."""
+
+    def test_happy_path_text(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive_file = AsyncMock(
+            return_value=Source(id="src_epub", title="Book.epub", _type_code=17)
+        )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add-drive-file", "drive_epub_id", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+        assert result.exit_code == 0, result.output
+        assert "Added Drive file source" in result.output
+        mock_client.sources.add_drive_file.assert_awaited_once_with(
+            "nb_123", "drive_epub_id", title=None, wait=False, wait_timeout=120.0
+        )
+
+    def test_json_envelope(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive_file = AsyncMock(
+            return_value=Source(id="src_epub", title="Book.epub", _type_code=17)
+        )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add-drive-file",
+                    "drive_epub_id",
+                    "--title",
+                    "My Book",
+                    "-n",
+                    "nb_123",
+                    "--json",
+                ],
+                obj=inject_client(mock_client),
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "add-drive-file"
+        assert data["source"]["id"] == "src_epub"
+        assert data["source"]["type"] == "epub"
+        assert data["document_id"] == "drive_epub_id"
+        assert data["notebook_id"] == "nb_123"
+        mock_client.sources.add_drive_file.assert_awaited_once_with(
+            "nb_123", "drive_epub_id", title="My Book", wait=False, wait_timeout=120.0
+        )
+
+    def test_unsupported_type_error_exits_nonzero(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive_file = AsyncMock(
+            side_effect=ValidationError(
+                "HTML isn't supported by NotebookLM upload; convert to .txt/.md/.pdf first."
+            )
+        )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add-drive-file", "drive_html_id", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+        assert result.exit_code != 0
+        assert "HTML" in result.output or "html" in result.output
 
 
 # =============================================================================
@@ -1059,26 +1635,28 @@ class TestSourceAddDrive:
 class TestSourceAddResearch:
     def test_add_research_with_import_all_uses_retry_helper(self, runner, mock_auth):
         with (
-            patch_client_for_module("source") as mock_client_cls,
             patch.object(
                 research_import_module, "import_with_retry", new_callable=AsyncMock
             ) as mock_import,
         ):
             mock_client = create_mock_client()
-            mock_client.research.start = AsyncMock(return_value={"task_id": "task_123"})
+            mock_client.research.start = AsyncMock(
+                return_value=research_start({"task_id": "task_123"})
+            )
             mock_client.research.poll = AsyncMock(
-                return_value={
-                    "status": "completed",
-                    "task_id": "task_123",
-                    "sources": [{"title": "Source 1", "url": "http://example.com"}],
-                    "report": "# Report",
-                }
+                return_value=research_task(
+                    {
+                        "status": "completed",
+                        "task_id": "task_123",
+                        "sources": [{"title": "Source 1", "url": "http://example.com"}],
+                        "report": "# Report",
+                    }
+                )
             )
             mock_import.return_value = [{"id": "src_1", "title": "Source 1"}]
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1093,6 +1671,7 @@ class TestSourceAddResearch:
                         "-n",
                         "nb_123",
                     ],
+                    obj=inject_client(mock_client),
                 )
 
         assert result.exit_code == 0
@@ -1101,35 +1680,37 @@ class TestSourceAddResearch:
             mock_client,
             "nb_123",
             "task_123",
-            [{"title": "Source 1", "url": "http://example.com"}],
+            [{"url": "http://example.com", "title": "Source 1", "result_type": 1}],
             max_elapsed=1800,
         )
 
     def test_add_research_with_import_all_cited_only(self, runner, mock_auth):
         with (
-            patch_client_for_module("source") as mock_client_cls,
             patch.object(
                 research_import_module, "import_with_retry", new_callable=AsyncMock
             ) as mock_import,
         ):
             mock_client = create_mock_client()
-            mock_client.research.start = AsyncMock(return_value={"task_id": "task_123"})
+            mock_client.research.start = AsyncMock(
+                return_value=research_start({"task_id": "task_123"})
+            )
             mock_client.research.poll = AsyncMock(
-                return_value={
-                    "status": "completed",
-                    "task_id": "task_123",
-                    "sources": [
-                        {"title": "Cited", "url": "https://example.com/cited"},
-                        {"title": "Uncited", "url": "https://example.com/uncited"},
-                    ],
-                    "report": "Report cites https://example.com/cited",
-                }
+                return_value=research_task(
+                    {
+                        "status": "completed",
+                        "task_id": "task_123",
+                        "sources": [
+                            {"title": "Cited", "url": "https://example.com/cited"},
+                            {"title": "Uncited", "url": "https://example.com/uncited"},
+                        ],
+                        "report": "Report cites https://example.com/cited",
+                    }
+                )
             )
             mock_import.return_value = [{"id": "src_1", "title": "Cited"}]
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1143,6 +1724,7 @@ class TestSourceAddResearch:
                         "-n",
                         "nb_123",
                     ],
+                    obj=inject_client(mock_client),
                 )
 
         assert result.exit_code == 0
@@ -1151,7 +1733,7 @@ class TestSourceAddResearch:
             mock_client,
             "nb_123",
             "task_123",
-            [{"title": "Cited", "url": "https://example.com/cited"}],
+            [{"url": "https://example.com/cited", "title": "Cited", "result_type": 1}],
             max_elapsed=1800,
         )
 
@@ -1169,26 +1751,28 @@ class TestSourceAddResearch:
 
     def test_add_research_timeout_flag_threaded_to_import_with_retry(self, runner, mock_auth):
         with (
-            patch_client_for_module("source") as mock_client_cls,
             patch.object(
                 research_import_module, "import_with_retry", new_callable=AsyncMock
             ) as mock_import,
         ):
             mock_client = create_mock_client()
-            mock_client.research.start = AsyncMock(return_value={"task_id": "task_t1"})
+            mock_client.research.start = AsyncMock(
+                return_value=research_start({"task_id": "task_t1"})
+            )
             mock_client.research.poll = AsyncMock(
-                return_value={
-                    "status": "completed",
-                    "task_id": "task_t1",
-                    "sources": [{"title": "S", "url": "http://example.com"}],
-                    "report": "",
-                }
+                return_value=research_task(
+                    {
+                        "status": "completed",
+                        "task_id": "task_t1",
+                        "sources": [{"title": "S", "url": "http://example.com"}],
+                        "report": "",
+                    }
+                )
             )
             mock_import.return_value = [{"id": "src_t1", "title": "S"}]
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1203,10 +1787,157 @@ class TestSourceAddResearch:
                         "-n",
                         "nb_123",
                     ],
+                    obj=inject_client(mock_client),
                 )
 
         assert result.exit_code == 0
         assert mock_import.await_args.kwargs["max_elapsed"] == 600
+
+    def test_add_research_poll_budget_respects_timeout(self, runner, mock_auth):
+        """Regression for #315: deep research that completes after the legacy
+        hardcoded 300 s poll cap must still trigger ``IMPORT_RESEARCH`` when
+        the caller bumps ``--timeout``.
+
+        Before the fix the poll loop was ``for _ in range(60)`` with a fixed
+        5 s interval, so deep-research tasks running longer than 5 minutes
+        timed out and the import branch was skipped entirely — leaving the
+        web UI's "Add sources?" modal hanging open server-side."""
+        in_progress = research_task(
+            {
+                "status": "in_progress",
+                "task_id": "task_long",
+                "sources": [],
+            }
+        )
+        completed = research_task(
+            {
+                "status": "completed",
+                "task_id": "task_long",
+                "sources": [{"title": "S", "url": "http://example.com"}],
+                "report": "",
+            }
+        )
+        # 70 in-progress polls before completion — past the legacy 60-cap,
+        # well within a 600 s / 5 s budget (=120 polls).
+        poll_responses = [in_progress] * 70 + [completed]
+
+        with (
+            patch.object(
+                research_import_module, "import_with_retry", new_callable=AsyncMock
+            ) as mock_import,
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_client = create_mock_client()
+            mock_client.research.start = AsyncMock(
+                return_value=research_start({"task_id": "task_long"})
+            )
+            mock_client.research.poll = AsyncMock(side_effect=poll_responses)
+            mock_import.return_value = [{"id": "src_long", "title": "S"}]
+
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(
+                    cli,
+                    [
+                        "source",
+                        "add-research",
+                        "topic",
+                        "--mode",
+                        "deep",
+                        "--import-all",
+                        "--timeout",
+                        "600",
+                        "-n",
+                        "nb_123",
+                    ],
+                    obj=inject_client(mock_client),
+                )
+
+        assert result.exit_code == 0, result.output
+        assert "Imported 1 sources" in result.output
+        mock_import.assert_awaited_once()
+        assert mock_client.research.poll.await_count == 71
+
+    def test_add_research_tolerates_initial_no_research_after_start(self, runner, mock_auth):
+        """NotebookLM can briefly return no_research immediately after START_RESEARCH."""
+        poll_responses = [
+            research_task({"status": "no_research", "tasks": []}),
+            research_task({"status": "in_progress", "task_id": "task_lag", "sources": []}),
+            research_task(
+                {"status": "completed", "task_id": "task_lag", "sources": [], "report": ""}
+            ),
+        ]
+
+        with (
+            patch.object(source_module.asyncio, "sleep", AsyncMock()),
+        ):
+            mock_client = create_mock_client()
+            mock_client.research.start = AsyncMock(
+                return_value=research_start({"task_id": "task_lag"})
+            )
+            mock_client.research.poll = AsyncMock(side_effect=poll_responses)
+
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(
+                    cli,
+                    ["source", "add-research", "topic", "-n", "nb_123"],
+                    obj=inject_client(mock_client),
+                )
+
+        assert result.exit_code == 0, result.output
+        assert mock_client.research.poll.await_count == 3
+
+    def test_add_research_deep_polls_with_report_id(self, runner, mock_auth):
+        """Deep research's poll/import discriminator is START_DEEP_RESEARCH report_id."""
+        with (
+            patch.object(
+                research_import_module, "import_with_retry", new_callable=AsyncMock
+            ) as mock_import,
+        ):
+            mock_client = create_mock_client()
+            mock_client.research.start = AsyncMock(
+                return_value=research_start({"task_id": "start_task", "report_id": "report_task"})
+            )
+            mock_client.research.poll = AsyncMock(
+                return_value=research_task(
+                    {
+                        "status": "completed",
+                        "task_id": "report_task",
+                        "sources": [{"title": "S", "url": "http://example.com"}],
+                        "report": "",
+                    }
+                )
+            )
+            mock_import.return_value = [{"id": "src_report", "title": "S"}]
+
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(
+                    cli,
+                    [
+                        "source",
+                        "add-research",
+                        "topic",
+                        "--mode",
+                        "deep",
+                        "--import-all",
+                        "-n",
+                        "nb_123",
+                    ],
+                    obj=inject_client(mock_client),
+                )
+
+        assert result.exit_code == 0, result.output
+        mock_client.research.poll.assert_awaited_once_with("nb_123", task_id="report_task")
+        mock_import.assert_awaited_once()
+        assert mock_import.await_args.args[2] == "report_task"
 
 
 # =============================================================================
@@ -1220,120 +1951,107 @@ class TestSourceAddResearch:
 
 
 class TestSourceGuide:
-    def test_source_guide_with_summary_and_keywords(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.get_guide = AsyncMock(
-                return_value={
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_guide_with_summary_and_keywords(self, runner, mock_auth, output_mode):
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_guide = AsyncMock(
+            return_value=source_guide(
+                {
                     "summary": "This is a **test** summary about AI.",
                     "keywords": ["AI", "machine learning", "data science"],
                 }
             )
-            mock_client_cls.return_value = mock_client
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "guide", "src_123", "-n", "nb_123"])
+        args = ["source", "guide", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
+        if output_mode == "text":
             assert "Summary" in result.output
             assert "test" in result.output
             assert "Keywords" in result.output
             assert "AI" in result.output
-
-    def test_source_guide_no_guide_available(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.get_guide = AsyncMock(return_value={"summary": "", "keywords": []})
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "guide", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0
-            assert "No guide available" in result.output
-
-    def test_source_guide_json_output(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.get_guide = AsyncMock(
-                return_value={"summary": "Test summary", "keywords": ["keyword1", "keyword2"]}
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "guide", "src_123", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 0
+        else:
             data = json.loads(result.output)
             assert data["source_id"] == "src_123"
-            assert data["summary"] == "Test summary"
-            assert data["keywords"] == ["keyword1", "keyword2"]
+            assert data["summary"] == "This is a **test** summary about AI."
+            assert data["keywords"] == ["AI", "machine learning", "data science"]
+
+    def test_source_guide_no_guide_available(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_guide = AsyncMock(
+            return_value=source_guide({"summary": "", "keywords": []})
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "guide", "src_123", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0
+        assert "No guide available" in result.output
 
     def test_source_guide_summary_only(self, runner, mock_auth):
         """Test that summary is displayed even when keywords are empty."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.get_guide = AsyncMock(
-                return_value={"summary": "Summary without keywords", "keywords": []}
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_guide = AsyncMock(
+            return_value=source_guide({"summary": "Summary without keywords", "keywords": []})
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "guide", "src_123", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "guide", "src_123", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
 
-            assert result.exit_code == 0
-            assert "Summary" in result.output
-            assert "Summary without keywords" in result.output
-            assert "No guide available" not in result.output
+        assert result.exit_code == 0
+        assert "Summary" in result.output
+        assert "Summary without keywords" in result.output
+        assert "No guide available" not in result.output
 
     def test_source_guide_keywords_only(self, runner, mock_auth):
         """Test that keywords are displayed even when summary is empty."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.get_guide = AsyncMock(
-                return_value={"summary": "", "keywords": ["AI", "ML", "Data"]}
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_guide = AsyncMock(
+            return_value=source_guide({"summary": "", "keywords": ["AI", "ML", "Data"]})
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "guide", "src_123", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "guide", "src_123", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
 
-            assert result.exit_code == 0
-            assert "Keywords" in result.output
-            assert "AI" in result.output
-            assert "No guide available" not in result.output
+        assert result.exit_code == 0
+        assert "Keywords" in result.output
+        assert "AI" in result.output
+        assert "No guide available" not in result.output
 
 
 # =============================================================================
@@ -1342,44 +2060,65 @@ class TestSourceGuide:
 
 
 class TestSourceStale:
-    def test_source_stale_is_stale(self, runner, mock_auth):
-        """Test exit code 0 when source is stale (needs refresh)."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.check_freshness = AsyncMock(return_value=False)  # Not fresh = stale
-            mock_client_cls.return_value = mock_client
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_stale_is_stale(self, runner, mock_auth, output_mode):
+        """Default exit code is 0 (success) when the check completes — stale branch.
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "stale", "src_123", "-n", "nb_123"])
+        The freshness result is reported on stdout; callers branch on the
+        text (or, with --json, on the ``stale`` field). See
+        docs/cli-exit-codes.md.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.check_freshness = AsyncMock(return_value=False)  # Not fresh = stale
 
-            assert result.exit_code == 0  # 0 = stale (condition is true)
+        args = ["source", "stale", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
+
+        assert result.exit_code == 0  # success — check completed
+        if output_mode == "text":
             assert "stale" in result.output.lower()
             assert "refresh" in result.output.lower()
+        else:
+            data = json.loads(result.output)
+            assert data["stale"] is True
+            assert data["fresh"] is False
+            assert data["source_id"] == "src_123"
 
-    def test_source_stale_is_fresh(self, runner, mock_auth):
-        """Test exit code 1 when source is fresh (no refresh needed)."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.check_freshness = AsyncMock(return_value=True)  # Fresh
-            mock_client_cls.return_value = mock_client
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_stale_is_fresh(self, runner, mock_auth, output_mode):
+        """Default exit code is 0 (success) when the check completes — fresh branch."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.check_freshness = AsyncMock(return_value=True)  # Fresh
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "stale", "src_123", "-n", "nb_123"])
+        args = ["source", "stale", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 1  # 1 = not stale (condition is false)
+        assert result.exit_code == 0  # success — check completed
+        if output_mode == "text":
             assert "fresh" in result.output.lower()
+        else:
+            data = json.loads(result.output)
+            assert data["stale"] is False
+            assert data["fresh"] is True
+            assert data["source_id"] == "src_123"
 
 
 # =============================================================================
@@ -1433,85 +2172,82 @@ class TestSourceAddAutoDetect:
         test_file = tmp_path / "notes.txt"
         test_file.write_text("Some file content")
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_file = AsyncMock(
-                return_value=Source(id="src_file", title="notes.txt")
+        mock_client = create_mock_client()
+        mock_client.sources.add_file = AsyncMock(
+            return_value=Source(id="src_file", title="notes.txt")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", str(test_file), "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", str(test_file), "-n", "nb_123"],
-                )
-
-            assert result.exit_code == 0
-            mock_client.sources.add_file.assert_called_once()
+        assert result.exit_code == 0
+        mock_client.sources.add_file.assert_called_once()
 
     def test_source_add_autodetect_plain_text(self, runner, mock_auth):
         """Pass plain text (not URL, not existing path) without --type.
 
         Should auto-detect as 'text' with default title 'Pasted Text'.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "This is just some plain text content", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", "This is just some plain text content", "-n", "nb_123"],
-                )
-
-            assert result.exit_code == 0
-            # Verify add_text was called with the default "Pasted Text" title
-            mock_client.sources.add_text.assert_called_once()
-            call_args = mock_client.sources.add_text.call_args
-            assert call_args[0][1] == "Pasted Text"  # title arg
+        assert result.exit_code == 0
+        # Verify add_text was called with the default "Pasted Text" title
+        mock_client.sources.add_text.assert_called_once()
+        call_args = mock_client.sources.add_text.call_args
+        assert call_args[0][1] == "Pasted Text"  # title arg
 
     def test_source_add_autodetect_text_with_custom_title(self, runner, mock_auth):
         """Pass plain text without --type but with --title.
 
         Title should be the custom title, not 'Pasted Text'.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Custom Title")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Custom Title")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    "This is just some plain text content",
+                    "--title",
+                    "Custom Title",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        "This is just some plain text content",
-                        "--title",
-                        "Custom Title",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
-
-            assert result.exit_code == 0
-            mock_client.sources.add_text.assert_called_once()
-            call_args = mock_client.sources.add_text.call_args
-            assert call_args[0][1] == "Custom Title"  # title arg
+        assert result.exit_code == 0
+        mock_client.sources.add_text.assert_called_once()
+        call_args = mock_client.sources.add_text.call_args
+        assert call_args[0][1] == "Custom Title"  # title arg
 
     def test_source_add_file_with_custom_title_passes_title_through(
         self, runner, mock_auth, tmp_path
@@ -1522,34 +2258,33 @@ class TestSourceAddAutoDetect:
         test_file = tmp_path / "boring-filename.md"
         test_file.write_text("# content\n")
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_file = AsyncMock(
-                return_value=Source(id="src_md", title="Real Intended Title")
+        mock_client = create_mock_client()
+        mock_client.sources.add_file = AsyncMock(
+            return_value=Source(id="src_md", title="Real Intended Title")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    str(test_file),
+                    "--title",
+                    "Real Intended Title",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        str(test_file),
-                        "--title",
-                        "Real Intended Title",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
-
-            assert result.exit_code == 0
-            mock_client.sources.add_file.assert_called_once()
-            call_kwargs = mock_client.sources.add_file.call_args.kwargs
-            assert call_kwargs.get("title") == "Real Intended Title"
+        assert result.exit_code == 0
+        mock_client.sources.add_file.assert_called_once()
+        call_kwargs = mock_client.sources.add_file.call_args.kwargs
+        assert call_kwargs.get("title") == "Real Intended Title"
 
 
 # =============================================================================
@@ -1576,18 +2311,20 @@ class TestSourceAddPathShapedMissing:
 
         Source is still added as text — warning is advisory, not fatal.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "add", "./missing.md", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "./missing.md", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
         # Source must still be added (advisory warn, not fatal).
         assert result.exit_code == 0
@@ -1606,18 +2343,18 @@ class TestSourceAddPathShapedMissing:
         ``missing.md`` (no slash, has ``.md``) is path-shaped: ``./missing.md``
         without the leading dot-slash is a common shell mistake.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "add", "missing.md", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "add", "missing.md", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
 
         assert result.exit_code == 0
         mock_client.sources.add_text.assert_called_once()
@@ -1631,29 +2368,28 @@ class TestSourceAddPathShapedMissing:
         The user has stated intent: "treat this as text, not a path." The
         heuristic must respect that and stay silent.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add",
-                        "./missing.md",
-                        "--type",
-                        "text",
-                        "-n",
-                        "nb_123",
-                    ],
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add",
+                    "./missing.md",
+                    "--type",
+                    "text",
+                    "-n",
+                    "nb_123",
+                ],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 0
         mock_client.sources.add_text.assert_called_once()
@@ -1666,21 +2402,20 @@ class TestSourceAddPathShapedMissing:
         Regression guard: the heuristic must not fire on legitimate inline
         text content like ``"My notes here"``.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", "This is just some plain prose content", "-n", "nb_123"],
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "This is just some plain prose content", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 0
         mock_client.sources.add_text.assert_called_once()
@@ -1697,18 +2432,20 @@ class TestSourceAddPathShapedMissing:
         test_file = tmp_path / "real.md"
         test_file.write_text("# real content\n")
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_file = AsyncMock(
-                return_value=Source(id="src_file", title="real.md")
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.add_file = AsyncMock(
+            return_value=Source(id="src_file", title="real.md")
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "add", str(test_file), "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", str(test_file), "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 0
         mock_client.sources.add_file.assert_called_once()
@@ -1722,191 +2459,171 @@ class TestSourceAddPathShapedMissing:
 
 
 class TestSourceFulltext:
-    def test_source_fulltext_console_output(self, runner, mock_auth):
-        """Short content (<= 2000 chars) is displayed in full."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_fulltext_console_output(self, runner, mock_auth, output_mode):
+        """Short content (<= 2000 chars) is displayed in full in both formats."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="Test Source",
+                content="This is the full text content.",
+                _type_code=5,
+                char_count=30,
+                url=None,
             )
-            mock_client.sources.get_fulltext = AsyncMock(
-                return_value=SourceFulltext(
-                    source_id="src_123",
-                    title="Test Source",
-                    content="This is the full text content.",
-                    char_count=30,
-                    url=None,
-                )
-            )
-            mock_client_cls.return_value = mock_client
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "fulltext", "src_123", "-n", "nb_123"])
+        args = ["source", "fulltext", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
+        if output_mode == "text":
             assert "src_123" in result.output
             assert "Test Source" in result.output
             assert "This is the full text content." in result.output
             # Should NOT show truncation message for short content
             assert "more chars" not in result.output
+        else:
+            data = json.loads(result.output)
+            assert data["source_id"] == "src_123"
+            assert data["title"] == "Test Source"
+            assert data["kind"] == "web_page"
+            assert data["content"] == "This is the full text content."
+            assert data["char_count"] == 30
+            assert "_type_code" not in data
 
     def test_source_fulltext_truncated_output(self, runner, mock_auth):
         """Long content (> 2000 chars) is truncated with a 'more chars' message."""
         long_content = "A" * 3000
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="Long Source",
+                content=long_content,
+                char_count=3000,
+                url=None,
             )
-            mock_client.sources.get_fulltext = AsyncMock(
-                return_value=SourceFulltext(
-                    source_id="src_123",
-                    title="Long Source",
-                    content=long_content,
-                    char_count=3000,
-                    url=None,
-                )
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "fulltext", "src_123", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "fulltext", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0
-            assert "more chars" in result.output
+        assert result.exit_code == 0
+        assert "more chars" in result.output
 
     def test_source_fulltext_save_to_file(self, runner, mock_auth, tmp_path):
         """-o flag saves content to file."""
         output_file = tmp_path / "output.txt"
         content = "Full text content to save."
 
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="Test Source",
+                content=content,
+                char_count=len(content),
+                url=None,
             )
-            mock_client.sources.get_fulltext = AsyncMock(
-                return_value=SourceFulltext(
-                    source_id="src_123",
-                    title="Test Source",
-                    content=content,
-                    char_count=len(content),
-                    url=None,
-                )
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "fulltext", "src_123", "-n", "nb_123", "-o", str(output_file)],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "fulltext", "src_123", "-n", "nb_123", "-o", str(output_file)],
-                )
-
-            assert result.exit_code == 0
-            assert "Saved" in result.output
-            assert output_file.read_text(encoding="utf-8") == content
-
-    def test_source_fulltext_json_output(self, runner, mock_auth):
-        """--json outputs JSON with fulltext fields."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.get_fulltext = AsyncMock(
-                return_value=SourceFulltext(
-                    source_id="src_123",
-                    title="Test Source",
-                    content="Some content",
-                    char_count=12,
-                    url=None,
-                )
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "fulltext", "src_123", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 0
-            data = json.loads(result.output)
-            assert data["source_id"] == "src_123"
-            assert data["title"] == "Test Source"
-            assert data["content"] == "Some content"
-            assert data["char_count"] == 12
+        assert result.exit_code == 0
+        assert "Saved" in result.output
+        assert output_file.read_text(encoding="utf-8") == content
 
     def test_source_fulltext_format_markdown_propagates(self, runner, mock_auth):
         """`-f markdown` propagates output_format='markdown' to the API."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="MD Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="MD Source")])
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="MD Source",
+                content="# Heading\n\n[link](https://example.com)",
+                char_count=39,
+                url=None,
             )
-            mock_client.sources.get_fulltext = AsyncMock(
-                return_value=SourceFulltext(
-                    source_id="src_123",
-                    title="MD Source",
-                    content="# Heading\n\n[link](https://example.com)",
-                    char_count=39,
-                    url=None,
-                )
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "fulltext", "src_123", "-n", "nb_123", "-f", "markdown"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "fulltext", "src_123", "-n", "nb_123", "-f", "markdown"]
-                )
-
-            assert result.exit_code == 0
-            mock_client.sources.get_fulltext.assert_awaited_once()
-            _, kwargs = mock_client.sources.get_fulltext.call_args
-            assert kwargs["output_format"] == "markdown"
-            # Markdown link should round-trip verbatim, not be eaten by Rich markup
-            assert "[link](https://example.com)" in result.output
+        assert result.exit_code == 0
+        mock_client.sources.get_fulltext.assert_awaited_once()
+        _, kwargs = mock_client.sources.get_fulltext.call_args
+        assert kwargs["output_format"] == "markdown"
+        # Markdown link should round-trip verbatim, not be eaten by Rich markup
+        assert "[link](https://example.com)" in result.output
 
     def test_source_fulltext_with_url(self, runner, mock_auth):
         """Shows URL field when present in fulltext."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Web Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Web Source")]
+        )
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="Web Source",
+                content="Web page content.",
+                char_count=17,
+                url="https://example.com/page",
             )
-            mock_client.sources.get_fulltext = AsyncMock(
-                return_value=SourceFulltext(
-                    source_id="src_123",
-                    title="Web Source",
-                    content="Web page content.",
-                    char_count=17,
-                    url="https://example.com/page",
-                )
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "fulltext", "src_123", "-n", "nb_123"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "fulltext", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0
-            assert "https://example.com/page" in result.output
+        assert result.exit_code == 0
+        assert "https://example.com/page" in result.output
 
 
 # =============================================================================
@@ -1915,180 +2632,139 @@ class TestSourceFulltext:
 
 
 class TestSourceWait:
-    def test_source_wait_success(self, runner, mock_auth):
-        """wait_until_ready returns a Source → prints 'ready'."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                return_value=Source(id="src_123", title="Test Source", status=2)
-            )
-            mock_client_cls.return_value = mock_client
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_wait_success(self, runner, mock_auth, output_mode):
+        """wait_until_ready returns a Source → prints 'ready' / emits ready JSON."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            return_value=Source(id="src_123", title="Test Source", status=2)
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123"])
+        args = ["source", "wait", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 0
+        assert result.exit_code == 0
+        if output_mode == "text":
             assert "ready" in result.output.lower()
-
-    def test_source_wait_success_with_title(self, runner, mock_auth):
-        """Source has a title → prints the title after 'ready' message."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="My Source Title")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                return_value=Source(id="src_123", title="My Source Title", status=2)
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0
-            assert "My Source Title" in result.output
-
-    def test_source_wait_success_json(self, runner, mock_auth):
-        """--json output on successful wait."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                return_value=Source(id="src_123", title="Test Source", status=2)
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123", "--json"])
-
-            assert result.exit_code == 0
+        else:
             data = json.loads(result.output)
             assert data["source_id"] == "src_123"
             assert data["status"] == "ready"
 
-    def test_source_wait_not_found(self, runner, mock_auth):
-        """Raises SourceNotFoundError → exit code 1."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                side_effect=SourceNotFoundError("src_123")
-            )
-            mock_client_cls.return_value = mock_client
+    def test_source_wait_success_with_title(self, runner, mock_auth):
+        """Source has a title → prints the title after 'ready' message."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="My Source Title")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            return_value=Source(id="src_123", title="My Source Title", status=2)
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "wait", "src_123", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
 
-            assert result.exit_code == 1
+        assert result.exit_code == 0
+        assert "My Source Title" in result.output
+
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_wait_not_found(self, runner, mock_auth, output_mode):
+        """SourceNotFoundError → exit 1 (text message / not_found JSON)."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(side_effect=SourceNotFoundError("src_123"))
+
+        args = ["source", "wait", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
+
+        assert result.exit_code == 1
+        if output_mode == "text":
             assert "not found" in result.output.lower()
-
-    def test_source_wait_not_found_json(self, runner, mock_auth):
-        """--json on SourceNotFoundError → JSON with status 'not_found', exit 1."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                side_effect=SourceNotFoundError("src_123")
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123", "--json"])
-
-            assert result.exit_code == 1
+        else:
             data = json.loads(result.output)
             assert data["status"] == "not_found"
             assert data["source_id"] == "src_123"
 
-    def test_source_wait_processing_error(self, runner, mock_auth):
-        """Raises SourceProcessingError → exit code 1."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                side_effect=SourceProcessingError("src_123", status=3)
-            )
-            mock_client_cls.return_value = mock_client
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_wait_processing_error(self, runner, mock_auth, output_mode):
+        """SourceProcessingError → exit 1 (text message / error JSON)."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            side_effect=SourceProcessingError("src_123", status=3)
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123"])
+        args = ["source", "wait", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 1
+        assert result.exit_code == 1
+        if output_mode == "text":
             assert "processing failed" in result.output.lower()
-
-    def test_source_wait_processing_error_json(self, runner, mock_auth):
-        """--json on SourceProcessingError → JSON with status 'error', exit 1."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                side_effect=SourceProcessingError("src_123", status=3)
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123", "--json"])
-
-            assert result.exit_code == 1
+        else:
             data = json.loads(result.output)
             assert data["status"] == "error"
             assert data["source_id"] == "src_123"
             assert data["status_code"] == 3
 
-    def test_source_wait_timeout(self, runner, mock_auth):
-        """Raises SourceTimeoutError → exit code 2."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                side_effect=SourceTimeoutError("src_123", timeout=30.0, last_status=1)
-            )
-            mock_client_cls.return_value = mock_client
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_wait_timeout(self, runner, mock_auth, output_mode):
+        """SourceTimeoutError → exit 2 (text message / timeout JSON)."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            side_effect=SourceTimeoutError("src_123", timeout=30.0, last_status=1)
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123"])
+        args = ["source", "wait", "src_123", "-n", "nb_123"]
+        if output_mode == "json":
+            args.append("--json")
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
 
-            assert result.exit_code == 2
+        assert result.exit_code == 2
+        if output_mode == "text":
             assert "timeout" in result.output.lower()
+        else:
+            data = json.loads(result.output)
+            assert data["status"] == "timeout"
+            assert data["source_id"] == "src_123"
+            assert data["timeout_seconds"] == 30
+            assert data["last_status_code"] == 1
 
     def test_source_wait_timeout_interval_forwarded(self, runner, mock_auth):
         """`source wait <id> --timeout 60 --interval 5` plumbs both into
@@ -2101,106 +2777,80 @@ class TestSourceWait:
         not-found-or-error / 2 timeout) is preserved by the success path here
         — exit code stays 0 when the source becomes ready.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                return_value=Source(id="src_123", title="Test Source", status=2)
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            return_value=Source(id="src_123", title="Test Source", status=2)
+        )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "wait",
-                        "src_123",
-                        "-n",
-                        "nb_123",
-                        "--timeout",
-                        "60",
-                        "--interval",
-                        "5",
-                    ],
-                )
-
-            assert result.exit_code == 0, result.output
-            mock_client.sources.wait_until_ready.assert_awaited_once()
-            kwargs = mock_client.sources.wait_until_ready.await_args.kwargs
-            assert kwargs.get("timeout") == 60.0
-            # `wait_until_ready` exposes the cadence as `initial_interval`.
-            assert kwargs.get("initial_interval") == 5.0, (
-                f"expected --interval=5 to plumb into wait_until_ready, got kwargs={kwargs}"
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "wait",
+                    "src_123",
+                    "-n",
+                    "nb_123",
+                    "--timeout",
+                    "60",
+                    "--interval",
+                    "5",
+                ],
+                obj=inject_client(mock_client),
             )
 
-    def test_source_wait_timeout_json(self, runner, mock_auth):
-        """--json on SourceTimeoutError → JSON with status 'timeout', exit 2."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                side_effect=SourceTimeoutError("src_123", timeout=30.0, last_status=1)
-            )
-            mock_client_cls.return_value = mock_client
-
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123", "--json"])
-
-            assert result.exit_code == 2
-            data = json.loads(result.output)
-            assert data["status"] == "timeout"
-            assert data["source_id"] == "src_123"
-            assert data["timeout_seconds"] == 30
-            assert data["last_status_code"] == 1
+        assert result.exit_code == 0, result.output
+        mock_client.sources.wait_until_ready.assert_awaited_once()
+        kwargs = mock_client.sources.wait_until_ready.await_args.kwargs
+        assert kwargs.get("timeout") == 60.0
+        # `wait_until_ready` exposes the cadence as `initial_interval`.
+        assert kwargs.get("initial_interval") == 5.0, (
+            f"expected --interval=5 to plumb into wait_until_ready, got kwargs={kwargs}"
+        )
 
     def test_source_wait_invokes_console_status(self, runner, mock_auth):
         """`source wait` wraps the polling call in `console.status`.
 
         The spinner replaces the static "Waiting for source ..." print with a
         live transient line that includes the source ID. Asserts the wrap by
-        patching `notebooklm.cli.source.console.status` and confirming it is
+        patching `notebooklm.cli.source_cmd.console.status` and confirming it is
         invoked exactly once with a message that mentions the source. Does not
         assert under `--json` because the JSON path intentionally suppresses
         the spinner to keep stdout pure JSON.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                return_value=Source(id="src_123", title="Test Source", status=2)
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            return_value=Source(id="src_123", title="Test Source", status=2)
+        )
 
-            with (
-                patch(
-                    "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-                ) as mock_fetch,
-                patch.object(source_module.console, "status") as mock_status,
-            ):
-                mock_fetch.return_value = ("csrf", "session")
-                mock_status.return_value.__enter__ = MagicMock(return_value=MagicMock())
-                mock_status.return_value.__exit__ = MagicMock(return_value=False)
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123"])
-
-            assert result.exit_code == 0, result.output
-            assert mock_status.called, "expected console.status to wrap the wait call"
-            status_msg = mock_status.call_args.args[0]
-            assert "source" in status_msg.lower() or "src_123" in status_msg, (
-                f"expected status message to describe the source wait, got: {status_msg!r}"
+        with (
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch,
+            patch.object(source_module.console, "status") as mock_status,
+        ):
+            mock_fetch.return_value = ("csrf", "session")
+            mock_status.return_value.__enter__ = MagicMock(return_value=MagicMock())
+            mock_status.return_value.__exit__ = MagicMock(return_value=False)
+            result = runner.invoke(
+                cli, ["source", "wait", "src_123", "-n", "nb_123"], obj=inject_client(mock_client)
             )
+
+        assert result.exit_code == 0, result.output
+        assert mock_status.called, "expected console.status to wrap the wait call"
+        status_msg = mock_status.call_args.args[0]
+        assert "source" in status_msg.lower() or "src_123" in status_msg, (
+            f"expected status message to describe the source wait, got: {status_msg!r}"
+        )
 
     def test_source_wait_json_skips_console_status(self, runner, mock_auth):
         """`source wait --json` must NOT invoke console.status (stdout stays JSON).
@@ -2208,29 +2858,31 @@ class TestSourceWait:
         The spinner is suppressed under JSON mode so automation parsing stdout
         does not see Rich escape sequences leak in.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(
-                return_value=Source(id="src_123", title="Test Source", status=2)
-            )
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(
+            return_value=Source(id="src_123", title="Test Source", status=2)
+        )
 
-            with (
-                patch(
-                    "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-                ) as mock_fetch,
-                patch.object(source_module.console, "status") as mock_status,
-            ):
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_123", "-n", "nb_123", "--json"])
-
-            assert result.exit_code == 0, result.output
-            assert not mock_status.called, (
-                "console.status must NOT be invoked under --json (would leak ANSI into stdout)"
+        with (
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+            ) as mock_fetch,
+            patch.object(source_module.console, "status") as mock_status,
+        ):
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "wait", "src_123", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
+
+        assert result.exit_code == 0, result.output
+        assert not mock_status.called, (
+            "console.status must NOT be invoked under --json (would leak ANSI into stdout)"
+        )
 
     def test_source_wait_sigint_prints_resume_hint_and_exits_130(self, runner, mock_auth):
         """Ctrl-C during ``source wait`` exits 130 with a parallel resume hint
@@ -2242,19 +2894,21 @@ class TestSourceWait:
         than the ``artifact poll <task_id>`` shape used by the other two
         long-running paths.
         """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_sigint", title="Test Source")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(side_effect=KeyboardInterrupt)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_sigint", title="Test Source")]
+        )
+        mock_client.sources.wait_until_ready = AsyncMock(side_effect=KeyboardInterrupt)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(cli, ["source", "wait", "src_sigint", "-n", "nb_123"])
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "wait", "src_sigint", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 130, (
             f"expected SIGINT exit 130, got {result.exit_code}; output={result.output!r}"
@@ -2267,21 +2921,19 @@ class TestSourceWait:
     def test_source_wait_sigint_json_emits_cancelled_envelope(self, runner, mock_auth):
         """Ctrl-C under ``source wait --json`` emits a CANCELLED envelope, exits 130
         ."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_json_sigint", title="T")]
-            )
-            mock_client.sources.wait_until_ready = AsyncMock(side_effect=KeyboardInterrupt)
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_json_sigint", title="T")])
+        mock_client.sources.wait_until_ready = AsyncMock(side_effect=KeyboardInterrupt)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli, ["source", "wait", "src_json_sigint", "-n", "nb_123", "--json"]
-                )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "wait", "src_json_sigint", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
 
         assert result.exit_code == 130
         assert '"code": "CANCELLED"' in result.output
@@ -2305,146 +2957,12 @@ def _src(
     return Source(id=sid, title=title, url=url, status=status, created_at=created_at)
 
 
-class TestSourceCleanClassify:
-    """Unit tests for the pure-function ``_classify_junk_sources`` helper.
-
-    These are independent of Click/CLI invocation so they're fast and exercise
-    every branch of the classification logic without mocking the client.
-    """
-
-    def test_empty_notebook_returns_nothing(self):
-        assert source_module._classify_junk_sources([]) == []
-
-    def test_error_status_is_flagged(self):
-        s = _src("src_e", status=SourceStatus.ERROR, url="https://ex.com/a")
-        out = source_module._classify_junk_sources([s])
-        assert [(c[0], c[3]) for c in out] == [("src_e", "error_status")]
-
-    def test_unknown_status_is_not_flagged(self):
-        # Unrecognized status codes must NOT be auto-deleted; they may
-        # represent future NotebookLM states or missing-status payloads.
-        s = _src("src_u", status=99, url="https://ex.com/a")
-        assert source_module._classify_junk_sources([s]) == []
-
-    def test_zero_status_is_not_flagged(self):
-        # status=0 maps to "unknown" via the truthy fallback. Must NOT delete.
-        s = _src("src_z", status=0, url="https://ex.com/a")
-        assert source_module._classify_junk_sources([s]) == []
-
-    def test_processing_status_is_not_flagged(self):
-        s = _src("src_p", status=SourceStatus.PROCESSING, url="https://ex.com/a")
-        assert source_module._classify_junk_sources([s]) == []
-
-    @pytest.mark.parametrize(
-        "title",
-        [
-            "Access Denied",
-            "403 Forbidden",
-            "404 Not Found",
-            "Just a Moment...",
-            "Attention Required! | Cloudflare",
-            "Security check",
-            "CAPTCHA verification",
-            "  403  ",
-        ],
-    )
-    def test_gateway_titles_are_flagged(self, title):
-        s = _src("src_g", title=title, url="https://ex.com/a")
-        out = source_module._classify_junk_sources([s])
-        assert [(c[0], c[3]) for c in out] == [("src_g", "gateway_title")]
-
-    def test_legitimate_titles_starting_with_digits_are_not_flagged(self):
-        # "404 Not Found" is a gateway title, but "100 Ways to ..." is not.
-        s = _src("src_ok", title="100 Ways to Cook Pasta", url="https://ex.com/a")
-        assert source_module._classify_junk_sources([s]) == []
-
-    def test_url_title_on_ready_source_is_not_deleted(self):
-        # Regression: PR review caught that URL-as-title was being treated as
-        # junk, which deletes legitimate in-flight sources (Source.title is
-        # documented to "may be URL if not yet processed").
-        s = _src(
-            "src_url",
-            title="https://example.com/article",
-            url="https://example.com/article",
-        )
-        assert source_module._classify_junk_sources([s]) == []
-
-    def test_dedup_keeps_oldest_and_flags_later_copies(self):
-        # Oldest at t=0; two later duplicates.
-        sources = [
-            _src("src_3", url="https://ex.com/a", created_at=datetime(2024, 3, 1)),
-            _src("src_1", url="https://ex.com/a", created_at=datetime(2024, 1, 1)),
-            _src("src_2", url="https://ex.com/a", created_at=datetime(2024, 2, 1)),
-        ]
-        out = source_module._classify_junk_sources(sources)
-        deleted_ids = sorted(c[0] for c in out)
-        assert deleted_ids == ["src_2", "src_3"]
-        assert all(c[3].startswith("duplicate_of:src_1"[:21]) for c in out)
-
-    def test_dedup_when_oldest_is_error(self):
-        # First copy (oldest) is error → flagged as error_status, NOT recorded
-        # in seen_urls. Second copy becomes the kept anchor; third copy
-        # deduped against it. Both deletions report their own reason.
-        sources = [
-            _src(
-                "src_e",
-                url="https://ex.com/a",
-                status=SourceStatus.ERROR,
-                created_at=datetime(2024, 1, 1),
-            ),
-            _src("src_ok", url="https://ex.com/a", created_at=datetime(2024, 2, 1)),
-            _src("src_dup", url="https://ex.com/a", created_at=datetime(2024, 3, 1)),
-        ]
-        out = source_module._classify_junk_sources(sources)
-        by_id = {c[0]: c[3] for c in out}
-        assert set(by_id) == {"src_e", "src_dup"}
-        assert by_id["src_e"] == "error_status"
-        assert by_id["src_dup"].startswith("duplicate_of:")
-
-    def test_dedup_preserves_query_string(self):
-        # Different YouTube video IDs (via ?v=) must NOT be collapsed.
-        sources = [
-            _src("yt_a", url="https://youtube.com/watch?v=AAA"),
-            _src("yt_b", url="https://youtube.com/watch?v=BBB"),
-        ]
-        assert source_module._classify_junk_sources(sources) == []
-
-    def test_dedup_strips_fragment(self):
-        sources = [
-            _src("src_1", url="https://ex.com/a#top", created_at=datetime(2024, 1, 1)),
-            _src("src_2", url="https://ex.com/a#bottom", created_at=datetime(2024, 2, 1)),
-        ]
-        out = source_module._classify_junk_sources(sources)
-        assert [c[0] for c in out] == ["src_2"]
-
-    def test_dedup_is_case_insensitive_on_scheme_and_host(self):
-        # Per RFC 3986, scheme and host are case-insensitive, so mixed-case
-        # copies of the same URL must be recognised as duplicates.
-        sources = [
-            _src("src_1", url="https://Example.COM/a", created_at=datetime(2024, 1, 1)),
-            _src("src_2", url="HTTPS://example.com/a", created_at=datetime(2024, 2, 1)),
-        ]
-        out = source_module._classify_junk_sources(sources)
-        assert [c[0] for c in out] == ["src_2"]
-
-    def test_undated_sources_go_to_end_of_sort(self):
-        # If src_undated were placed at position 0 (epoch sentinel), it would
-        # be kept and src_dated deleted as a duplicate. With float('inf') the
-        # dated one wins.
-        sources = [
-            _src("src_undated", url="https://ex.com/a", created_at=None),
-            _src("src_dated", url="https://ex.com/a", created_at=datetime(2024, 1, 1)),
-        ]
-        out = source_module._classify_junk_sources(sources)
-        assert [c[0] for c in out] == ["src_undated"]
-
-    def test_source_with_no_url_is_not_deduped(self):
-        # Text-only sources have url=None — they must never be deduped together.
-        sources = [
-            _src("src_1", title="Note A"),
-            _src("src_2", title="Note B"),
-        ]
-        assert source_module._classify_junk_sources(sources) == []
+# NOTE: The pure-function ``_classify_junk_sources`` branch tests (formerly
+# ``TestSourceCleanClassify``) were moved down to the transport-neutral layer in
+# ``tests/unit/app/test_app_source_clean.py::TestClassifyJunkSources`` — they
+# already called the pure function directly through the
+# ``source_cmd._classify_junk_sources`` re-export, so the move only retargets the
+# import. The end-to-end Click invocation tests stay here.
 
 
 class TestSourceCleanCommand:
@@ -2456,7 +2974,7 @@ class TestSourceCleanCommand:
 
     def test_already_clean_short_circuits(self, runner, mock_auth):
         with self._patch_clean([_src("src_1", title="Page", url="https://ex.com/a")]) as mc:
-            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y"])
+            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y"], obj=mc.obj)
             assert result.exit_code == 0
             assert "already clean" in result.output.lower()
             mc.sources.delete.assert_not_called()
@@ -2467,7 +2985,9 @@ class TestSourceCleanCommand:
             _src("src_block", title="Just a Moment...", url="https://ex.com/x"),
         ]
         with self._patch_clean(sources) as mc:
-            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "--dry-run"])
+            result = runner.invoke(
+                cli, ["source", "clean", "-n", "nb_123", "--dry-run"], obj=mc.obj
+            )
             assert result.exit_code == 0
             assert "Dry run" in result.output
             assert "error_status" in result.output
@@ -2477,7 +2997,7 @@ class TestSourceCleanCommand:
     def test_yes_skips_confirmation_and_deletes(self, runner, mock_auth):
         sources = [_src("src_err", status=SourceStatus.ERROR)]
         with self._patch_clean(sources) as mc:
-            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y"])
+            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y"], obj=mc.obj)
             assert result.exit_code == 0
             mc.sources.delete.assert_awaited_once_with("nb_123", "src_err")
             assert "Successfully cleaned" in result.output
@@ -2485,7 +3005,9 @@ class TestSourceCleanCommand:
     def test_user_declines_confirmation_aborts(self, runner, mock_auth):
         sources = [_src("src_err", status=SourceStatus.ERROR)]
         with self._patch_clean(sources) as mc:
-            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123"], input="n\n")
+            result = runner.invoke(
+                cli, ["source", "clean", "-n", "nb_123"], input="n\n", obj=mc.obj
+            )
             assert result.exit_code == 0
             mc.sources.delete.assert_not_called()
 
@@ -2501,18 +3023,21 @@ class TestSourceCleanCommand:
 
         with self._patch_clean(sources) as mc:
             mc.sources.delete = AsyncMock(side_effect=fake_delete)
-            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y"])
-            assert result.exit_code == 0
+            result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y"], obj=mc.obj)
+            # P1.T2 bug 8: partial-failure must exit non-zero so shell
+            # automation (set -e, CI, etc.) can detect the failure.
+            assert result.exit_code != 0
             assert "1 deletion(s) failed" in result.output
             assert "src_b" in result.output
             assert "boom" in result.output
 
 
 class _CleanPatch:
-    """Context manager that patches the NotebookLMClient for source-clean tests.
+    """Context manager that wires a mock NotebookLMClient for source-clean tests.
 
-    Uses ``ExitStack`` so any patch that raises mid-setup correctly unwinds the
-    patches that already entered, instead of leaking them into the next test.
+    The client is injected via ``ctx.obj`` (``self.obj``), so each test threads
+    ``obj=mc.obj`` into ``runner.invoke``. Uses ``ExitStack`` so the
+    ``fetch_tokens`` patch correctly unwinds even if setup raises mid-way.
     """
 
     def __init__(self, sources):
@@ -2520,16 +3045,14 @@ class _CleanPatch:
         self._exit_stack = contextlib.ExitStack()
 
     def __enter__(self):
-        mock_client_cls = self._exit_stack.enter_context(patch_client_for_module("source"))
-
         mock_client = create_mock_client()
         mock_client.sources.list = AsyncMock(return_value=self._sources)
         mock_client.sources.delete = AsyncMock(return_value=None)
-        mock_client_cls.return_value = mock_client
         self.sources = mock_client.sources
+        self.obj = inject_client(mock_client)
 
         fetch_mock = self._exit_stack.enter_context(
-            patch("notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock)
+            patch.object(auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock)
         )
         fetch_mock.return_value = ("csrf", "session")
         return self
@@ -2552,43 +3075,130 @@ class TestSourceJsonOutput:
     1. Stdout is parseable JSON (no Rich color codes leaking onto stdout).
     2. The shape exposes the fields automation needs (``source_id``,
        ``status``, etc.).
-    3. ``source stale --json`` PRESERVES the inverted exit-code semantics
-       documented in ``docs/cli-exit-codes.md`` (stale=0, fresh=1).
+    3. ``source stale --json`` follows the standard CLI exit convention
+       (0=success regardless of freshness, 1=error). The inverted
+       predicate is available as an opt-in via ``--exit-on-stale``;
+       see ``docs/cli-exit-codes.md``.
     """
 
     def _patch_fetch_tokens(self):
-        return patch(
-            "notebooklm.auth.fetch_tokens_with_domains",
+        return patch.object(
+            auth_module,
+            "fetch_tokens_with_domains",
             new_callable=AsyncMock,
             return_value=("csrf", "session"),
         )
 
     def test_source_get_json(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="My Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="My Source")])
+        mock_client.sources.get_or_none = AsyncMock(
+            return_value=Source(
+                id="src_123",
+                title="My Source",
+                url="https://example.com",
+                _type_code=5,
+                created_at=datetime(2024, 1, 1, 12, 0),
             )
-            mock_client.sources.get = AsyncMock(
-                return_value=Source(
-                    id="src_123",
-                    title="My Source",
-                    url="https://example.com",
-                    created_at=datetime(2024, 1, 1, 12, 0),
-                )
+        )
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "get", "src_123", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(cli, ["source", "get", "src_123", "-n", "nb_123", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["found"] is True
+        assert data["source"]["id"] == "src_123"
+        assert data["source"]["title"] == "My Source"
+        assert data["source"]["type"] == "web_page"
+        assert data["source"]["url"] == "https://example.com"
+        assert data["source"]["created_at"] == "2024-01-01T12:00:00"
 
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["found"] is True
-            assert data["source"]["id"] == "src_123"
-            assert data["source"]["title"] == "My Source"
-            assert data["source"]["url"] == "https://example.com"
-            assert data["source"]["created_at"] == "2024-01-01T12:00:00"
+    def test_source_get_json_carries_drive_health(self, runner, mock_auth):
+        """``source get --json`` reports the Drive axis, not just ingestion (#2111).
+
+        The CLI mirror of ``tests/server/test_sources.py::
+        test_get_source_carries_drive_health``: without it the whole Drive axis
+        could vanish from CLI output with the CLI suite still green — which is
+        exactly how it never arrived in the first place.
+        """
+        drive = _drive_source(DriveSourceStatus.INACCESSIBLE)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        source = json.loads(result.output)["source"]
+        # Ingestion finished, so ``status`` still reads ready — that is the bug
+        # #2111 is about, and the Drive axis is what disambiguates it.
+        assert source["status"] == "ready"
+        assert source["drive_document_id"] == _DRIVE_FILE_ID
+        assert source["drive_status"] == "inaccessible"
+        assert source["is_drive_degraded"] is True
+
+    def test_source_get_json_drive_axis_is_null_for_a_non_drive_source(self, runner, mock_auth):
+        """A web source gets the Drive keys as ``null``/``false``, never omitted."""
+        web = _web_source()
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[web])
+        mock_client.sources.get_or_none = AsyncMock(return_value=web)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "get", web.id, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        source = json.loads(result.output)["source"]
+        assert source["drive_document_id"] is None
+        assert source["drive_status"] is None
+        assert source["is_drive_degraded"] is False
+
+    def test_source_get_json_row_shape_matches_source_list(self, runner, mock_auth):
+        """``source get --json`` and ``source list --json`` share one row shape.
+
+        The two paths built their row independently, which is how a new field
+        could land on one and not the other. They now share
+        ``source_row_payload``; this pins that they agree key-for-key (``list``
+        adds only its 1-based ``index``).
+        """
+        drive = _drive_source(DriveSourceStatus.SYNCING)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="NB"))
+
+        with self._patch_fetch_tokens():
+            got = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+            listed = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert got.exit_code == 0, got.output
+        assert listed.exit_code == 0, listed.output
+        get_row = json.loads(got.output)["source"]
+        list_row = json.loads(listed.output)["sources"][0]
+        assert list_row.pop("index") == 1
+        assert get_row == list_row
 
     def test_source_get_json_not_found_exits_1_with_typed_json(self, runner, mock_auth):
         # The contract was flipped: ``get`` on not-found now exits 1
@@ -2596,280 +3206,232 @@ class TestSourceJsonOutput:
         # message}``) instead of the previous exit-0 ``{found: false}``
         # placeholder. See ``docs/cli-exit-codes.md`` and the BREAKING entry
         # in ``CHANGELOG.md`` (Unreleased → Changed).
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_resolved", title="Existing")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_resolved", title="Existing")]
+        )
+        mock_client.sources.get_or_none = AsyncMock(return_value=None)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "get", "src_resolved", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.get = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "get", "src_resolved", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 1, result.output
-            data = json.loads(result.output)
-            assert data["error"] is True
-            assert data["code"] == "NOT_FOUND"
-            assert "Source not found" in data["message"]
-            assert data["source_id"] == "src_resolved"
+        assert result.exit_code == 1, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "NOT_FOUND"
+        assert "Source not found" in data["message"]
+        assert data["source_id"] == "src_resolved"
 
     def test_source_delete_json(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="My Source")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="My Source")])
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "src_123", "-n", "nb_123", "-y", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "delete", "src_123", "-n", "nb_123", "-y", "--json"]
-                )
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "delete"
-            assert data["source_id"] == "src_123"
-            assert data["notebook_id"] == "nb_123"
-            assert data["success"] is True
-            assert data["status"] == "deleted"
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "delete"
+        assert data["source_id"] == "src_123"
+        assert data["notebook_id"] == "nb_123"
+        assert data["success"] is True
+        assert data["status"] == "deleted"
 
     def test_source_delete_by_title_json(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_999", title="Doomed")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_999", title="Doomed")])
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "delete-by-title",
+                    "Doomed",
+                    "-n",
+                    "nb_123",
+                    "-y",
+                    "--json",
+                ],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "delete-by-title",
-                        "Doomed",
-                        "-n",
-                        "nb_123",
-                        "-y",
-                        "--json",
-                    ],
-                )
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "delete-by-title"
-            assert data["source_id"] == "src_999"
-            assert data["title"] == "Doomed"
-            assert data["success"] is True
-            assert data["status"] == "deleted"
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "delete-by-title"
+        assert data["source_id"] == "src_999"
+        assert data["title"] == "Doomed"
+        assert data["success"] is True
+        assert data["status"] == "deleted"
 
     def test_source_rename_json(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Old")])
-            mock_client.sources.rename = AsyncMock(return_value=Source(id="src_123", title="New"))
-            mock_client_cls.return_value = mock_client
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Old")])
+        mock_client.sources.rename = AsyncMock(return_value=Source(id="src_123", title="New"))
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli,
-                    ["source", "rename", "src_123", "New", "-n", "nb_123", "--json"],
-                )
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "rename", "src_123", "New", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
 
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "rename"
-            assert data["source_id"] == "src_123"
-            assert data["title"] == "New"
-            assert data["status"] == "renamed"
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "rename"
+        assert data["source_id"] == "src_123"
+        assert data["title"] == "New"
+        assert data["status"] == "renamed"
 
     def test_source_refresh_json(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Original")]
+        # v0.8.0 (#1290): refresh() returns None on success; the --json path must
+        # render status "refreshed" (keyed on the resolved source id).
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Original")])
+        mock_client.sources.refresh = AsyncMock(return_value=None)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "refresh", "src_123", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.refresh = AsyncMock(
-                return_value=Source(id="src_123", title="Refreshed")
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "refresh"
+        assert data["source_id"] == "src_123"
+        assert data["status"] == "refreshed"
+
+    def test_source_refresh_json_none_is_refreshed_not_no_result(self, runner, mock_auth):
+        # Regression guard for the hidden CLI bug (#1290): once refresh() returns
+        # None on success, the --json path must NOT fall through to "no_result".
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Original")])
+        mock_client.sources.refresh = AsyncMock(return_value=None)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "refresh", "src_123", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "refresh", "src_123", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "refresh"
-            assert data["source_id"] == "src_123"
-            assert data["title"] == "Refreshed"
-            assert data["status"] == "refreshed"
-
-    def test_source_refresh_json_no_result(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[Source(id="src_123", title="Original")]
-            )
-            mock_client.sources.refresh = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "refresh", "src_123", "-n", "nb_123", "--json"]
-                )
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "refresh"
-            assert data["source_id"] == "src_123"
-            assert data["status"] == "no_result"
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "refresh"
+        assert data["source_id"] == "src_123"
+        assert data["status"] == "refreshed"
+        assert data["status"] != "no_result"
 
     def test_source_add_drive_json(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_drive = AsyncMock(
-                return_value=Source(id="src_drive", title="My Drive Doc")
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive = AsyncMock(
+            return_value=Source(id="src_drive", title="My Drive Doc", _type_code=3)
+        )
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add-drive",
+                    "drive_file_xyz",
+                    "My Drive Doc",
+                    "--mime-type",
+                    "pdf",
+                    "-n",
+                    "nb_123",
+                    "--json",
+                ],
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli,
-                    [
-                        "source",
-                        "add-drive",
-                        "drive_file_xyz",
-                        "My Drive Doc",
-                        "--mime-type",
-                        "pdf",
-                        "-n",
-                        "nb_123",
-                        "--json",
-                    ],
-                )
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "add-drive"
-            assert data["source"]["id"] == "src_drive"
-            assert data["source"]["title"] == "My Drive Doc"
-            assert data["source"]["drive_file_id"] == "drive_file_xyz"
-            assert data["source"]["mime_type"] == "pdf"
-            assert data["notebook_id"] == "nb_123"
-
-    def test_source_stale_json_is_stale_exits_zero(self, runner, mock_auth):
-        """``source stale --json`` PRESERVES the inverted exit-code semantics:
-        exit 0 when stale (predicate true), so the shell idiom
-        ``if notebooklm source stale ID; then refresh; fi`` still works in
-        JSON mode. See docs/cli-exit-codes.md.
-        """
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Stale")])
-            mock_client.sources.check_freshness = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "stale", "src_123", "-n", "nb_123", "--json"]
-                )
-
-            # Inverted exit code preserved in JSON mode.
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["stale"] is True
-            assert data["fresh"] is False
-            assert data["source_id"] == "src_123"
-
-    def test_source_stale_json_is_fresh_exits_one(self, runner, mock_auth):
-        """Inverted exit-code semantics, fresh branch: exit 1 (predicate false)."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Fresh")])
-            mock_client.sources.check_freshness = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
-
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "stale", "src_123", "-n", "nb_123", "--json"]
-                )
-
-            # Inverted exit code preserved in JSON mode.
-            assert result.exit_code == 1, result.output
-            data = json.loads(result.output)
-            assert data["stale"] is False
-            assert data["fresh"] is True
-            assert data["source_id"] == "src_123"
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "add-drive"
+        assert data["source"]["id"] == "src_drive"
+        assert data["source"]["title"] == "My Drive Doc"
+        assert data["source"]["type"] == "pdf"
+        assert data["source"]["drive_file_id"] == "drive_file_xyz"
+        assert data["source"]["mime_type"] == "pdf"
+        assert data["notebook_id"] == "nb_123"
 
     def test_source_clean_json_already_clean(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[_src("src_1", title="Page", url="https://ex.com/a")]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_src("src_1", title="Page", url="https://ex.com/a")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=None)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "clean", "-n", "nb_123", "-y", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y", "--json"])
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["action"] == "clean"
-            assert data["status"] == "already_clean"
-            assert data["candidates"] == []
-            assert data["deleted_count"] == 0
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "clean"
+        assert data["status"] == "already_clean"
+        assert data["candidates"] == []
+        assert data["deleted_count"] == 0
 
     def test_source_clean_json_dry_run(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[_src("src_err", title="oops", status=SourceStatus.ERROR)]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_src("src_err", title="oops", status=SourceStatus.ERROR)]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=None)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "clean", "-n", "nb_123", "--dry-run", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(
-                    cli, ["source", "clean", "-n", "nb_123", "--dry-run", "--json"]
-                )
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["status"] == "dry_run"
-            assert data["candidate_count"] == 1
-            assert data["candidates"][0]["id"] == "src_err"
-            assert data["candidates"][0]["reason"] == "error_status"
-            assert data["deleted_count"] == 0
-            mock_client.sources.delete.assert_not_called()
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "dry_run"
+        assert data["candidate_count"] == 1
+        assert data["candidates"][0]["id"] == "src_err"
+        assert data["candidates"][0]["reason"] == "error_status"
+        assert data["deleted_count"] == 0
+        mock_client.sources.delete.assert_not_called()
 
     def test_source_clean_json_completed(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.list = AsyncMock(
-                return_value=[_src("src_err", title="oops", status=SourceStatus.ERROR)]
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_src("src_err", title="oops", status=SourceStatus.ERROR)]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "clean", "-n", "nb_123", "-y", "--json"],
+                obj=inject_client(mock_client),
             )
-            mock_client.sources.delete = AsyncMock(return_value=True)
-            mock_client_cls.return_value = mock_client
 
-            with self._patch_fetch_tokens():
-                result = runner.invoke(cli, ["source", "clean", "-n", "nb_123", "-y", "--json"])
-
-            assert result.exit_code == 0, result.output
-            data = json.loads(result.output)
-            assert data["status"] == "completed"
-            assert data["deleted_count"] == 1
-            assert data["failure_count"] == 0
-            assert data["failures"] == []
-            mock_client.sources.delete.assert_awaited_once_with("nb_123", "src_err")
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "completed"
+        assert data["deleted_count"] == 1
+        assert data["failure_count"] == 0
+        assert data["failures"] == []
+        mock_client.sources.delete.assert_awaited_once_with("nb_123", "src_err")
 
 
 # =============================================================================
@@ -2887,72 +3449,522 @@ class TestSourceAddStdinDash:
     """``notebooklm source add -`` reads inline text from stdin."""
 
     def test_source_add_dash_reads_stdin(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "-", "-n", "nb_123"],
+                input="content from stdin\n",
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", "-", "-n", "nb_123"],
-                    input="content from stdin\n",
-                )
-
-            assert result.exit_code == 0, result.output
-            mock_client.sources.add_text.assert_awaited_once()
-            call = mock_client.sources.add_text.call_args
-            # signature: add_text(notebook_id, title, content)
-            assert call.args[0] == "nb_123"
-            assert call.args[2] == "content from stdin"
+        assert result.exit_code == 0, result.output
+        mock_client.sources.add_text.assert_awaited_once()
+        call = mock_client.sources.add_text.call_args
+        # signature: add_text(notebook_id, title, content)
+        assert call.args[0] == "nb_123"
+        assert call.args[2] == "content from stdin"
 
     def test_source_add_dash_with_title(self, runner, mock_auth):
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="My Title")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="My Title")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "-", "--title", "My Title", "-n", "nb_123"],
+                input="hello world\n",
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", "-", "--title", "My Title", "-n", "nb_123"],
-                    input="hello world\n",
-                )
+        assert result.exit_code == 0, result.output
+        call = mock_client.sources.add_text.call_args
+        assert call.args[1] == "My Title"
+        assert call.args[2] == "hello world"
 
-            assert result.exit_code == 0, result.output
-            call = mock_client.sources.add_text.call_args
-            assert call.args[1] == "My Title"
-            assert call.args[2] == "hello world"
+    def test_source_add_dash_with_explicit_text_type_reads_stdin(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "-", "--type", "text", "-n", "nb_123"],
+                input="typed stdin\n",
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_client.sources.add_text.assert_awaited_once()
+        call = mock_client.sources.add_text.call_args
+        assert call.args[2] == "typed stdin"
+
+    @pytest.mark.parametrize("source_type", ["url", "file", "youtube"])
+    def test_source_add_dash_rejects_non_text_type(self, runner, mock_auth, source_type):
+        client_calls: list = []
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "-", "--type", source_type, "-n", "nb_123"],
+                input="content from stdin\n",
+                obj=inject_client(create_mock_client(), recorder=client_calls),
+            )
+
+        assert result.exit_code == 2
+        assert f"Cannot use '-' (stdin) with --type {source_type}" in result.output
+        assert client_calls == []
+
+    def test_source_add_dash_rejects_non_text_type_json(self, runner, mock_auth):
+        client_calls: list = []
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "-", "--type", "url", "-n", "nb_123", "--json"],
+                input="content from stdin\n",
+                obj=inject_client(create_mock_client(), recorder=client_calls),
+            )
+
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert data == {
+            "error": True,
+            "code": "VALIDATION_ERROR",
+            "message": (
+                "Cannot use '-' (stdin) with --type url; stdin content can only be added as text."
+            ),
+        }
+        assert client_calls == []
 
     def test_source_add_literal_dash_path_unchanged(self, runner, mock_auth):
         """Regression: a normal text argument is not treated as stdin."""
-        with patch_client_for_module("source") as mock_client_cls:
-            mock_client = create_mock_client()
-            mock_client.sources.add_text = AsyncMock(
-                return_value=Source(id="src_text", title="Pasted Text")
+        mock_client = create_mock_client()
+        mock_client.sources.add_text = AsyncMock(
+            return_value=Source(id="src_text", title="Pasted Text")
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add", "literal text", "-n", "nb_123"],
+                input="ignored stdin\n",
+                obj=inject_client(mock_client),
             )
-            mock_client_cls.return_value = mock_client
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
-            ) as mock_fetch:
-                mock_fetch.return_value = ("csrf", "session")
-                result = runner.invoke(
-                    cli,
-                    ["source", "add", "literal text", "-n", "nb_123"],
-                    input="ignored stdin\n",
-                )
+        assert result.exit_code == 0, result.output
+        call = mock_client.sources.add_text.call_args
+        assert call.args[2] == "literal text"
 
-            assert result.exit_code == 0, result.output
-            call = mock_client.sources.add_text.call_args
-            assert call.args[2] == "literal text"
+
+# =============================================================================
+# P1.T2 — source.py surgical bug bundle (CLI audit fixes)
+# =============================================================================
+#
+# Eight regression tests, one per bug in the audit's P1.T2 bundle. Each test
+# pins the *fixed* contract; on `main` (pre-fix) every test in this class
+# should be red.
+#
+# Bug index:
+#   1. source delete --json without --yes -> structured JSON error, no prompt.
+#   2. source delete-by-title --json without --yes -> same.
+#   3. source clean --json without --yes (with candidates) -> structured error.
+#   4. source fulltext --json -o FILE -> file written + metadata envelope on stdout.
+#   5. source add -> console.status spinner brackets the awaited upload, not the
+#      pre-await coroutine creation.
+#   6. source add-research -> client.research.poll is task-pinned via task_id.
+#   7. source add-research --no-wait --import-all -> UsageError (exit 2).
+#   8. source clean -> exit code != 0 when any deletion fails.
+
+
+class TestSourceBundleP1T2:
+    """Regression tests for the P1.T2 source.py bug bundle (CLI audit)."""
+
+    def _patch_fetch_tokens(self):
+        return patch.object(
+            auth_module,
+            "fetch_tokens_with_domains",
+            new_callable=AsyncMock,
+            return_value=("csrf", "session"),
+        )
+
+    # ------------------------------------------------------------------
+    # Bug 1: source delete --json without --yes
+    # ------------------------------------------------------------------
+    def test_source_delete_json_without_yes_emits_structured_error_no_prompt(
+        self, runner, mock_auth
+    ):
+        """`source delete <id> --json` without `--yes` must NOT prompt; instead
+        emit a structured JSON error and exit non-zero."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="My Source")])
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with self._patch_fetch_tokens(), patch("click.confirm") as mock_confirm:
+            result = runner.invoke(
+                cli,
+                ["source", "delete", "src_123", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code != 0, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "CONFIRM_REQUIRED"
+        assert "--yes" in data["message"]
+        mock_confirm.assert_not_called()
+        mock_client.sources.delete.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Bug 2: source delete-by-title --json without --yes
+    # ------------------------------------------------------------------
+    def test_source_delete_by_title_json_without_yes_emits_structured_error_no_prompt(
+        self, runner, mock_auth
+    ):
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Test Source")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with self._patch_fetch_tokens(), patch("click.confirm") as mock_confirm:
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "delete-by-title",
+                    "Test Source",
+                    "-n",
+                    "nb_123",
+                    "--json",
+                ],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code != 0, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "CONFIRM_REQUIRED"
+        assert "--yes" in data["message"]
+        mock_confirm.assert_not_called()
+        mock_client.sources.delete.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Bug 3: source clean --json without --yes with candidates
+    # ------------------------------------------------------------------
+    def test_source_clean_json_without_yes_with_candidates_emits_structured_error_no_prompt(
+        self, runner, mock_auth
+    ):
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_src("src_err", title="oops", status=SourceStatus.ERROR)]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=True)
+
+        with self._patch_fetch_tokens(), patch("click.confirm") as mock_confirm:
+            result = runner.invoke(
+                cli, ["source", "clean", "-n", "nb_123", "--json"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code != 0, result.output
+        data = json.loads(result.output)
+        assert data["error"] is True
+        assert data["code"] == "CONFIRM_REQUIRED"
+        assert "--yes" in data["message"]
+        mock_confirm.assert_not_called()
+        mock_client.sources.delete.assert_not_called()
+
+    def test_source_clean_json_already_clean_without_yes_does_not_error(self, runner, mock_auth):
+        """`source clean --json` without --yes must NOT error when there are no
+        candidates — the confirmation is a no-op in that path."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_src("src_1", title="Page", url="https://ex.com/a")]
+        )
+        mock_client.sources.delete = AsyncMock(return_value=None)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli, ["source", "clean", "-n", "nb_123", "--json"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "already_clean"
+
+    # ------------------------------------------------------------------
+    # Bug 4: source fulltext --json -o FILE -> metadata envelope on stdout
+    # ------------------------------------------------------------------
+    def test_source_fulltext_json_with_output_file_writes_file_and_emits_metadata(
+        self, runner, mock_auth, tmp_path
+    ):
+        """`source fulltext --json -o FILE` writes the full content to FILE and
+        emits a metadata envelope on stdout (NOT the full content twice)."""
+        output_file = tmp_path / "fulltext.txt"
+        body = "A" * 1024  # large enough to make the duplication smell obvious
+
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_123", title="Big Source")]
+        )
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="Big Source",
+                content=body,
+                _type_code=5,
+                char_count=len(body),
+                url=None,
+            )
+        )
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "fulltext",
+                    "src_123",
+                    "-n",
+                    "nb_123",
+                    "--json",
+                    "-o",
+                    str(output_file),
+                ],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        # File written with full content (UTF-8).
+        assert output_file.read_text(encoding="utf-8") == body
+        # Stdout is a metadata envelope, NOT the full content.
+        data = json.loads(result.output)
+        assert data["path"] == str(output_file)
+        assert data["bytes"] == len(body.encode("utf-8"))
+        assert data["source_id"] == "src_123"
+        assert data["title"] == "Big Source"
+        assert data["kind"] == "web_page"
+        # Full content must not be in the metadata envelope.
+        assert "content" not in data
+
+    def test_source_fulltext_json_without_output_file_keeps_full_payload(self, runner, mock_auth):
+        """Regression guard: when `-o` is OMITTED, `--json` mode still emits the
+        full public SourceFulltext payload on stdout."""
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Tiny")])
+        mock_client.sources.get_fulltext = AsyncMock(
+            return_value=SourceFulltext(
+                source_id="src_123",
+                title="Tiny",
+                content="hello",
+                _type_code=5,
+                char_count=5,
+                url=None,
+            )
+        )
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "fulltext", "src_123", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["kind"] == "web_page"
+        assert data["content"] == "hello"
+        assert data["char_count"] == 5
+        assert "_type_code" not in data
+
+    # ------------------------------------------------------------------
+    # Bug 5: source add spinner brackets the awaited upload
+    # ------------------------------------------------------------------
+    def test_source_add_spinner_brackets_upload(self, runner, mock_auth):
+        """`source add <url>` non-JSON mode wraps the awaited upload in
+        `console.status(...)`, NOT just the synchronous coroutine creation.
+
+        The pre-fix code did ``with console.status(...): return _run()`` — the
+        ``with`` block exits as soon as ``_run()`` returns the coroutine,
+        BEFORE the coroutine is awaited. We assert spinner enter happens before
+        the upload mock is awaited and spinner exit happens after.
+        """
+        timeline: list[str] = []
+
+        class _RecordingStatus:
+            def __init__(self, message):
+                self.message = message
+
+            def __enter__(self):
+                timeline.append("status.enter")
+                return MagicMock()
+
+            def __exit__(self, *exc):
+                timeline.append("status.exit")
+                return False
+
+        def _make_status(message, *args, **kwargs):
+            return _RecordingStatus(message)
+
+        async def _record_add_url(*args, **kwargs):
+            timeline.append("upload.start")
+            return Source(id="src_new", title="Added", url="https://ex.com")
+
+        mock_client = create_mock_client()
+        mock_client.sources.add_url = AsyncMock(side_effect=_record_add_url)
+
+        with (
+            self._patch_fetch_tokens(),
+            patch.object(source_module.console, "status", side_effect=_make_status),
+        ):
+            result = runner.invoke(
+                cli,
+                ["source", "add", "https://ex.com", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        # The spinner must enclose the upload: enter -> upload -> exit.
+        assert timeline == ["status.enter", "upload.start", "status.exit"], (
+            f"spinner must bracket the awaited upload; got timeline={timeline}"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug 6: source add-research polling must pin to task_id
+    # ------------------------------------------------------------------
+    def test_source_add_research_poll_is_task_pinned(self, runner, mock_auth):
+        """`source add-research` must pass ``task_id`` to ``client.research.poll``
+        so a second research task starting mid-poll cannot cross-wire its
+        sources into this task's import branch."""
+        mock_client = create_mock_client()
+        mock_client.research.start = AsyncMock(
+            return_value=research_start({"task_id": "task_pinned"})
+        )
+        # First poll returns in_progress (so the loop continues at least once
+        # and we can prove the discriminator is threaded); second returns
+        # completed.
+        poll_calls: list[dict] = []
+
+        async def _poll(notebook_id, task_id=None):
+            poll_calls.append({"notebook_id": notebook_id, "task_id": task_id})
+            if len(poll_calls) < 2:
+                return research_task({"status": "in_progress", "task_id": "task_pinned"})
+            return research_task(
+                {
+                    "status": "completed",
+                    "task_id": "task_pinned",
+                    "sources": [],
+                    "report": "",
+                }
+            )
+
+        mock_client.research.poll = AsyncMock(side_effect=_poll)
+
+        # Short-circuit asyncio.sleep so the test does not wait 5s between polls.
+        # Use patch.object on the already-imported module to avoid the dotted-string
+        # path "notebooklm.cli.source_cmd.asyncio.sleep" which fails on Python 3.10 because
+        # mock.patch tries to import "notebooklm.cli.source_cmd" as a package first.
+        with (
+            self._patch_fetch_tokens(),
+            patch.object(source_module.asyncio, "sleep", AsyncMock()),
+        ):
+            result = runner.invoke(
+                cli,
+                ["source", "add-research", "topic", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        assert len(poll_calls) >= 2
+        # Every poll call after the first must carry the task_id
+        # discriminator. (The first call may be unpinned if implementation
+        # discovers the id from start(); the second MUST be pinned.)
+        assert poll_calls[1]["task_id"] == "task_pinned", (
+            f"second poll must pass task_id='task_pinned'; got {poll_calls[1]!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug 7: --no-wait + --import-all is a usage error
+    # ------------------------------------------------------------------
+    def test_source_add_research_no_wait_with_import_all_is_usage_error(
+        self, runner, mock_auth, mock_fetch_tokens
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "source",
+                "add-research",
+                "topic",
+                "--no-wait",
+                "--import-all",
+                "-n",
+                "nb_123",
+            ],
+        )
+
+        # ``click.UsageError`` exits 2 — Click's standard convention.
+        assert result.exit_code == 2, result.output
+        assert "--import-all" in result.output
+        assert "--no-wait" in result.output or "--wait" in result.output
+
+    # ------------------------------------------------------------------
+    # Bug 8: source clean partial-failure exit code
+    # ------------------------------------------------------------------
+    @pytest.mark.parametrize("output_mode", ["text", "json"])
+    def test_source_clean_partial_failure_exits_nonzero(self, runner, mock_auth, output_mode):
+        sources = [
+            _src("src_a", status=SourceStatus.ERROR),
+            _src("src_b", status=SourceStatus.ERROR),
+        ]
+
+        async def fake_delete(nb, sid):
+            if sid == "src_b":
+                raise RuntimeError("boom")
+
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=sources)
+        mock_client.sources.delete = AsyncMock(side_effect=fake_delete)
+
+        args = ["source", "clean", "-n", "nb_123", "-y"]
+        if output_mode == "json":
+            args.append("--json")
+        with self._patch_fetch_tokens():
+            result = runner.invoke(cli, args, obj=inject_client(mock_client))
+
+        assert result.exit_code != 0, result.output
+        if output_mode == "text":
+            assert "1 deletion(s) failed" in result.output
+            assert "src_b" in result.output
+            assert "boom" in result.output
+        else:
+            data = json.loads(result.output)
+            # Behavior parity with text mode: the JSON envelope still carries
+            # the full clean report so callers can introspect which IDs failed.
+            assert data["status"] == "completed"
+            assert data["deleted_count"] == 1
+            assert data["failure_count"] == 1
+            assert data["failures"] == [{"id": "src_b", "error": "boom"}]

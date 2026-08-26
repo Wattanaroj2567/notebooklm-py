@@ -6,10 +6,9 @@ programmatic users had to discover and opt in. Diverges from "smart
 retry" SDK norms.
 
 Post-fix:
-- ``ClientCore.__init__`` defaults ``rate_limit_max_retries`` to ``3``.
-- ``NotebookLMClient.__init__`` and ``NotebookLMClient.from_storage``
-  match the new default.
-- ``_perform_authed_post`` falls back to capped exponential backoff
+- ``NotebookLMClient.__init__`` and ``NotebookLMClient.from_storage`` default
+  ``rate_limit_max_retries`` to ``3``.
+- ``RuntimeTransport.perform_authed_post`` falls back to capped exponential backoff
   (start 1s, cap 30s, ±20% jitter) when a 429 lacks a parseable
   ``Retry-After`` header, so the new default is useful even when the
   server omits the hint.
@@ -33,9 +32,10 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from conftest import install_post_as_stream
 from notebooklm import NotebookLMClient, RateLimitError
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
+from tests.integration.conftest import install_post_as_stream
 
 # Uses synthetic HTTPX responses via mock — no cassette, no real HTTP.
 pytestmark = pytest.mark.allow_no_vcr
@@ -83,15 +83,15 @@ async def test_default_retries_succeed_after_three_429s(auth_tokens) -> None:
 
     # NotebookLMClient default — NO ``rate_limit_max_retries`` kwarg.
     client = NotebookLMClient(auth_tokens)
-    assert client._core._rate_limit_max_retries == 3, (
+    assert client._composed.chain_host._rate_limit_max_retries == 3, (
         "rate_limit_max_retries default must be 3; check that NotebookLMClient.__init__ "
-        "forwards the ClientCore default."
+        "forwards the runtime default."
     )
 
     mock_http = AsyncMock(spec=httpx.AsyncClient)
     mock_http.post = mock_post
     install_post_as_stream(None, mock_http, mock_post)
-    client._core._http_client = mock_http
+    install_http_client_for_test(client._collaborators.kernel, mock_http)
 
     with patch("asyncio.sleep", AsyncMock()) as mock_sleep:
         result = await client.notebooks.list()
@@ -116,12 +116,12 @@ async def test_default_retries_exhausted_raises_rate_limit_error(auth_tokens) ->
     mock_post = AsyncMock(return_value=_build_429("1"))
 
     client = NotebookLMClient(auth_tokens)
-    assert client._core._rate_limit_max_retries == 3
+    assert client._composed.chain_host._rate_limit_max_retries == 3
 
     mock_http = AsyncMock(spec=httpx.AsyncClient)
     mock_http.post = mock_post
     install_post_as_stream(None, mock_http, mock_post)
-    client._core._http_client = mock_http
+    install_http_client_for_test(client._collaborators.kernel, mock_http)
 
     with patch("asyncio.sleep", AsyncMock()) as mock_sleep, pytest.raises(RateLimitError):
         await client.notebooks.list()
@@ -161,7 +161,7 @@ async def test_default_retries_use_exponential_backoff_when_header_missing(
     mock_http = AsyncMock(spec=httpx.AsyncClient)
     mock_http.post = mock_post
     install_post_as_stream(None, mock_http, mock_post)
-    client._core._http_client = mock_http
+    install_http_client_for_test(client._collaborators.kernel, mock_http)
 
     sleep_calls: list[float] = []
 
@@ -195,28 +195,28 @@ async def test_disable_internal_retries_skips_429_loop_under_new_default(
     creates would silently inherit the new default and the idempotency
     safety net would no longer apply.
 
-    This test exercises ``_perform_authed_post`` directly with
+    This test exercises ``RuntimeTransport.perform_authed_post`` directly with
     ``disable_internal_retries=True`` and verifies the very first 429
-    raises ``_TransportRateLimited`` (which the API layer translates
+    raises ``TransportRateLimited`` (which the API layer translates
     into ``RateLimitError``) without sleeping.
     """
-    from notebooklm._core import _TransportRateLimited
+    from notebooklm._transport_errors import TransportRateLimited
 
     mock_post = AsyncMock(return_value=_build_429("1"))
 
     client = NotebookLMClient(auth_tokens)
-    assert client._core._rate_limit_max_retries == 3
+    assert client._composed.chain_host._rate_limit_max_retries == 3
 
     mock_http = AsyncMock(spec=httpx.AsyncClient)
     mock_http.post = mock_post
     install_post_as_stream(None, mock_http, mock_post)
-    client._core._http_client = mock_http
+    install_http_client_for_test(client._collaborators.kernel, mock_http)
 
     def _build_request(_snap):
         return ("https://example.invalid/x", b"body", None)
 
-    with patch("asyncio.sleep", AsyncMock()) as mock_sleep, pytest.raises(_TransportRateLimited):
-        await client._core._perform_authed_post(
+    with patch("asyncio.sleep", AsyncMock()) as mock_sleep, pytest.raises(TransportRateLimited):
+        await client._composed.transport.perform_authed_post(
             build_request=_build_request,
             log_label="test",
             disable_internal_retries=True,

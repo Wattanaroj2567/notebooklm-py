@@ -19,20 +19,12 @@ tests assert:
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
 
-# ``tests/cassette_patterns.py`` lives directly under ``tests/`` (not in a
-# package). Other test modules add it to ``sys.path``; we follow the same
-# convention so the validator is importable in either layout.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-TESTS_DIR = REPO_ROOT / "tests"
-sys.path.insert(0, str(TESTS_DIR))
-
-import vcr_config  # noqa: E402
-from cassette_patterns import (  # noqa: E402
+from tests import vcr_config
+from tests.cassette_patterns import (
     DISPLAY_NAME_FALSE_POSITIVES,
     EMAIL_PROVIDERS,
     HOST_COOKIES,
@@ -40,9 +32,21 @@ from cassette_patterns import (  # noqa: E402
     SCRUB_PLACEHOLDERS,
     SECURE_COOKIES,
     SESSION_COOKIES,
+    find_credential_leaks,
+    find_high_entropy_leaks,
     is_clean,
     scrub_string,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# A synthetic Google API key whose *shape* (``AIza`` + 35 ``[A-Za-z0-9_-]``
+# chars) matches the canonical Google API-key pattern the registry scrubs, but
+# which is built by concatenation at runtime so no contiguous 39-char key
+# literal ever appears in this source file — embedding a real-looking key here
+# would itself trip GitHub secret scanning. The value is obviously fake.
+FAKE_GOOGLE_API_KEY = "AIza" + "FAKE0" * 7
+assert len(FAKE_GOOGLE_API_KEY) == 39  # AIza + 35
 
 # ---------------------------------------------------------------------------
 # Exports
@@ -226,6 +230,7 @@ def test_scrub_is_idempotent_on_already_scrubbed_storage_state() -> None:
         ("oPEP7c", "SCRUBBED_EMAIL"),
         ("S06Grb", "SCRUBBED_USER_ID"),
         ("B8SWKb", "SCRUBBED_API_KEY"),
+        ("JrWMbf", "SCRUBBED_API_KEY"),
         ("at", "SCRUBBED_CSRF"),
     ],
 )
@@ -337,6 +342,216 @@ def test_is_clean_flags_wiz_global_data_unscrubbed_csrf() -> None:
     assert any("SNlM0e" in leak or "CSRF" in leak.upper() for leak in leaks)
 
 
+def test_is_clean_flags_jrwmbf_unscrubbed_api_key() -> None:
+    """``JrWMbf`` left at its real Google API key value is flagged as a leak.
+
+    Regression for the ``generate_mind_map_interactive`` /
+    ``mind_maps_interactive`` cassette leak: the NotebookLM web API key rode in
+    the ``JrWMbf`` WIZ field, which had no scrubber, so the key round-tripped
+    into committed cassettes unredacted.
+    """
+    text = f'{{"JrWMbf":"{FAKE_GOOGLE_API_KEY}"}}'
+    ok, leaks = is_clean(text)
+    assert not ok
+    assert any("JrWMbf" in leak or "Google API key" in leak for leak in leaks)
+
+
+def test_is_clean_flags_bare_google_api_key_in_unknown_field() -> None:
+    """A Google API-key shape is flagged even outside any known WIZ field.
+
+    The field-name-agnostic catch-all detector is the backstop that closes the
+    ``JrWMbf`` gap class: a key in any future/unknown field is still caught.
+    """
+    text = f'{{"SomeUnknownField":"{FAKE_GOOGLE_API_KEY}"}}'
+    ok, leaks = is_clean(text)
+    assert not ok
+    assert any("Google API key" in leak for leak in leaks)
+
+
+def test_scrub_removes_google_api_key_in_unknown_field() -> None:
+    """The catch-all scrubber collapses an ``AIza`` key in any field."""
+    text = f'{{"SomeUnknownField":"{FAKE_GOOGLE_API_KEY}"}}'
+    scrubbed = scrub_string(text)
+    assert FAKE_GOOGLE_API_KEY not in scrubbed
+    assert "SCRUBBED_API_KEY" in scrubbed
+
+
+def test_longer_than_canonical_api_key_is_fully_scrubbed_no_partial_leak() -> None:
+    """A key with MORE than 35 tail chars is scrubbed in full (no trailing leak).
+
+    Regression for the exact-``{35}``-quantifier partial-leak class: with an
+    exact quantifier, ``AIza`` + 36 chars in an unknown field would scrub only
+    the first 39 chars and leave a trailing fragment that ``SCRUBBED_API_KEY``
+    no longer re-matches — silently leaking the tail. The greedy ``{35,}`` tail
+    consumes the whole contiguous key-char run.
+    """
+    # Tail char ``Z`` is absent from the ``SCRUBBED_API_KEY`` sentinel, so its
+    # presence in the output can only mean an un-scrubbed key fragment survived.
+    long_key = "AIza" + "Z" * 40  # 4 + 40 = 44 chars, well over the canonical 39
+    text = f'{{"SomeUnknownField":"{long_key}"}}'
+    scrubbed = scrub_string(text)
+    # No fragment of the original key survives (not even a trailing remainder).
+    assert "Z" not in scrubbed, scrubbed
+    assert "AIza" not in scrubbed, scrubbed
+    assert "SCRUBBED_API_KEY" in scrubbed
+    # And the validator agrees the scrubbed output is clean.
+    assert is_clean(scrubbed)[0]
+    # The raw long key is itself flagged before scrubbing.
+    assert find_credential_leaks(text)
+
+
+# ---------------------------------------------------------------------------
+# find_credential_leaks — high-severity-only subset (for fixture scanning)
+# ---------------------------------------------------------------------------
+
+
+def test_find_credential_leaks_flags_google_api_key() -> None:
+    """A Google API-key shape is reported by the credential-only scanner."""
+    leaks = find_credential_leaks(f'{{"JrWMbf":"{FAKE_GOOGLE_API_KEY}"}}')
+    assert any("Google API key" in leak for leak in leaks)
+
+
+def test_find_credential_leaks_flags_auth_token() -> None:
+    """A raw ``g.a000-`` auth token is reported by the credential-only scanner."""
+    leaks = find_credential_leaks("Cookie: SID=g.a000-abcdefghijklmnop")
+    assert any("auth token" in leak for leak in leaks)
+
+
+def test_find_credential_leaks_ignores_placeholder_fixture_content() -> None:
+    """Placeholder content that trips ``is_clean`` is NOT flagged here.
+
+    This is the property that makes ``--secrets-only`` safe to run over
+    ``tests/fixtures/`` — escaped display names, test emails, and scrubbed
+    cookie sentinels are all ignored; only real credential shapes match.
+    """
+    fixture_like = (
+        '[\\"Scrubbed Note Title\\",\\"alice@gmail.com\\"]'
+        ' {"SID":"SCRUBBED"} {"oPEP7c":"SCRUBBED_EMAIL"}'
+    )
+    # is_clean WOULD flag the escaped display name / email here ...
+    assert not is_clean(fixture_like)[0]
+    # ... but the credential-only scanner stays silent.
+    assert find_credential_leaks(fixture_like) == []
+
+
+# ---------------------------------------------------------------------------
+# Generic high-entropy / unknown-field credential scan (issue #1382)
+# ---------------------------------------------------------------------------
+#
+# The targeted detectors above are name-anchored or known-shape, making the
+# guard necessary-but-not-sufficient: a NOVEL token shape, or a known secret in
+# an un-targeted field, passes silently (the LSID / JrWMbf leaks). These tests
+# pin the field-agnostic backstop: it WOULD catch a planted novel token, yet
+# produces ZERO false positives on every committed cassette.
+
+# Synthetic novel credentials assembled at runtime from shorter chunks so this
+# source file carries NO contiguous static credential-shaped literal — a 64-char
+# hex or 40+ char base64 string written inline would itself trip secret scanning
+# (Betterleaks flags it as a generic API key). The shapes are also distinct from
+# the known g.a000-/sidts-/ya29./AIza prefixes, and the deterministic mixes keep
+# the base64 entropy well above the 4.0 bits/char floor.
+NOVEL_BASE64_TOKEN = "".join(
+    ("kJ8sLm2NpQr5TvWx", "Yz0AbCdEfGhIjKlM", "nOpQrStUvWxYz123", "45678AbCdEf")
+)
+NOVEL_HEX_TOKEN = "".join(
+    ("9f8e7d6c5b4a3928", "17065fe4d3c2b1a0", "9f8e7d6c5b4a3928", "17065fe4d3c2b1a0")
+)
+assert len(NOVEL_BASE64_TOKEN) >= 40
+assert len(NOVEL_HEX_TOKEN) >= 64
+
+
+def test_entropy_scan_flags_novel_base64_token_in_unknown_field() -> None:
+    """A long high-entropy base64 token in an UNKNOWN field is flagged.
+
+    This is the residual-risk shape the name-anchored detectors miss: a credential
+    family the registry does not yet know about, riding in a field that is not on
+    any allowlist. The generic entropy scan catches it by shape alone.
+    """
+    payload = f'{{"sessionBlob":"{NOVEL_BASE64_TOKEN}"}}'
+    leaks = find_high_entropy_leaks(payload)
+    assert any("high-entropy token" in leak for leak in leaks), leaks
+    # It also surfaces through both public entry points.
+    assert any("high-entropy token" in leak for leak in find_credential_leaks(payload))
+    assert not is_clean(payload)[0]
+
+
+def test_entropy_scan_flags_novel_hex_token_in_unknown_field() -> None:
+    """A long pure-hex token (64+ chars) in an unknown field is flagged.
+
+    Hex entropy caps at log2(16) == 4.0 bits/char, so the base64 entropy bar can
+    never reliably fire on it — the scan routes pure-hex tokens onto a dedicated
+    64-char length floor instead.
+    """
+    payload = f'{{"legacyToken":"{NOVEL_HEX_TOKEN}"}}'
+    assert any("high-entropy token" in leak for leak in find_high_entropy_leaks(payload))
+    assert not is_clean(payload)[0]
+
+
+def test_entropy_scan_ignores_internal_uuid() -> None:
+    """A 36-char UUID (artifact / source / conversation ID) is NOT flagged.
+
+    UUIDs are NotebookLM-internal identifiers the scrubbers deliberately
+    preserve. They fall under both the 40-char base64 length floor and the
+    explicit UUID-shape allowlist, so the scan must stay silent.
+    """
+    payload = '{"artifactId":"06f0c5bd-108f-4c8b-8911-34b2acc656de"}'
+    assert find_high_entropy_leaks(payload) == []
+    assert is_clean(payload)[0]
+
+
+def test_entropy_scan_ignores_scrub_placeholders() -> None:
+    """Canonical scrub placeholders are never flagged (idempotent validation)."""
+    for placeholder in SCRUB_PLACEHOLDERS:
+        payload = f'{{"field":"{placeholder}"}}'
+        assert find_high_entropy_leaks(payload) == [], placeholder
+
+
+def test_entropy_scan_ignores_short_token() -> None:
+    """A token below the 40-char base64 length floor is not flagged."""
+    payload = '{"x":"abcdef1234567890ABCDEF"}'  # 22 chars, high entropy
+    assert find_high_entropy_leaks(payload) == []
+
+
+def test_entropy_scan_ignores_unquoted_high_entropy_content() -> None:
+    """High-entropy content that is NOT a quoted scalar is out of scope.
+
+    The scan deliberately anchors on a quoted JSON string scalar — the shape a
+    leaked credential takes in an unknown field — so the legitimate high-entropy
+    text that pervades real cassettes (CSS class runs, base64 query blobs split
+    by ``=``/``&``, hex mind-map data) stays out of scope. This documents that
+    blind spot as a deliberate decision, not an accident.
+    """
+    # Mirrors a real cassette ``context=eJw...`` zlib-base64 query param: the
+    # token is preceded by ``context=`` and is NOT inside quotes.
+    blob = "kJ8sLm2NpQr5TvWxYz0AbCdEfGhIjKlMnOpQrStUvWxYz12345678AbCdEf"
+    assert find_high_entropy_leaks(f"context={blob}&next=1") == []
+
+
+def test_all_committed_cassettes_pass_entropy_scan() -> None:
+    """ZERO false positives: every committed cassette passes the entropy scan.
+
+    Calibration guard. The thresholds are tuned against the real corpus; if a
+    future cassette legitimately carries a quoted high-entropy scalar this test
+    fails loudly so the threshold/allowlist is revisited deliberately rather
+    than the scan silently regressing into noise.
+    """
+    cassette_dir = REPO_ROOT / "tests" / "cassettes"
+    offenders: list[str] = []
+    for cassette in sorted(cassette_dir.rglob("*.yaml")):
+        # ``examples/`` holds illustrative fixtures with hand-edited placeholder
+        # content, excluded from the real-recording guard for the same reason
+        # the checker excludes them.
+        if "examples" in cassette.parts:
+            continue
+        text = cassette.read_text(encoding="utf-8", errors="replace")
+        leaks = find_high_entropy_leaks(text)
+        if leaks:
+            offenders.append(f"{cassette.name}: {leaks[:3]}")
+    assert not offenders, "entropy scan false-positives on committed cassettes:\n" + "\n".join(
+        offenders
+    )
+
+
 # ---------------------------------------------------------------------------
 # Round-trip: scrub_string(x) is always is_clean
 # ---------------------------------------------------------------------------
@@ -364,6 +579,10 @@ def test_is_clean_flags_wiz_global_data_unscrubbed_csrf() -> None:
         '{"qDCSke":"123456789012345678901"}',
         '{"B8SWKb":"AIzaSyAREAL_API_KEY_HERE"}',
         '{"VqImj":"AIzaSyAREAL_API_KEY_HERE"}',
+        f'{{"JrWMbf":"{FAKE_GOOGLE_API_KEY}"}}',
+        # Bare Google API-key shape outside any known WIZ field — the
+        # field-name-agnostic catch-all must still scrub it.
+        f'{{"SomeUnknownField":"{FAKE_GOOGLE_API_KEY}"}}',
         '{"QGcrse":"real-client-id"}',
         '{"iQJtYd":"real-project-id"}',
         "f.sid=REAL_SESSION_TOKEN",
@@ -496,18 +715,12 @@ def test_upload_id_header_scrubbed() -> None:
 
 
 def test_upload_url_full_scrubbed() -> None:
-    """A full notebooklm upload URL is replaced with the URL placeholder.
-
-    The whole URL collapses to ``SCRUBBED_UPLOAD_URL`` (rather than leaving
-    a half-scrubbed ``upload_id=...`` fragment) so that the standalone
-    ``upload_id=`` pattern below cannot re-match the placeholder — which
-    would otherwise produce a non-idempotent rewrite.
-    """
+    """A full notebooklm upload URL preserves host/path and scrubs the token."""
     url = (
         "https://notebooklm.google.com/upload/_/?authuser=0&upload_id=AJRbA5XZXPNXlxYzAbcdef_-12345"
     )
     scrubbed = scrub_string(url)
-    assert scrubbed == "SCRUBBED_UPLOAD_URL"
+    assert scrubbed == "https://notebooklm.google.com/upload/_/?upload_id=SCRUBBED_UPLOAD_ID"
     assert "AJRbA5XZXPNXlx" not in scrubbed
 
 
@@ -636,6 +849,7 @@ def test_is_clean_recognizes_upload_drive_placeholders() -> None:
     for placeholder in [
         "X-GUploader-UploadID: SCRUBBED_UPLOAD_ID",
         "upload_id=SCRUBBED_UPLOAD_ID",
+        "https://notebooklm.google.com/upload/_/?upload_id=SCRUBBED_UPLOAD_ID",
         "SCRUBBED_UPLOAD_URL",
         "SCRUBBED_AONS",
         '{"file_id": "SCRUBBED_DRIVE_FILE_ID"}',
@@ -875,13 +1089,20 @@ def test_is_clean_recognizes_display_name_avatar_placeholders() -> None:
 def test_display_name_false_positives_mirror_shape_lint() -> None:
     """The scrub-registry allowlist must stay in sync with the shape-lint allowlist.
 
-    ``tests/unit/test_cassette_shapes.py`` carries the same set under a
-    slightly different name (``DISPLAY_NAME_FALSE_POSITIVES``), with each
-    entry wrapped in the cassette's escape-quote form. If the two drift,
-    a real cassette could pass shape-lint but trip the scrub detector (or
-    vice versa) — this test forces both lists to be updated together.
+    The shape lint carries the same set under the same name
+    (``DISPLAY_NAME_FALSE_POSITIVES``) with each entry wrapped in the
+    cassette's escape-quote form. If the two drift, a real cassette could pass
+    shape-lint but trip the scrub detector (or vice versa) — this test forces
+    both lists to be updated together.
     """
-    from test_cassette_shapes import DISPLAY_NAME_FALSE_POSITIVES as SHAPE_LINT_FPS
+    # The shape-lint allowlist now lives in the shared non-test helper
+    # ``_guardrails._cassette_shape_lint`` (issue #1431); importing it from
+    # that ``_``-prefixed module avoids a test-imports-test dependency on
+    # ``test_cassette_shapes``. ``tests/`` is on ``sys.path`` so the
+    # ``_guardrails`` package resolves.
+    from tests._guardrails._cassette_shape_lint import (
+        DISPLAY_NAME_FALSE_POSITIVES as SHAPE_LINT_FPS,
+    )
 
     # Shape-lint stores entries as ``\"Name\"``; the scrub registry stores
     # bare names. Strip the escape wrapping to compare apples-to-apples.
@@ -890,5 +1111,6 @@ def test_display_name_false_positives_mirror_shape_lint() -> None:
     )
     assert shape_lint_bare == DISPLAY_NAME_FALSE_POSITIVES, (
         "Display-name false-positive allowlist drifted from shape-lint allowlist; "
-        "update BOTH tests/cassette_patterns.py and tests/unit/test_cassette_shapes.py"
+        "update BOTH tests/cassette_patterns.py and "
+        "tests/_guardrails/_cassette_shape_lint.py"
     )

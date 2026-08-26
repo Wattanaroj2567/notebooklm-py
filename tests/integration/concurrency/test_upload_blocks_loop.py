@@ -58,13 +58,16 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import threading
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from notebooklm._source.upload import SourceUploadPipeline
 from notebooklm._sources import SourcesAPI
+from tests._fixtures.fake_core import FakeSession, make_fake_core
 
 # mock-based loop-blocking detection tests; no HTTP, no cassette.
 # Opt out of the tier-enforcement hook in tests/integration/conftest.py.
@@ -87,26 +90,36 @@ HEARTBEAT_INTERVAL_S = 0.01
 MIN_HEARTBEATS = 5
 
 
-def _make_sources_api() -> tuple[SourcesAPI, MagicMock]:
-    """Build a SourcesAPI with a minimal mocked core.
+def _make_sources_api() -> tuple[SourcesAPI, FakeSession]:
+    """Build a SourcesAPI via constructor-injection over ``make_fake_core``.
 
     Mirrors ``tests/unit/test_sources_upload.py``'s ``mock_core`` /
-    ``sources_api`` fixture pair. We don't import them because they are
-    module-local; copying the four-line setup here keeps the test
-    self-contained and avoids a conftest cross-dependency between
-    unit/ and integration/concurrency/.
+    ``sources_api`` fixture pair, which themselves build on
+    ``make_fake_core`` — the sanctioned ADR-0007 substrate. The fake bundles
+    every narrow collaborator the upload pipeline needs:
+
+    - ``rpc_executor.rpc_call`` (RpcCaller) — injected fresh per call so a
+      test can set ``.return_value`` without the default ``side_effect``
+      shadowing it,
+    - ``operation_scope`` (the ``drain`` slot) and ``assert_bound_loop``
+      (the ``lifecycle`` slot) used by ``add_file``,
+    - ``kernel`` (live cookie jar) and ``auth`` (authuser routing) consumed
+      by the streaming/start paths,
+    - ``record_upload_queue_wait`` for the upload-metrics path.
+
+    Returning the fake lets callers configure ``core.rpc_executor.rpc_call``
+    and assert it was awaited (the Form-1 bite-check for ADR-0007).
     """
-    core = MagicMock()
-    core.rpc_call = AsyncMock()
-    core.auth = MagicMock()
-    core.auth.authuser = 0
-    core.auth.account_email = None
-    core.auth.cookie_jar = MagicMock(name="auth_cookie_jar")
-    core.get_http_client.return_value.cookies = MagicMock(name="live_cookie_jar")
-    core._begin_transport_post = AsyncMock(return_value=object())
-    core._finish_transport_post = AsyncMock()
-    core.record_upload_queue_wait = MagicMock()
-    return SourcesAPI(core), core
+    core = make_fake_core(rpc_call=AsyncMock())
+    uploader = SourceUploadPipeline(
+        rpc=core.rpc_executor,
+        drain=core,
+        lifecycle=core,
+        kernel=core.kernel,
+        auth=core.auth,
+        record_upload_queue_wait=core.record_upload_queue_wait,
+    )
+    return SourcesAPI(core.rpc_executor, uploader=uploader), core
 
 
 class _SlowReadFile:
@@ -239,7 +252,7 @@ async def test_upload_file_streaming_fd_path_does_not_block_event_loop() -> None
 
         async def _upload() -> None:
             await sources_api._upload_file_streaming(
-                "https://upload.example.com/session",
+                "https://notebooklm.google.com/upload/_/?upload_id=session",
                 file_obj,
                 filename="slow.bin",
             )
@@ -293,7 +306,7 @@ async def test_upload_file_streaming_path_fallback_does_not_block_event_loop(
 
         async def _upload() -> None:
             await sources_api._upload_file_streaming(
-                "https://upload.example.com/session",
+                "https://notebooklm.google.com/upload/_/?upload_id=session",
                 test_file,
             )
 
@@ -306,3 +319,84 @@ async def test_upload_file_streaming_path_fallback_does_not_block_event_loop(
         f"still running on the event-loop thread — wrap it with "
         f"asyncio.to_thread."
     )
+
+
+@pytest.mark.asyncio
+async def test_add_file_open_runs_off_loop_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``add_file``'s ``open()`` + ``fstat()`` must run off the event loop.
+
+    Pre-fix the ``open()`` and ``os.fstat`` calls inside ``add_file``
+    execute as synchronous syscalls directly on the loop thread. On a
+    slow network mount that stalls every other concurrent coroutine for
+    the full ``open`` latency. The fix wraps the pair in
+    ``await asyncio.to_thread(...)``.
+
+    Methodology mirrors ``test_download_blocks_loop.py``: we monkey-patch
+    ``builtins.open`` so it captures ``threading.get_ident()`` on the
+    very first call for our test file. If the wrap is in place the
+    captured id differs from the loop thread id; a regression that
+    removes the wrap leaves them equal.
+    """
+    sources_api, _core = _make_sources_api()
+    test_file = tmp_path / "to_open.bin"
+    test_file.write_bytes(b"payload")
+
+    real_open = builtins.open
+    loop_thread_id = threading.get_ident()
+    captured: list[int] = []
+
+    def _recording_open(file, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        # Only record when the open is for our test file in binary mode
+        # — log handlers, .pyc caches, etc. can also call builtins.open
+        # and would otherwise pollute the capture list.
+        try:
+            same = Path(file).resolve() == test_file.resolve()
+        except (TypeError, ValueError):
+            same = False
+        if same and "b" in mode:
+            captured.append(threading.get_ident())
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _recording_open)
+
+    # Mock the registration RPC so we never hit the wire. Two RPC calls
+    # land before ``add_file`` returns: GET_NOTEBOOK (baseline list) and
+    # ADD_SOURCE_FILE (register). The "[[[['src_t1']]]]" shape feeds the
+    # standard SOURCE_ID walker in ``_extract_register_file_source_id``.
+    _core.rpc_executor.rpc_call.return_value = [[[["src_t1"]]]]
+
+    mock_start_response = MagicMock()
+    mock_start_response.headers = {
+        "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+    }
+    mock_upload_response = MagicMock()
+    mock_upload_response.raise_for_status = MagicMock()
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_client.post.side_effect = [mock_start_response, mock_upload_response]
+        mock_client_cls.return_value = mock_client
+
+        await sources_api.add_file("nb_t1", str(test_file))
+
+    # The first `open` on our test file is the production ``open()``
+    # inside the upload-semaphore block. Subsequent `open`s (e.g. the
+    # finalize path) are not under test here.
+    assert captured, (
+        "builtins.open was never called for the test file — the patch target "
+        "or the production code path may have changed."
+    )
+    assert captured[0] != loop_thread_id, (
+        f"add_file's open() ran on the event-loop thread (thread id {captured[0]}). "
+        "It must be wrapped in asyncio.to_thread so a slow filesystem cannot stall "
+        "concurrent tasks."
+    )
+    # Form-1 bite-check (ADR-0007): prove the constructor-injected RPC
+    # collaborator from ``make_fake_core`` is the one ``add_file`` drove,
+    # so the migration off the monkeypatch allowlist is wired, not a no-op.
+    _core.rpc_executor.rpc_call.assert_awaited()

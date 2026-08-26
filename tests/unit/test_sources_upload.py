@@ -4,12 +4,14 @@ import ast
 import inspect
 import textwrap
 import warnings
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from notebooklm._source_upload import SourceUploadPipeline
+from notebooklm._source.upload import SourceUploadPipeline
 from notebooklm._sources import SourcesAPI
 from notebooklm.exceptions import NetworkError, RPCError, ValidationError
 from notebooklm.rpc import RPCMethod
@@ -19,9 +21,10 @@ from notebooklm.types import Source
 
 @pytest.fixture
 def mock_core():
-    """Create a mocked ClientCore for SourcesAPI."""
-    core = MagicMock()
-    core.rpc_call = AsyncMock()
+    """Create a mocked Session for SourcesAPI."""
+    from tests._fixtures.fake_core import make_fake_core
+
+    core = make_fake_core(rpc_call=AsyncMock())
     core.auth = MagicMock()
     core.auth.authuser = 0
     core.auth.account_email = None
@@ -31,20 +34,20 @@ def mock_core():
     auth_cookie_jar = MagicMock(name="auth_cookie_jar")
     live_cookie_jar = MagicMock(name="live_cookie_jar")
     core.auth.cookie_jar = auth_cookie_jar
+    core.get_http_client = MagicMock()
     core.get_http_client.return_value.cookies = live_cookie_jar
-    # After D2 cutover, ``_source_upload`` reaches the live cookie jar via
-    # ``capabilities.live_cookies()`` (the ``CookieJarProvider`` Protocol).
-    # Wire the same ``live_cookie_jar`` to that method so the
-    # ``_assert_async_client_uses_live_cookies`` invariant still proves the
-    # upload pipeline reuses the live jar.
+    core.kernel = core
+    # The stateful upload pipeline reaches the live cookie jar through the
+    # injected kernel/session compatibility path. Keep this distinct from
+    # auth.cookie_jar so the invariant still proves uploads reuse the live jar.
     core.live_cookies = MagicMock(return_value=live_cookie_jar)
-    # Mirror ``ClientCore``'s ``AuthRouteProvider`` surface. The
+    # Mirror ``Session``'s auth-route helper surface. The
     # ``authuser_query()`` and ``authuser_header()`` callables read
     # ``core.auth.authuser`` / ``core.auth.account_email`` at call time so
     # tests that mutate ``mock_core.auth.authuser`` mid-test still observe
     # the updated routing.
-    from notebooklm.auth import authuser_query as _authuser_query
-    from notebooklm.auth import format_authuser_value as _authuser_header
+    from notebooklm._auth.account import authuser_query as _authuser_query
+    from notebooklm._auth.account import format_authuser_value as _authuser_header
 
     core.authuser_query = MagicMock(
         side_effect=lambda: _authuser_query(core.auth.authuser, core.auth.account_email)
@@ -52,19 +55,80 @@ def mock_core():
     core.authuser_header = MagicMock(
         side_effect=lambda: _authuser_header(core.auth.authuser, core.auth.account_email)
     )
-    core._begin_transport_post = AsyncMock(return_value=object())
-    core._finish_transport_post = AsyncMock()
+    core._drain_tracker = MagicMock()
+    core._drain_tracker.begin_transport_post = AsyncMock(return_value=object())
+    core._drain_tracker.finish_transport_post = AsyncMock()
+    core.operation_scope = MagicMock()
+
+    def operation_scope(_label):
+        @asynccontextmanager
+        async def scope() -> AsyncIterator[None]:
+            yield None
+
+        return scope()
+
+    core.operation_scope.side_effect = operation_scope
     core.record_upload_queue_wait = MagicMock()
+    # Audit C1: :class:`SourceUploadPipeline` now takes ``LoopGuard``
+    # directly (the ``lifecycle`` constructor slot) so
+    # :meth:`SourceUploadPipeline.add_file` short-circuits cross-loop
+    # misuse. MagicMock blocks ``assert``-prefixed attribute access as a
+    # foot-gun guard, so the no-op stub must be installed explicitly.
+    core.assert_bound_loop = MagicMock()
     return core
 
 
 @pytest.fixture
 def sources_api(mock_core):
-    """Create SourcesAPI with mocked core."""
-    return SourcesAPI(mock_core)
+    """Create SourcesAPI with mocked core.
+
+    The uploader is constructed explicitly from the same mocked core so the
+    upload-path tests still exercise the real :class:`SourceUploadPipeline`
+    while honoring the now-required ``uploader=`` kwarg on
+    :class:`SourcesAPI`. ``mock_core`` bundles ``rpc_call`` /
+    ``operation_scope`` / ``assert_bound_loop`` so it structurally
+    satisfies all three of the pipeline's narrow collaborator slots.
+    """
+    uploader = SourceUploadPipeline(
+        rpc=mock_core,
+        drain=mock_core,
+        lifecycle=mock_core,
+        kernel=mock_core.kernel,
+        auth=mock_core.auth,
+        record_upload_queue_wait=mock_core.record_upload_queue_wait,
+    )
+    return SourcesAPI(mock_core, uploader=uploader)
 
 
-def _self_core_auth_attr_read(node: ast.AST, attr: str) -> bool:
+@pytest.mark.asyncio
+async def test_add_drive_file_asserts_bound_loop_before_fetch(sources_api, mock_core):
+    """A cross-loop ``add_drive_file`` fails before any download/fetch runs (#1884).
+
+    The download-gating semaphore's ``assert_bound_loop`` is the seam: it fires
+    from ``get_download_semaphore`` BEFORE ``DriveImportService.add_drive_file``
+    (and thus any network fetch). Getting exactly that ``wrong loop`` error back —
+    not a network/httpx error — proves the fetch never ran.
+    """
+    mock_core.assert_bound_loop = MagicMock(side_effect=RuntimeError("wrong loop"))
+    with pytest.raises(RuntimeError, match="wrong loop"):
+        await sources_api.add_drive_file("nb_1", "https://drive.google.com/open?id=" + "a" * 33)
+    mock_core.assert_bound_loop.assert_called()
+
+
+def test_sources_api_makes_uploader_share_lifecycle_collaborators(sources_api):
+    """SourcesAPI is the single owner of the source-lifecycle verbs.
+
+    The upload pipeline's ``list_sources`` / ``get_source`` / ``wait_*``
+    helpers must delegate to the SAME ``SourceLister`` / ``SourcePoller``
+    instances the public API uses, rather than parallel copies built in the
+    pipeline constructor (issue #1205). ``SourcesAPI.__init__`` injects its
+    own collaborators via ``configure_source_lifecycle``.
+    """
+    assert sources_api._uploader._lister is sources_api._lister
+    assert sources_api._uploader._poller is sources_api._poller
+
+
+def _self_runtime_auth_attr_read(node: ast.AST, attr: str) -> bool:
     return (
         isinstance(node, ast.Attribute)
         and node.attr == attr
@@ -102,14 +166,14 @@ def _self_core_http_client_cookies_read(node: ast.AST) -> bool:
         SourceUploadPipeline.cancel_upload_session,
     ],
 )
-def test_upload_helpers_do_not_read_core_auth_or_live_cookies_directly(helper):
+def test_upload_helpers_do_not_read_runtime_auth_or_live_cookies_directly(helper):
     """Upload helpers must route through the narrow capability Protocols, not broad core internals."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(helper)))
     violations = [
         ast.unparse(node)
         for node in ast.walk(tree)
-        if _self_core_auth_attr_read(node, "authuser")
-        or _self_core_auth_attr_read(node, "account_email")
+        if _self_runtime_auth_attr_read(node, "authuser")
+        or _self_runtime_auth_attr_read(node, "account_email")
         or _self_core_http_client_cookies_read(node)
     ]
 
@@ -122,6 +186,71 @@ def _assert_async_client_uses_live_cookies(mock_client_cls, mock_core) -> None:
         is mock_core.get_http_client.return_value.cookies
     )
     assert mock_client_cls.call_args.kwargs["cookies"] is not mock_core.auth.cookie_jar
+
+
+class TestWaitArgsKeywordOnly:
+    """``wait`` / ``wait_timeout`` are keyword-only on the ``add_*`` methods.
+
+    The v0.4.x positional-wait compatibility shim was removed in v0.7.0
+    (see ``docs/deprecations.md``). Passing ``wait`` / ``wait_timeout``
+    positionally now raises ``TypeError`` from Python's own argument
+    binding rather than emitting a ``DeprecationWarning``.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("add_url", ("nb_123", "https://example.com/article")),
+            ("add_text", ("nb_123", "Title", "Body")),
+            ("add_file", ("nb_123", "document.pdf", None)),
+            (
+                "add_drive",
+                (
+                    "nb_123",
+                    "drive_file_id",
+                    "Drive Doc",
+                    "application/vnd.google-apps.document",
+                ),
+            ),
+        ],
+    )
+    async def test_keyword_wait_args_forward(self, sources_api, method_name, args):
+        target = sources_api._uploader if method_name == "add_file" else sources_api._adder
+        patched = AsyncMock(return_value=Source(id="src_123", title="Source"))
+        setattr(target, method_name, patched)
+        # #1960: add_url/add_drive run a best-effort post-add rename when a requested
+        # title differs from the returned one; stub it so this wait-arg forwarding
+        # test stays focused on the adder call.
+        sources_api.rename = AsyncMock(return_value=Source(id="src_123", title="Source"))
+
+        method = getattr(sources_api, method_name)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            result = await method(*args, wait=True, wait_timeout=45.0)
+
+        assert result.id == "src_123"
+        patched.assert_awaited_once()
+        assert patched.call_args.kwargs["wait"] is True
+        assert patched.call_args.kwargs["wait_timeout"] == 45.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("add_url", ("nb_123", "https://example.com/article")),
+            ("add_text", ("nb_123", "Title", "Body")),
+            ("add_file", ("nb_123", "document.pdf", None)),
+            (
+                "add_drive",
+                ("nb_123", "drive_file_id", "Drive Doc", "application/vnd.google-apps.document"),
+            ),
+        ],
+    )
+    async def test_positional_wait_args_raise_type_error(self, sources_api, method_name, args):
+        method = getattr(sources_api, method_name)
+        with pytest.raises(TypeError):
+            await method(*args, True, 45.0)
 
 
 # =============================================================================
@@ -192,6 +321,37 @@ class TestExtractYoutubeVideoId:
 # =============================================================================
 
 
+# A decoded GET_NOTEBOOK payload for a notebook with no sources, in the shape
+# the server actually sends: the title in slot 0, and slot 1 **elided to None**
+# rather than an empty list. Verified against the recorded zero-source frame in
+# ``tests/cassettes/notebook_zero_sources.yaml``. ``SourceLister._extract_sources_list``
+# has a dedicated branch for that ``None`` (its comment names this very cassette),
+# so a ``[]`` here would decode to the same ``[]`` while exercising the *other*
+# branch — the one a notebook that once had sources returns.
+_EMPTY_NOTEBOOK: list = [["Test Notebook", None]]
+
+
+def _register_response_only(mock_core, response) -> None:
+    """Drive the register RPC with ``response``, leaving the list RPCs healthy.
+
+    ``mock_core.rpc_executor.rpc_call`` answers *every* method from one mock, so
+    a bare ``return_value = <register payload>`` also hands that payload to the
+    two ``GET_NOTEBOOK`` reads the register path makes — the idempotency
+    baseline before the create, and the probe after it when the register
+    response carries no trustworthy SOURCE_ID. The notebook decoder rejects a
+    register payload, so both reads were failing in every test that used
+    ``return_value``.
+
+    That was invisible while both failures were swallowed. Since #2220 the probe
+    propagates, so an incidentally-broken list now aborts the call before the
+    assertion under test is reached. Answering the list RPCs properly is not a
+    workaround for that change: these tests are about how a malformed *register*
+    response is decoded, and a probe failing for unrelated reasons was never
+    what they meant to exercise.
+    """
+    mock_core.rpc_executor.rpc_call.side_effect = [_EMPTY_NOTEBOOK, response, _EMPTY_NOTEBOOK]
+
+
 class TestRegisterFileSource:
     """Tests for file source registration."""
 
@@ -205,20 +365,20 @@ class TestRegisterFileSource:
         mis-matching a pre-existing same-named source on a retry probe.
         """
         # Response structure: [[[["source_id_123"]]]] - 4 levels with string at deepest
-        mock_core.rpc_call.return_value = [[[["source_id_abc"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["source_id_abc"]]]]
 
         result = await sources_api._register_file_source("nb_123", "test.pdf")
 
         assert result == "source_id_abc"
         # 2 calls: baseline GET_NOTEBOOK + ADD_SOURCE_FILE register.
-        assert mock_core.rpc_call.call_count == 2
-        methods_called = [call.args[0] for call in mock_core.rpc_call.await_args_list]
+        assert mock_core.rpc_executor.rpc_call.call_count == 2
+        methods_called = [call.args[0] for call in mock_core.rpc_executor.rpc_call.await_args_list]
         assert RPCMethod.ADD_SOURCE_FILE in methods_called
 
     @pytest.mark.asyncio
     async def test_register_file_source_parses_deeply_nested(self, sources_api, mock_core):
         """Test parsing deeply nested response."""
-        mock_core.rpc_call.return_value = [[[["my_source_id"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["my_source_id"]]]]
 
         result = await sources_api._register_file_source("nb_123", "doc.docx")
 
@@ -229,7 +389,7 @@ class TestRegisterFileSource:
         """Test that null response raises SourceAddError."""
         from notebooklm.exceptions import SourceAddError
 
-        mock_core.rpc_call.return_value = None
+        _register_response_only(mock_core, None)
 
         with pytest.raises(SourceAddError, match="Failed to get SOURCE_ID"):
             await sources_api._register_file_source("nb_123", "test.pdf")
@@ -239,16 +399,15 @@ class TestRegisterFileSource:
         """Test that empty response raises SourceAddError."""
         from notebooklm.exceptions import SourceAddError
 
-        mock_core.rpc_call.return_value = []
+        _register_response_only(mock_core, [])
 
         with pytest.raises(SourceAddError, match="Failed to get SOURCE_ID"):
             await sources_api._register_file_source("nb_123", "test.pdf")
 
     @pytest.mark.asyncio
     async def test_register_file_source_extracts_id_from_nested_lists(self, sources_api, mock_core):
-        """Test that ID is extracted from arbitrarily nested lists."""
-        # The flexible parser should extract "source_id_123" from any nesting depth
-        mock_core.rpc_call.return_value = [[["source_id_123"]]]
+        """Test that ID is extracted from legacy singleton list envelopes."""
+        mock_core.rpc_executor.rpc_call.return_value = [[["source_id_123"]]]
 
         result = await sources_api._register_file_source("nb_123", "test.pdf")
         assert result == "source_id_123"
@@ -258,19 +417,18 @@ class TestRegisterFileSource:
         """Test that non-string source ID raises SourceAddError."""
         from notebooklm.exceptions import SourceAddError
 
-        mock_core.rpc_call.return_value = [[[[[[12345]]]]]]
+        _register_response_only(mock_core, [[[[[[12345]]]]]])
 
         with pytest.raises(SourceAddError, match="Failed to get SOURCE_ID"):
             await sources_api._register_file_source("nb_123", "test.pdf")
 
     @pytest.mark.asyncio
     async def test_register_file_source_handles_leading_none_shape(self, sources_api, mock_core):
-        """Shape drift (#474): the new wrb.fr result_data starts with a None
-        element, so the legacy position-0 walk lands on None. The full-tree
-        scan should still find the UUID-shaped SOURCE_ID elsewhere.
+        """The trusted prefixed-singleton envelope path should unwrap the
+        UUID-shaped SOURCE_ID after the leading None.
         """
         uuid = "dc84ca28-2629-49ac-aec3-de45f0ec93e4"
-        mock_core.rpc_call.return_value = [None, [[[uuid]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [None, [[[uuid]]]]
 
         result = await sources_api._register_file_source("nb_123", "report.pdf")
         assert result == uuid
@@ -298,21 +456,25 @@ class TestRegisterFileSource:
     async def test_register_file_source_prefers_uuid_over_echoed_filename(
         self, sources_api, mock_core, filename, response, expected
     ):
-        """The extractor must skip the echoed filename and return the UUID,
-        regardless of where the filename sits in the structure (#474).
+        """The extractor must skip the echoed filename and return the paired UUID.
+
+        The filename provides context for the SOURCE_ID (#474).
         """
-        mock_core.rpc_call.return_value = response
+        mock_core.rpc_executor.rpc_call.side_effect = [
+            [["", []]],
+            response,
+        ]
 
         result = await sources_api._register_file_source("nb_123", filename)
         assert result == expected
 
     @pytest.mark.asyncio
     async def test_register_file_source_falls_back_to_non_uuid_string(self, sources_api, mock_core):
-        """Existing tests pass non-UUID IDs like 'src_pdf' — when no UUID
-        candidate is present, the extractor falls back to the first non-
-        filename string. Preserves backward compatibility with prior shapes.
+        """Legacy singleton envelopes still accept plausible id-like non-UUID strings.
+
+        This applies when no UUID candidate is present.
         """
-        mock_core.rpc_call.return_value = [[[["src_pdf"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_pdf"]]]]
 
         result = await sources_api._register_file_source("nb_123", "doc.pdf")
         assert result == "src_pdf"
@@ -321,16 +483,18 @@ class TestRegisterFileSource:
     async def test_register_file_source_error_message_includes_shape_preview(
         self, sources_api, mock_core
     ):
-        """Future shape drift should surface a structural preview in the error
-        so users can file actionable bug reports (#474).
-        """
+        """Future shape drift should report a sanitized response shape."""
         from notebooklm.exceptions import SourceAddError
 
         # Pure-numeric response — no string leaves → no candidates → raises.
-        mock_core.rpc_call.return_value = [[[1, 2, 3]]]
+        _register_response_only(mock_core, [[[1, 2, 3]]])
 
-        with pytest.raises(SourceAddError, match=r"Response shape:.*\[\[\[1, 2, 3\]\]\]"):
+        with pytest.raises(
+            SourceAddError,
+            match="Failed to get SOURCE_ID: no trustworthy SOURCE_ID found in array",
+        ) as exc_info:
             await sources_api._register_file_source("nb_123", "test.pdf")
+        assert "[[[1, 2, 3]]]" not in str(exc_info.value)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status_token", ["OK", "DONE", "true", "null"])
@@ -343,7 +507,7 @@ class TestRegisterFileSource:
         """
         from notebooklm.exceptions import SourceAddError
 
-        mock_core.rpc_call.return_value = [[[status_token]]]
+        _register_response_only(mock_core, [[[status_token]]])
 
         with pytest.raises(SourceAddError, match="Failed to get SOURCE_ID"):
             await sources_api._register_file_source("nb_123", "test.pdf")
@@ -363,14 +527,14 @@ class TestRegisterFileSource:
         # ClientError is what the decoder raises for status codes 5/7 (NOT_FOUND
         # / PERMISSION_DENIED) with an account-routing hint attached — exactly
         # the #114/#294 pattern we suspect for #474.
-        mock_core.rpc_call.side_effect = ClientError(
-            "RPC o4cbdc returned null result with status code 7 (Permission denied). "
+        mock_core.rpc_executor.rpc_call.side_effect = ClientError(
+            "The server rejected this request (permission denied). "
             "If you have multiple Google accounts signed in...",
             method_id="o4cbdc",
             rpc_code=7,
         )
 
-        with pytest.raises(SourceAddError, match="Permission denied") as exc_info:
+        with pytest.raises(SourceAddError, match="permission denied") as exc_info:
             await sources_api._register_file_source("nb_123", "test.pdf")
 
         # The original RPCError is preserved as the cause so debuggers can
@@ -385,7 +549,7 @@ class TestRegisterFileSource:
         """
         from notebooklm.exceptions import AuthError
 
-        mock_core.rpc_call.side_effect = AuthError("session expired")
+        mock_core.rpc_executor.rpc_call.side_effect = AuthError("session expired")
 
         with pytest.raises(AuthError, match="session expired"):
             await sources_api._register_file_source("nb_123", "test.pdf")
@@ -400,7 +564,7 @@ class TestRegisterFileSource:
         """
         from notebooklm.exceptions import RateLimitError
 
-        mock_core.rpc_call.side_effect = RateLimitError(
+        mock_core.rpc_executor.rpc_call.side_effect = RateLimitError(
             "API rate limit exceeded",
             method_id="o4cbdc",
             rpc_code="USER_DISPLAYABLE_ERROR",
@@ -416,7 +580,7 @@ class TestRegisterFileSource:
         """
         from notebooklm.exceptions import ServerError
 
-        mock_core.rpc_call.side_effect = ServerError(
+        mock_core.rpc_executor.rpc_call.side_effect = ServerError(
             "Backend unavailable",
             method_id="o4cbdc",
             rpc_code=500,
@@ -427,8 +591,9 @@ class TestRegisterFileSource:
 
     @pytest.mark.asyncio
     async def test_register_file_source_walker_has_recursion_guard(self, sources_api, mock_core):
-        """A pathological deeply-nested response must not trigger
-        RecursionError — the depth guard caps recursion at ``max_depth=50``.
+        """A deeply-nested response must not trigger RecursionError.
+
+        The depth guard caps traversal at ``_SOURCE_ID_ENVELOPE_MAX_DEPTH``.
         """
         # 200-deep nest with a UUID at the bottom. Past the depth guard the
         # walker stops, so the UUID is unreachable and we raise — but we don't
@@ -438,7 +603,7 @@ class TestRegisterFileSource:
         deep: list = ["dc84ca28-2629-49ac-aec3-de45f0ec93e4"]
         for _ in range(200):
             deep = [deep]
-        mock_core.rpc_call.return_value = deep
+        _register_response_only(mock_core, deep)
 
         with pytest.raises(SourceAddError, match="Failed to get SOURCE_ID"):
             await sources_api._register_file_source("nb_123", "test.pdf")
@@ -456,7 +621,9 @@ class TestStartResumableUpload:
     async def test_start_resumable_upload_success(self, sources_api, mock_core):
         """Test successful upload start."""
         mock_response = MagicMock()
-        mock_response.headers = {"x-goog-upload-url": "https://upload.example.com/session123"}
+        mock_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session123"
+        }
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -466,16 +633,18 @@ class TestStartResumableUpload:
             mock_client_cls.return_value = mock_client
 
             result = await sources_api._start_resumable_upload(
-                "nb_123", "test.pdf", 1024, "src_456"
+                "nb_123", "test.pdf", 1024, "src_456", "application/pdf"
             )
 
-        assert result == "https://upload.example.com/session123"
+        assert result == "https://notebooklm.google.com/upload/_/?upload_id=session123"
 
     @pytest.mark.asyncio
     async def test_start_resumable_upload_includes_correct_headers(self, sources_api, mock_core):
         """Test that upload start includes correct headers."""
         mock_response = MagicMock()
-        mock_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -484,13 +653,16 @@ class TestStartResumableUpload:
             mock_client.post.return_value = mock_response
             mock_client_cls.return_value = mock_client
 
-            await sources_api._start_resumable_upload("nb_123", "test.pdf", 2048, "src_789")
+            await sources_api._start_resumable_upload(
+                "nb_123", "test.pdf", 2048, "src_789", "application/pdf"
+            )
 
             call_kwargs = mock_client.post.call_args[1]
             headers = call_kwargs["headers"]
 
             assert headers["x-goog-upload-command"] == "start"
             assert headers["x-goog-upload-header-content-length"] == "2048"
+            assert headers["x-goog-upload-header-content-type"] == "application/pdf"
             assert headers["x-goog-upload-protocol"] == "resumable"
             # Cookie header is no longer set manually; httpx scopes cookies
             # by Domain attribute via the cookie_jar kwarg (#373).
@@ -505,7 +677,9 @@ class TestStartResumableUpload:
         mock_core.auth.authuser = 2
         mock_core.auth.account_email = None
         mock_response = MagicMock()
-        mock_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -514,7 +688,9 @@ class TestStartResumableUpload:
             mock_client.post.return_value = mock_response
             mock_client_cls.return_value = mock_client
 
-            await sources_api._start_resumable_upload("nb_123", "test.pdf", 2048, "src_789")
+            await sources_api._start_resumable_upload(
+                "nb_123", "test.pdf", 2048, "src_789", "application/pdf"
+            )
 
         url = mock_client.post.call_args.args[0]
         assert parse_qs(urlparse(url).query) == {"authuser": ["2"]}
@@ -528,7 +704,9 @@ class TestStartResumableUpload:
         mock_core.auth.authuser = 2
         mock_core.auth.account_email = "user+test@example.com"
         mock_response = MagicMock()
-        mock_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -537,7 +715,9 @@ class TestStartResumableUpload:
             mock_client.post.return_value = mock_response
             mock_client_cls.return_value = mock_client
 
-            await sources_api._start_resumable_upload("nb_123", "test.pdf", 2048, "src_789")
+            await sources_api._start_resumable_upload(
+                "nb_123", "test.pdf", 2048, "src_789", "application/pdf"
+            )
 
         url = mock_client.post.call_args.args[0]
         assert "authuser=user%2Btest%40example.com" in urlparse(url).query
@@ -553,7 +733,9 @@ class TestStartResumableUpload:
         import json
 
         mock_response = MagicMock()
-        mock_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
 
         with patch("httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -562,7 +744,9 @@ class TestStartResumableUpload:
             mock_client.post.return_value = mock_response
             mock_client_cls.return_value = mock_client
 
-            await sources_api._start_resumable_upload("nb_test", "myfile.pdf", 1000, "src_abc")
+            await sources_api._start_resumable_upload(
+                "nb_test", "myfile.pdf", 1000, "src_abc", "application/pdf"
+            )
 
             call_kwargs = mock_client.post.call_args[1]
             body = json.loads(call_kwargs["content"])
@@ -589,7 +773,9 @@ class TestStartResumableUpload:
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(SourceAddError, match="Failed to get upload URL"):
-                await sources_api._start_resumable_upload("nb_123", "test.pdf", 1024, "src_456")
+                await sources_api._start_resumable_upload(
+                    "nb_123", "test.pdf", 1024, "src_456", "application/pdf"
+                )
 
     @pytest.mark.asyncio
     async def test_start_resumable_upload_raises_on_http_error(self, sources_api, mock_core):
@@ -606,7 +792,9 @@ class TestStartResumableUpload:
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(httpx.HTTPStatusError):
-                await sources_api._start_resumable_upload("nb_123", "test.pdf", 1024, "src_456")
+                await sources_api._start_resumable_upload(
+                    "nb_123", "test.pdf", 1024, "src_456", "application/pdf"
+                )
 
 
 # =============================================================================
@@ -633,7 +821,7 @@ class TestUploadFileStreaming:
 
             # Should not raise
             await sources_api._upload_file_streaming(
-                "https://upload.example.com/session", test_file
+                "https://notebooklm.google.com/upload/_/?upload_id=session", test_file
             )
 
             mock_client.post.assert_called_once()
@@ -655,7 +843,7 @@ class TestUploadFileStreaming:
             mock_client_cls.return_value = mock_client
 
             await sources_api._upload_file_streaming(
-                "https://upload.example.com/session", test_file
+                "https://notebooklm.google.com/upload/_/?upload_id=session", test_file
             )
 
             call_kwargs = mock_client.post.call_args[1]
@@ -687,7 +875,7 @@ class TestUploadFileStreaming:
             mock_client_cls.return_value = mock_client
 
             await sources_api._upload_file_streaming(
-                "https://upload.example.com/session", test_file
+                "https://notebooklm.google.com/upload/_/?upload_id=session", test_file
             )
 
         assert (
@@ -709,8 +897,7 @@ class TestUploadFileStreaming:
             mock_client_cls.return_value = mock_client
 
             await sources_api._cancel_upload_session(
-                "https://upload.example.com/session",
-                "https://notebooklm.google.com",
+                "https://notebooklm.google.com/upload/_/?upload_id=session",
                 auth_route,
             )
 
@@ -734,7 +921,9 @@ class TestUploadFileStreaming:
             mock_client.post.return_value = mock_response
             mock_client_cls.return_value = mock_client
 
-            await sources_api._upload_file_streaming("https://upload.example.com", test_file)
+            await sources_api._upload_file_streaming(
+                "https://notebooklm.google.com/upload/_/?upload_id=session", test_file
+            )
 
             call_kwargs = mock_client.post.call_args[1]
             # Content should be a generator, not bytes
@@ -763,7 +952,9 @@ class TestUploadFileStreaming:
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(httpx.HTTPStatusError):
-                await sources_api._upload_file_streaming("https://upload.example.com", test_file)
+                await sources_api._upload_file_streaming(
+                    "https://notebooklm.google.com/upload/_/?upload_id=session", test_file
+                )
 
 
 # =============================================================================
@@ -782,11 +973,13 @@ class TestAddFile:
         test_file.write_bytes(b"fake pdf content")
 
         # Mock the registration response - 4 levels with string at deepest
-        mock_core.rpc_call.return_value = [[[["src_new_123"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_new_123"]]]]
 
         # Mock HTTP calls
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com/session"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
 
         mock_upload_response = MagicMock()
 
@@ -803,7 +996,8 @@ class TestAddFile:
         assert result.title == "test.pdf"
         assert result.kind == "unknown"
         # 2 RPCs: GET_NOTEBOOK baseline + ADD_SOURCE_FILE register.
-        assert mock_core.rpc_call.call_count == 2
+        assert mock_core.rpc_executor.rpc_call.call_count == 2
+        mock_core.operation_scope.assert_called_once_with("upload:0")
 
     @pytest.mark.asyncio
     async def test_add_file_raises_file_not_found(self, sources_api, mock_core):
@@ -817,10 +1011,12 @@ class TestAddFile:
         test_file = tmp_path / "doc.txt"
         test_file.write_bytes(b"text content")
 
-        mock_core.rpc_call.return_value = [[[["src_txt"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_txt"]]]]
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -836,18 +1032,20 @@ class TestAddFile:
         assert result.title == "doc.txt"
 
     @pytest.mark.asyncio
-    async def test_add_file_preserves_positional_wait_args(self, sources_api, mock_core, tmp_path):
-        """Existing positional wait/wait_timeout callers remain compatible."""
+    async def test_add_file_keyword_wait_args(self, sources_api, mock_core, tmp_path):
+        """``wait`` / ``wait_timeout`` keyword callers forward through to the wait."""
         test_file = tmp_path / "report.pdf"
         test_file.write_bytes(b"fake pdf content")
 
-        mock_core.rpc_call.return_value = [[[["src_pdf"]]]]
-        sources_api.wait_until_ready = AsyncMock(
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_pdf"]]]]
+        sources_api._uploader.wait_until_ready = AsyncMock(
             return_value=MagicMock(id="src_pdf", title="report.pdf")
         )
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -862,26 +1060,24 @@ class TestAddFile:
             )
 
         assert result.id == "src_pdf"
-        sources_api.wait_until_ready.assert_awaited_once_with("nb_123", "src_pdf", timeout=45.0)
+        sources_api._uploader.wait_until_ready.assert_awaited_once_with(
+            "nb_123", "src_pdf", timeout=45.0, transient_error_types=()
+        )
 
     @pytest.mark.asyncio
-    async def test_add_file_mime_type_non_none_emits_deprecation_warning(
+    async def test_add_file_mime_type_non_none_sets_upload_content_type(
         self, sources_api, mock_core, tmp_path
     ):
-        """Passing a non-None ``mime_type`` to ``add_file`` emits ``DeprecationWarning``.
-
-        The argument was never wired into the resumable-upload
-        RPC payload; the server derives the MIME type from the filename
-        extension. The positional signature is preserved so this is a soft
-        deprecation rather than a removal.
-        """
+        """Passing ``mime_type`` sets the Scotty upload content-type header."""
         test_file = tmp_path / "image.png"
         test_file.write_bytes(b"\x89PNG\r\n\x1a\n")
 
-        mock_core.rpc_call.return_value = [[[["src_png"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_png"]]]]
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -891,12 +1087,14 @@ class TestAddFile:
             mock_client.post.side_effect = [mock_start_response, mock_upload_response]
             mock_client_cls.return_value = mock_client
 
-            with pytest.warns(DeprecationWarning, match="mime_type") as caught:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
                 result = await sources_api.add_file("nb_123", str(test_file), mime_type="image/png")
 
-        # Deprecation is non-fatal: the upload still completes normally.
         assert result.id == "src_png"
-        assert caught[0].filename.endswith("test_sources_upload.py")
+        assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        start_headers = mock_client.post.await_args_list[0].kwargs["headers"]
+        assert start_headers["x-goog-upload-header-content-type"] == "image/png"
 
     @pytest.mark.asyncio
     async def test_add_file_mime_type_none_does_not_warn(self, sources_api, mock_core, tmp_path):
@@ -908,10 +1106,12 @@ class TestAddFile:
         test_file = tmp_path / "notes.txt"
         test_file.write_bytes(b"hello")
 
-        mock_core.rpc_call.return_value = [[[["src_default"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_default"]]]]
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -931,6 +1131,8 @@ class TestAddFile:
             f"{[str(w.message) for w in deprecation_warnings]}"
         )
         assert result.id == "src_default"
+        start_headers = mock_client.post.await_args_list[0].kwargs["headers"]
+        assert start_headers["x-goog-upload-header-content-type"] == "text/plain"
 
     @pytest.mark.asyncio
     async def test_add_file_with_custom_title_renames_after_upload(
@@ -950,7 +1152,7 @@ class TestAddFile:
         #   [0] baseline GET_NOTEBOOK for the probe-then-create wrapper
         #   [1] ADD_SOURCE_FILE register
         #   [2] UPDATE_SOURCE rename
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,  # baseline returns no useful list — empty notebook
             [[[["src_md"]]]],
             [[[["src_md"], "Real Intended Title", [None, None, None, None, 8]]]],
@@ -958,13 +1160,15 @@ class TestAddFile:
         # The forced pre-rename registration wait is mocked — we don't want
         # this test to depend on the polling implementation. It returns the
         # registered source so add_file then issues the rename RPC.
-        sources_api.wait_until_registered = AsyncMock(
+        sources_api._uploader.wait_until_registered = AsyncMock(
             return_value=Source(id="src_md", title="boring-filename.md", _type_code=8)
         )
-        sources_api.wait_until_ready = AsyncMock()
+        sources_api._uploader.wait_until_ready = AsyncMock()
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -981,16 +1185,16 @@ class TestAddFile:
         assert result.id == "src_md"
         assert result.title == "Real Intended Title"
         # 1 baseline GET_NOTEBOOK + 1 register + 1 rename
-        assert mock_core.rpc_call.call_count == 3
-        rename_params = mock_core.rpc_call.call_args_list[2].args[1]
+        assert mock_core.rpc_executor.rpc_call.call_count == 3
+        rename_params = mock_core.rpc_executor.rpc_call.call_args_list[2].args[1]
         assert rename_params == [None, ["src_md"], [[["Real Intended Title"]]]]
         # Narrow wait uses the caller's wait_timeout (default 120s) — not the
         # full wait_until_ready. wait_until_registered returns on first
         # PROCESSING/READY status so the bound stays cheap in practice.
-        sources_api.wait_until_registered.assert_awaited_once_with(
-            "nb_123", "src_md", timeout=120.0
+        sources_api._uploader.wait_until_registered.assert_awaited_once_with(
+            "nb_123", "src_md", timeout=120.0, transient_error_types=()
         )
-        sources_api.wait_until_ready.assert_not_called()
+        sources_api._uploader.wait_until_ready.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_file_with_custom_title_renames_after_wait(
@@ -1005,27 +1209,30 @@ class TestAddFile:
 
         # 3 rpc_call invocations: baseline + register + rename (see the
         # earlier test for the same pattern).
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_md"]]]],
             [[[["src_md"], "Real Intended Title"]]],
         ]
 
-        async def wait_side_effect(notebook_id, source_id, *, timeout):
+        async def wait_side_effect(notebook_id, source_id, *, timeout, transient_error_types):
             assert notebook_id == "nb_123"
             assert source_id == "src_md"
             assert timeout == 120.0
+            assert transient_error_types == ()
             # Wait must happen BEFORE the rename: at this point only the
             # baseline GET_NOTEBOOK + ADD_SOURCE_FILE register RPCs have
             # fired (2 total — see register_file_source's probe-then-create
             # design for why the baseline call is required).
-            assert mock_core.rpc_call.call_count == 2
+            assert mock_core.rpc_executor.rpc_call.call_count == 2
             return Source(id=source_id, title="boring-filename.md", _type_code=8)
 
-        sources_api.wait_until_ready = AsyncMock(side_effect=wait_side_effect)
+        sources_api._uploader.wait_until_ready = AsyncMock(side_effect=wait_side_effect)
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1043,9 +1250,11 @@ class TestAddFile:
             )
 
         assert result.title == "Real Intended Title"
-        sources_api.wait_until_ready.assert_awaited_once_with("nb_123", "src_md", timeout=120.0)
+        sources_api._uploader.wait_until_ready.assert_awaited_once_with(
+            "nb_123", "src_md", timeout=120.0, transient_error_types=()
+        )
         # 3 RPCs in total: baseline + register + rename.
-        assert mock_core.rpc_call.call_count == 3
+        assert mock_core.rpc_executor.rpc_call.call_count == 3
 
     @pytest.mark.asyncio
     async def test_add_file_with_title_forces_wait_when_wait_false(
@@ -1058,28 +1267,31 @@ class TestAddFile:
         test_file.write_bytes(b"# content\n")
 
         # 3 RPCs: baseline + register + rename.
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_md"]]]],
             [[[["src_md"], "Real Intended Title", [None, None, None, None, 8]]]],
         ]
 
-        async def wait_side_effect(notebook_id, source_id, *, timeout):
+        async def wait_side_effect(notebook_id, source_id, *, timeout, transient_error_types):
             # Narrow registration wait — wait_timeout default (120s) is forwarded
             # verbatim. wait_until_registered returns on the first non-PREPARING
             # status, so the bound stays cheap.
             assert timeout == 120.0
+            assert transient_error_types == ()
             # Wait runs BEFORE the rename: at this point only the baseline
             # GET_NOTEBOOK + ADD_SOURCE_FILE register RPCs have fired (2
             # total).
-            assert mock_core.rpc_call.call_count == 2
+            assert mock_core.rpc_executor.rpc_call.call_count == 2
             return Source(id=source_id, title="boring-filename.md", _type_code=8)
 
-        sources_api.wait_until_registered = AsyncMock(side_effect=wait_side_effect)
-        sources_api.wait_until_ready = AsyncMock()
+        sources_api._uploader.wait_until_registered = AsyncMock(side_effect=wait_side_effect)
+        sources_api._uploader.wait_until_ready = AsyncMock()
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1096,10 +1308,10 @@ class TestAddFile:
             )
 
         assert result.title == "Real Intended Title"
-        sources_api.wait_until_registered.assert_awaited_once_with(
-            "nb_123", "src_md", timeout=120.0
+        sources_api._uploader.wait_until_registered.assert_awaited_once_with(
+            "nb_123", "src_md", timeout=120.0, transient_error_types=()
         )
-        sources_api.wait_until_ready.assert_not_called()
+        sources_api._uploader.wait_until_ready.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_file_with_title_forwards_wait_timeout(
@@ -1115,19 +1327,21 @@ class TestAddFile:
         test_file.write_bytes(b"fake audio")
 
         # 3 RPCs: baseline + register + rename.
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_audio"]]]],
             [[[["src_audio"], "Episode 1", [None, None, None, None, 10]]]],
         ]
 
-        sources_api.wait_until_registered = AsyncMock(
+        sources_api._uploader.wait_until_registered = AsyncMock(
             return_value=Source(id="src_audio", title="podcast.mp3", _type_code=10)
         )
-        sources_api.wait_until_ready = AsyncMock()
+        sources_api._uploader.wait_until_ready = AsyncMock()
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1145,10 +1359,10 @@ class TestAddFile:
             )
 
         # wait_timeout is forwarded directly — no min() cap.
-        sources_api.wait_until_registered.assert_awaited_once_with(
-            "nb_123", "src_audio", timeout=600.0
+        sources_api._uploader.wait_until_registered.assert_awaited_once_with(
+            "nb_123", "src_audio", timeout=600.0, transient_error_types=(10, 0, None)
         )
-        sources_api.wait_until_ready.assert_not_called()
+        sources_api._uploader.wait_until_ready.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_file_no_title_no_wait_does_not_wait(self, sources_api, mock_core, tmp_path):
@@ -1158,11 +1372,13 @@ class TestAddFile:
         test_file = tmp_path / "test.pdf"
         test_file.write_bytes(b"fake pdf content")
 
-        mock_core.rpc_call.return_value = [[[["src_pdf"]]]]
-        sources_api.wait_until_ready = AsyncMock()
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_pdf"]]]]
+        sources_api._uploader.wait_until_ready = AsyncMock()
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1176,7 +1392,7 @@ class TestAddFile:
 
         assert result.id == "src_pdf"
         assert result.title == "test.pdf"
-        sources_api.wait_until_ready.assert_not_called()
+        sources_api._uploader.wait_until_ready.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_file_no_title_no_wait_returns_processing_status(
@@ -1191,11 +1407,13 @@ class TestAddFile:
         test_file = tmp_path / "test.pdf"
         test_file.write_bytes(b"fake pdf content")
 
-        mock_core.rpc_call.return_value = [[[["src_pdf"]]]]
-        sources_api.wait_until_ready = AsyncMock()
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_pdf"]]]]
+        sources_api._uploader.wait_until_ready = AsyncMock()
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1223,7 +1441,7 @@ class TestAddFile:
         with pytest.raises(ValidationError, match="Title cannot be empty"):
             await sources_api.add_file("nb_123", str(test_file), title=title)
 
-        mock_core.rpc_call.assert_not_called()
+        mock_core.rpc_executor.rpc_call.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_file_skips_rename_when_title_matches_filename(
@@ -1235,10 +1453,12 @@ class TestAddFile:
         test_file = tmp_path / "report.pdf"
         test_file.write_bytes(b"fake pdf content")
 
-        mock_core.rpc_call.return_value = [[[["src_pdf"]]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[[["src_pdf"]]]]
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1254,7 +1474,7 @@ class TestAddFile:
         assert result.title == "report.pdf"
         # No rename happened (title matches filename) — but registration is
         # still 2 RPCs: baseline GET_NOTEBOOK + ADD_SOURCE_FILE.
-        assert mock_core.rpc_call.call_count == 2
+        assert mock_core.rpc_executor.rpc_call.call_count == 2
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1280,17 +1500,19 @@ class TestAddFile:
         # (representative of what `self.rename` actually raises in the wild).
         # The forced wait between register and rename is mocked separately.
         # 3 RPCs: baseline + register + rename (the rename raises).
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_doc"]]]],
             rename_error,
         ]
-        sources_api.wait_until_registered = AsyncMock(
+        sources_api._uploader.wait_until_registered = AsyncMock(
             return_value=Source(id="src_doc", title="doc.txt", _type_code=4)
         )
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1336,12 +1558,12 @@ class TestAddFile:
         # the merge preserves type_code/url/created_at from the waited source.
         # 3 RPCs: baseline + register + rename (rename returns None to
         # trigger the fallback).
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_audio"]]]],
             None,  # Triggers rename()'s Source(id=source_id, title=new_title) fallback
         ]
-        sources_api.wait_until_registered = AsyncMock(
+        sources_api._uploader.wait_until_registered = AsyncMock(
             return_value=Source(
                 id="src_audio",
                 title="podcast.mp3",
@@ -1352,7 +1574,9 @@ class TestAddFile:
         )
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1385,19 +1609,21 @@ class TestAddFile:
         test_file.write_bytes(b"fake audio")
 
         # 3 RPCs: baseline + register + rename.
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_audio"]]]],
             [[[["src_audio"], "My Title", [None, None, None, None, 10]]]],
         ]
 
-        sources_api.wait_until_registered = AsyncMock(
+        sources_api._uploader.wait_until_registered = AsyncMock(
             return_value=Source(id="src_audio", title="long-audio.mp3", _type_code=10)
         )
-        sources_api.wait_until_ready = AsyncMock()
+        sources_api._uploader.wait_until_ready = AsyncMock()
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1415,9 +1641,9 @@ class TestAddFile:
             )
 
         # Narrow wait was used...
-        sources_api.wait_until_registered.assert_awaited_once()
+        sources_api._uploader.wait_until_registered.assert_awaited_once()
         # ...and the full wait was NOT.
-        sources_api.wait_until_ready.assert_not_called()
+        sources_api._uploader.wait_until_ready.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_add_file_rename_failure_still_waits(self, sources_api, mock_core, tmp_path):
@@ -1429,25 +1655,28 @@ class TestAddFile:
         test_file.write_bytes(b"content")
 
         # 3 RPCs: baseline + register + rename (rename raises).
-        mock_core.rpc_call.side_effect = [
+        mock_core.rpc_executor.rpc_call.side_effect = [
             None,
             [[[["src_doc"]]]],
             RPCError("rename rpc blew up"),
         ]
 
-        async def wait_side_effect(notebook_id, source_id, *, timeout):
+        async def wait_side_effect(notebook_id, source_id, *, timeout, transient_error_types):
             assert notebook_id == "nb_123"
             assert source_id == "src_doc"
             assert timeout == 120.0
+            assert transient_error_types == ()
             # Wait runs BEFORE rename — baseline GET_NOTEBOOK + register
             # RPCs have fired (2 total), no rename yet.
-            assert mock_core.rpc_call.call_count == 2
+            assert mock_core.rpc_executor.rpc_call.call_count == 2
             return Source(id=source_id, title="doc.txt", _type_code=4)
 
-        sources_api.wait_until_ready = AsyncMock(side_effect=wait_side_effect)
+        sources_api._uploader.wait_until_ready = AsyncMock(side_effect=wait_side_effect)
 
         mock_start_response = MagicMock()
-        mock_start_response.headers = {"x-goog-upload-url": "https://upload.example.com"}
+        mock_start_response.headers = {
+            "x-goog-upload-url": "https://notebooklm.google.com/upload/_/?upload_id=session"
+        }
         mock_upload_response = MagicMock()
 
         with patch("httpx.AsyncClient") as mock_client_cls:
@@ -1465,7 +1694,9 @@ class TestAddFile:
             )
 
         assert result.title == "doc.txt"
-        sources_api.wait_until_ready.assert_awaited_once_with("nb_123", "src_doc", timeout=120.0)
+        sources_api._uploader.wait_until_ready.assert_awaited_once_with(
+            "nb_123", "src_doc", timeout=120.0, transient_error_types=()
+        )
 
 
 # =============================================================================
@@ -1479,12 +1710,12 @@ class TestAddUrlWithYouTube:
     @pytest.mark.asyncio
     async def test_add_url_detects_youtube_and_uses_youtube_method(self, sources_api, mock_core):
         """Test that YouTube URLs are detected and routed correctly."""
-        mock_core.rpc_call.return_value = [[["src_yt"], "YouTube Video"]]
+        mock_core.rpc_executor.rpc_call.return_value = [[["src_yt"], "YouTube Video"]]
 
         await sources_api.add_url("nb_123", "https://youtu.be/dQw4w9WgXcQ")
 
         # Check that the RPC was called with YouTube-specific params
-        call_args = mock_core.rpc_call.call_args
+        call_args = mock_core.rpc_executor.rpc_call.call_args
         params = call_args[0][1]
         # YouTube params have the URL at position [0][0][7]
         assert params[0][0][7] == ["https://youtu.be/dQw4w9WgXcQ"]
@@ -1492,12 +1723,12 @@ class TestAddUrlWithYouTube:
     @pytest.mark.asyncio
     async def test_add_url_uses_regular_method_for_non_youtube(self, sources_api, mock_core):
         """Test that non-YouTube URLs use regular add method."""
-        mock_core.rpc_call.return_value = [[["src_url"], "Example Site"]]
+        mock_core.rpc_executor.rpc_call.return_value = [[["src_url"], "Example Site"]]
 
         await sources_api.add_url("nb_123", "https://example.com/article")
 
         # Check that the RPC was called with regular URL params
-        call_args = mock_core.rpc_call.call_args
+        call_args = mock_core.rpc_executor.rpc_call.call_args
         params = call_args[0][1]
         # Regular URL params have the URL at position [0][0][2] (different from YouTube's [7])
         assert params[0][0][2] == ["https://example.com/article"]
@@ -1512,8 +1743,8 @@ class TestAddUrlWithYouTube:
         """
         from notebooklm.exceptions import ClientError, SourceAddError
 
-        mock_core.rpc_call.side_effect = ClientError(
-            "RPC <id> returned null result with status code 7 (Permission denied). ...",
+        mock_core.rpc_executor.rpc_call.side_effect = ClientError(
+            "The server rejected this request (permission denied). ...",
             method_id="<id>",
             rpc_code=7,
         )
@@ -1549,7 +1780,7 @@ class TestAddUrlWithYouTube:
         _register_file_source for #474.
         """
         exc = exc_factory()
-        mock_core.rpc_call.side_effect = exc
+        mock_core.rpc_executor.rpc_call.side_effect = exc
 
         with pytest.raises(type(exc)):
             await sources_api.add_url("nb_123", "https://example.com/article")
@@ -1566,11 +1797,11 @@ class TestAddYoutubeSource:
     @pytest.mark.asyncio
     async def test_add_youtube_source_structure(self, sources_api, mock_core):
         """Test YouTube source params structure."""
-        mock_core.rpc_call.return_value = [[["src_123"]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[["src_123"]]]
 
         await sources_api._add_youtube_source("nb_123", "https://youtu.be/abc123")
 
-        call_args = mock_core.rpc_call.call_args
+        call_args = mock_core.rpc_executor.rpc_call.call_args
         params = call_args[0][1]
 
         # Verify structure: [[None, None, None, ..., [url], None, None, 1]]
@@ -1590,16 +1821,23 @@ class TestAddUrlSource:
     @pytest.mark.asyncio
     async def test_add_url_source_structure(self, sources_api, mock_core):
         """Test regular URL source params structure."""
-        mock_core.rpc_call.return_value = [[["src_123"]]]
+        mock_core.rpc_executor.rpc_call.return_value = [[["src_123"]]]
 
         await sources_api._add_url_source("nb_123", "https://example.com/page")
 
-        call_args = mock_core.rpc_call.call_args
+        call_args = mock_core.rpc_executor.rpc_call.call_args
         params = call_args[0][1]
 
         # Verify structure: URL at position 2 (different from YouTube which uses position 7)
         assert params[0][0][2] == ["https://example.com/page"]
         assert params[1] == "nb_123"
-        assert params[2] == [2]
-        assert params[3] is None
-        assert params[4] is None
+        # Migrated to the nested trailing block (#1546): spec gains a trailing 1
+        # and [2],None,None collapses into [2,None,None,[1,...,[1]]].
+        assert params[0][0][-1] == 1
+        assert params[2] == [
+            2,
+            None,
+            None,
+            [1, None, None, None, None, None, None, None, None, None, [1]],
+        ]
+        assert len(params) == 3

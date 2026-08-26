@@ -137,32 +137,36 @@ def wait_option(f: FC) -> FC:
 def wait_polling_options(
     default_timeout: int = 300,
     default_interval: int = 2,
+    timeout_help: str | None = None,
 ) -> Callable[[FC], FC]:
     """Bundle the shared ``--timeout`` / ``--interval`` polling flags.
 
-    Used by every long-running CLI command so the flag surface stays uniform
-    across ``generate <kind> --wait``, ``artifact wait``, and ``source wait``.
+    Used by the generate/artifact/source polling commands so their flag surface
+    stays uniform across ``generate <kind> --wait``, ``artifact wait``, and
+    ``source wait``. ``research wait`` declares its own flags but mirrors the
+    same positive-interval validation.
     Returns a decorator so each call site can supply its own historical
     defaults without diverging on flag name or help text.
 
     The ``--wait`` flag is intentionally NOT bundled here. It is a *trigger*
-    flag on ``generate <kind>`` (paired with ``wait_option`` /
-    ``generate_options``) and is implicit on ``artifact wait`` /
-    ``source wait`` (those subcommands ARE the wait). Bundling ``--wait``
-    here would either force-add it to commands that don't need it, or
-    interact awkwardly with ``--wait/--no-wait``'s tri-state default on
-    ``generate``. Keeping the trigger separate makes the surface uniform
-    and honest about intent.
+    flag on ``generate <kind>`` (paired with ``wait_option``) and is implicit
+    on ``artifact wait`` / ``source wait`` (those subcommands ARE the wait).
+    Bundling ``--wait`` here would either force-add it to commands that don't
+    need it, or interact awkwardly with ``--wait/--no-wait``'s tri-state
+    default on ``generate``. Keeping the trigger separate makes the surface
+    uniform and honest about intent.
 
     Args:
         default_timeout: Default value for ``--timeout`` in seconds. Each
-            command keeps its own historical default (e.g. ``generate audio``
-            uses 300, ``source wait`` uses 120) so this PR is purely
-            additive — no command changes its existing wait ceiling.
+            command supplies its own wait budget (e.g. ``generate audio``
+            uses 1200, ``source wait`` uses 120); this helper only
+            standardizes the flag wiring and help text.
         default_interval: Default value for ``--interval`` in seconds. Most
             commands use 2 to match the existing ``artifact wait`` default;
             ``source wait`` uses 1 to match its underlying
             ``wait_until_ready`` default.
+        timeout_help: Optional custom help text for commands whose effective
+            timeout behavior depends on another option or alias.
 
     Returns:
         A decorator that adds ``--timeout`` and ``--interval`` Click options
@@ -180,14 +184,17 @@ def wait_polling_options(
         f = click.option(
             "--interval",
             default=default_interval,
-            type=int,
+            # ``IntRange(min=1)`` rejects 0/negative at parse time — otherwise
+            # the poll loop would either busy-spin (interval=0) or sleep
+            # backwards (interval<0); both surface as opaque runtime errors.
+            type=click.IntRange(min=1),
             help=f"Seconds between status checks (default: {default_interval})",
         )(f)
         f = click.option(
             "--timeout",
             default=default_timeout,
             type=int,
-            help=f"Maximum seconds to wait (default: {default_timeout})",
+            help=timeout_help or f"Maximum seconds to wait (default: {default_timeout})",
         )(f)
         return f
 
@@ -212,6 +219,48 @@ def source_option(f: FC) -> FC:
         required=True,
         help="Source ID. Supports partial IDs.",
         shell_complete=_complete_sources,
+    )(f)
+
+
+def multi_source_option(f: FC) -> FC:
+    """Add the ``--source/-s`` option used by ``generate <kind>`` commands.
+
+    Multi-valued, optional ``--source`` flag that collects source IDs into a
+    ``source_ids`` tuple (matches the ``multiple=True`` shape used by every
+    ``generate`` subcommand). Distinct from
+    :func:`source_option`, which is single-valued and required for callers that
+    need exactly one source ID.
+
+    Tab completion follows the same notebook-resolution rules as
+    :func:`source_option`.
+    """
+    # Decl order matches the inline ``@click.option("--source",
+    # "-s", "source_ids", ...)`` form in cli/generate_cmd.py. Click preserves
+    # decl order in ``param.opts`` and the CLI-contract baseline pins it; the
+    # long-flag-first order must stay even though the single-source
+    # :func:`source_option` above uses short-flag-first.
+    return click.option(
+        "--source",
+        "-s",
+        "source_ids",
+        multiple=True,
+        help="Limit to specific source IDs",
+        shell_complete=_complete_sources,
+    )(f)
+
+
+def language_option(f: FC) -> FC:
+    """Add the shared ``--language`` flag used by generation commands.
+
+    Resolution chain (handled by the command body, not the decorator):
+    ``--language`` flag > ``NOTEBOOKLM_HL`` env var > config file > ``"en"``
+    default. The decorator only declares the flag; the body must call
+    ``resolve_language(language)`` to walk the chain.
+    """
+    return click.option(
+        "--language",
+        default=None,
+        help="Output language (default: --language > NOTEBOOKLM_HL env > config > 'en')",
     )(f)
 
 
@@ -290,7 +339,9 @@ def retry_option(f: FC) -> FC:
     return click.option(
         "--retry",
         "max_retries",
-        type=int,
+        # ``IntRange(min=0)`` rejects negatives at parse time; 0 stays valid
+        # so the default "no retries" behavior is unchanged.
+        type=click.IntRange(min=0),
         default=0,
         help="Retry N times with exponential backoff on rate limit",
     )(f)
@@ -332,21 +383,75 @@ def list_options(f: FC) -> FC:
     f = click.option(
         "--limit",
         "limit",
-        type=int,
+        # ``IntRange(min=0)`` rejects negatives. 0 is intentionally valid and
+        # means "show no rows" (consistent with the underlying ``rows[:0]``
+        # slice in notebook/source/artifact list commands). Users who want
+        # "no limit" omit the flag entirely — that's why the default is
+        # ``None``, not 0.
+        type=click.IntRange(min=0),
         default=None,
-        help="Show at most N rows (default: unlimited). Applies to both text and --json output.",
+        help=(
+            "Show at most N rows. 0 = show no rows. Omit for unlimited. "
+            "Applies to both text and --json output."
+        ),
     )(f)
     return f
 
 
-# Composite decorators for common patterns
+# =============================================================================
+# COMMAND ALIASING
+# =============================================================================
+#
+# ``alias_command`` lives here rather than in ``cli.helpers`` because
+# ``cli.helpers`` is constrained to a compatibility-facade surface (see
+# ``tests/_guardrails/test_cli_boundary.py::test_helpers_remains_compatibility_facade``);
+# new implementations must own their module. ``options.py`` is the closest
+# fit: it is already the shared Click-surface utility module that command
+# modules import (for ``notebook_option``, ``json_option``, etc.), so adding
+# an alias-builder here keeps Click-surface concerns colocated without
+# inventing a one-function module.
 
 
-def standard_options(f: FC) -> FC:
-    """Apply notebook + json options (most common pattern)."""
-    return notebook_option(json_option(f))
+def alias_command(
+    group: click.Group,
+    source_command: click.Command,
+    name: str,
+    help: str,
+) -> click.Command:
+    """Register ``name`` on ``group`` as a thin alias for ``source_command``.
 
+    The alias shares the source command's callback and parameters, so flag and
+    behavior changes on the source command propagate automatically. Only the
+    visible ``name`` and ``help`` text are overridden, which is the entire
+    point of an alias: same behavior, different surface.
 
-def generate_options(f: FC) -> FC:
-    """Apply notebook + json + wait + retry options for generation commands."""
-    return notebook_option(json_option(wait_option(retry_option(f))))
+    The source command's ``params`` list is *copied*
+    (``list(source_command.params)``) so post-registration mutation on the
+    source list cannot retroactively change the alias. The
+    :class:`click.Parameter` instances inside are still shared by reference —
+    that is the desired contract for an alias and matches the previous
+    hand-written wiring for ``download cinematic-video`` and ``generate
+    cinematic-video``.
+
+    Args:
+        group: The Click group to register the alias under (e.g. ``download``
+            or ``generate``).
+        source_command: The already-built :class:`click.Command` whose
+            behavior the alias should mirror. Callers typically pass either a
+            module-level command symbol or ``group.commands["<name>"]``.
+        name: The subcommand name the alias is registered under.
+        help: The help text shown for the alias in ``--help`` output. Usually
+            states "Alias for ..." so users understand the relationship.
+
+    Returns:
+        The newly registered :class:`click.Command`, so callers can introspect
+        or further customize if needed.
+    """
+    alias = click.Command(
+        name=name,
+        callback=source_command.callback,
+        params=list(source_command.params),
+        help=help,
+    )
+    group.add_command(alias)
+    return alias

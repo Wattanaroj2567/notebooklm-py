@@ -1,9 +1,11 @@
 # RPC Development Guide
 
 **Status:** Active
-**Last Updated:** 2026-05-14
+**Last Updated:** 2026-08-05
 
 This guide covers everything about NotebookLM's RPC protocol: capturing calls, debugging issues, and implementing new methods.
+
+See also: [Python API Reference](python-api.md)
 
 ---
 
@@ -34,7 +36,14 @@ NotebookLM uses Google's `batchexecute` RPC protocol.
 ### Source of Truth
 
 - **RPC method IDs:** `src/notebooklm/rpc/types.py`
-- **Payload structures:** `docs/rpc-reference.md`
+- **Payload builders:** the owning implementation modules, for example
+  `_notebooks.py::build_create_notebook_params`,
+  `_source/upload_payloads.py`, `_source/add.py`, `_label/params.py`, and
+  `_artifact/payloads.py`
+- **Golden payload tests:** `tests/unit/test_rpc_golden_payloads.py` and
+  feature-specific unit tests such as `tests/unit/test_label_params.py`
+- **Human reference:** `docs/rpc-reference.md`, updated after the builder and
+  tests land
 
 ---
 
@@ -75,6 +84,7 @@ console.log("Params:", JSON.parse(outer[0][0][1]));
 import json
 from urllib.parse import unquote
 
+
 def decode_f_req(encoded: str) -> dict:
     decoded = unquote(encoded)
     outer = json.loads(decoded)
@@ -94,6 +104,7 @@ from playwright.async_api import async_playwright
 import json
 from urllib.parse import unquote, parse_qs
 
+
 async def setup_capture_session():
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch_persistent_context(
@@ -103,7 +114,7 @@ async def setup_capture_session():
     page = browser.pages[0] if browser.pages else await browser.new_page()
     captured_rpcs = []
 
-    async def handle_request(request):
+    def handle_request(request):
         if "batchexecute" in request.url:
             post_data = request.post_data
             if post_data and "f.req" in post_data:
@@ -159,7 +170,9 @@ await client.refresh_auth()
 
 **Debug:**
 ```python
-from notebooklm.rpc import decode_response
+# decode_response is an internal RPC helper (notebooklm.rpc.* is internal per
+# docs/stability.md); import it from its defining module for contributor debugging.
+from notebooklm.rpc.decoder import decode_response
 
 raw_response = await http_client.post(...)
 print("Raw:", raw_response.text[:500])
@@ -208,6 +221,7 @@ Source IDs have different nesting requirements:
 import json
 import re
 
+
 def parse_response(text: str, rpc_id: str):
     """Parse batchexecute response."""
     # Strip anti-XSSI prefix
@@ -250,12 +264,11 @@ Use Chrome DevTools or Playwright (see above).
 Document each position in the params array:
 
 ```python
-# Example: ADD_SOURCE for URL
+# Example: ADD_SOURCE for URL after the Gemini-3.5 wire-shape migration
 params = [
-    [[None, None, [url], None, None, None, None, None]],  # 0: Source data
-    notebook_id,   # 1: Notebook ID
-    [2],           # 2: Fixed flag
-    None,          # 3: Optional settings
+    [[None, None, [url], None, None, None, None, None, None, None, 1]],
+    notebook_id,
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
 ]
 ```
 
@@ -285,12 +298,12 @@ async def new_method(self, notebook_id: str, param: str) -> SomeResult:
         Description of return value.
     """
     params = [
-        param,           # Position 0
-        notebook_id,     # Position 1
-        [2],             # Position 2: Fixed flag
+        param,  # Position 0
+        notebook_id,  # Position 1
+        [2],  # Position 2: Fixed flag
     ]
 
-    result = await self._core.rpc_call(
+    result = await self._rpc.rpc_call(
         RPCMethod.NEW_METHOD,
         params,
         source_path=f"/notebook/{notebook_id}",
@@ -320,21 +333,25 @@ class SomeResult:
 def test_encode_new_method():
     params = ["value", "notebook_id", [2]]
     result = encode_rpc_request(RPCMethod.NEW_METHOD, params)
-    assert "AbCdEf" in result
+    assert result[0][0][0] == "AbCdEf"
 ```
 
-**Integration test** (`tests/integration/`):
+**Unit test with a fake RPC executor** (`tests/unit/`):
 ```python
 @pytest.mark.asyncio
-async def test_new_method(mock_client):
+async def test_new_method():
     mock_response = ["result_id", "Result Title"]
-    with patch('notebooklm._core.ClientCore.rpc_call', new_callable=AsyncMock) as mock:
-        mock.return_value = mock_response
-        result = await mock_client.some_api.new_method("nb_id", "param")
-        assert result.id == "result_id"
+    fake = make_fake_core(rpc_call=AsyncMock(return_value=mock_response))
+    api = SomeAPI(fake.rpc_executor)
+
+    result = await api.new_method("nb_id", "param")
+
+    assert result.id == "result_id"
+    fake.rpc_executor.rpc_call.assert_awaited_once()
 ```
 
-**E2E test** (`tests/e2e/`):
+**VCR-backed integration test** (`tests/integration/`) or authenticated E2E
+test (`tests/e2e/`):
 ```python
 @pytest.mark.e2e
 @pytest.mark.asyncio
@@ -348,7 +365,7 @@ async def test_new_method_e2e(client, read_only_notebook_id):
 Update `docs/rpc-reference.md`:
 
 ```markdown
-### NEW_METHOD (`AbCdEf`)
+### RPC: NEW_METHOD (`AbCdEf`)
 
 **Purpose:** Short description
 
@@ -363,7 +380,7 @@ params = [
 
 **Response:** Description of response structure
 
-**Source:** `_some_api.py:123`
+**Source:** `_some_api.py::new_method()`
 ```
 
 ---
@@ -392,10 +409,10 @@ Some methods require `source_path` for routing:
 
 ```python
 # May fail without source_path
-await self._core.rpc_call(RPCMethod.X, params)
+await self._rpc.rpc_call(RPCMethod.X, params)
 
 # Correct
-await self._core.rpc_call(
+await self._rpc.rpc_call(
     RPCMethod.X,
     params,
     source_path=f"/notebook/{notebook_id}",
@@ -407,7 +424,7 @@ await self._core.rpc_call(
 API returns nested arrays. Print raw response first:
 
 ```python
-result = await self._core.rpc_call(...)
+result = await self._rpc.rpc_call(...)
 print(f"DEBUG: {result}")  # See actual structure
 ```
 
@@ -467,30 +484,165 @@ Document:
 ### Validation
 
 ```python
-async def validate_rpc_call(rpc_id: str, params: list, expected_action: str):
+async def validate_root_rpc_call(method_name: str, params: list):
     from notebooklm import NotebookLMClient
+    from notebooklm.rpc import RPCMethod
 
-    async with await NotebookLMClient.from_storage() as client:
-        result = await client._rpc_call(RPCMethod(rpc_id), params)
+    async with NotebookLMClient.from_storage() as client:
+        # Public raw calls use the default root source path. For notebook-scoped
+        # calls that need source_path="/notebook/<id>", prefer the typed
+        # namespace API or a focused internal test around RpcExecutor.
+        result = await client.rpc_call(RPCMethod[method_name], params)
 
-    assert result is not None, f"RPC {rpc_id} returned None"
-    return {"rpc_id": rpc_id, "action": expected_action, "status": "verified"}
+    assert result is not None, f"RPC {method_name} returned None"
+    return {"method": method_name, "status": "verified"}
 ```
 
 ## RPC Health Check Triage Policy
 
-The `rpc-health.yml` workflow runs daily (07:00 UTC) and opens an issue on any
-detected RPC ID mismatch, auth failure, or non-transient RPC error:
+The `rpc-health.yml` workflow runs daily for `main` (07:00 UTC). Release branch
+health checks are manual via `custom_branch=release/vX.Y.Z`. The workflow opens
+an issue on any detected RPC ID mismatch, auth failure, or non-transient RPC
+error:
 
 - **RPC ID mismatch** issues (exit code 1): labeled `bug, rpc-breakage, automated`.
 - **Auth failure** issues (exit code 2): labeled `bug, automated` (no `rpc-breakage`
   label — auth is an operational concern, not a protocol break).
+- **Frontend bundle drift** is a separate live monitor. Its exit code 1 is
+  reserved for confirmed ABSENT RPC IDs or CHANGED/STALE studio enums. If its
+  authenticated homepage request instead lands on login, CookieMismatch, or the
+  region/anti-abuse gate—or the app/CDN cannot be read—it exits 2, says that no
+  drift conclusion was possible, and joins the authentication/infrastructure
+  issue lane. The script also writes a classified outcome file; the workflow
+  opens `Studio enum / RPC drift detected` only for the explicit `drift`
+  outcome. A Python, dependency, or runner failure that exits 1 before writing
+  that outcome is therefore treated as infrastructure, never as protocol drift.
 - **Non-transient ERROR detected** issues (exit code 3): labeled `rpc-error, bug,
   automated`. Opened when `check_rpc_health.py` surfaces failures that survive
   the rate-limit / `RESOURCE_EXHAUSTED` filter (timeouts, parse failures,
   unexpected HTTP errors). The issue body lists the affected method IDs
   extracted from the report, so triage can start without re-running the check.
-  See `.github/workflows/rpc-health.yml:76-109` for the body-assembly step.
+  See the `Extract failing methods for ERROR issue` step in
+  `.github/workflows/rpc-health.yml` for the body-assembly logic.
+- **Stale build label** issues (exit code 5): labeled `rpc-breakage, automated`.
+  See the build-label lane below.
+
+### Build-label lane (`bl` / `_env.DEFAULT_BL`)
+
+`bl` is the frontend build label sent on the chat streaming endpoint. It is a
+pinned constant, and pinned constants nobody re-verifies are this project's #1
+breakage class — but unlike a wrong RPC ID, which fails loudly and immediately, a
+stale `bl` is accepted silently. Cassettes replay whatever was recorded, so the
+entire offline suite passes no matter how old the pin gets. It reached five
+months (154 label-days) of drift before anyone looked
+([#2073](https://github.com/teng-lin/notebooklm-py/issues/2073)).
+
+Each nightly run fetches the app shell, extracts the label Google actually
+serves, and scores the pin against it:
+
+| Verdict | Meaning | Exit |
+| --- | --- | --- |
+| `CURRENT` | the pin is exactly what is served | 0 |
+| `DRIFTED` | pin differs but is within `_env.BUILD_LABEL_STALE_AFTER_DAYS` (90) | 0 |
+| `STALE` | pin trails the served label by more than that window | 5 |
+| `UNKNOWN` | no label could be read (signed out, transport failure, unrecognized shell) | 0 |
+
+- **`DRIFTED` is the steady state.** Google ships a new build roughly weekly and
+  the pin is not expected to chase every one; a tighter window would alarm
+  continuously and teach everyone to ignore the lane.
+- **The verdict compares label dates, never the wall clock**, so it depends only
+  on what was served — a delayed or replayed run cannot age into an alarm.
+- **Exit 5 sits below every live-breakage code** (mismatch, auth, non-transient
+  error, cohort flip). A stale pin is maintenance, and it must never mask an
+  outage.
+- **Redirects are followed by hand**, at most two hops, and only to an `https`
+  personal app host at the site root — the lane never carries the session jar
+  somewhere it did not intend to go, and never onto cleartext. The default host
+  serves the shell directly; the legacy host 302s to it, so only a run pointed at
+  the rollback host takes a hop at all, and anything past the second reports
+  `more than 2 redirects`. The sign-in bounce (`/login?continue=…`) ends the walk
+  with `UNKNOWN`: "this run was not signed in" is not evidence about the build
+  label.
+- An active `NOTEBOOKLM_BL` override does not change the verdict — the lane always
+  scores the committed `DEFAULT_BL`, since that is what ships to users — but the
+  report says the override was in effect.
+
+**To clear a `STALE` verdict:** take the served label from the report (or run the
+probe below) and bump `DEFAULT_BL` in `src/notebooklm/_env.py`.
+
+```python
+import asyncio, httpx
+from notebooklm._auth.cookies import _build_httpx_cookies_from_storage_strict
+from notebooklm._env import DEFAULT_BL, extract_build_label, get_base_url
+
+
+async def main():
+    # The strict loader is deliberate: build_httpx_cookies_from_storage triggers a
+    # PSIDTS RotateCookies round-trip and a disk write, so it is not safe here.
+    jar = _build_httpx_cookies_from_storage_strict(None)
+    async with httpx.AsyncClient(cookies=jar, follow_redirects=True, timeout=60.0) as c:
+        r = await c.get(f"{get_base_url()}/")
+    print("pinned:", DEFAULT_BL)
+    print("served:", extract_build_label(r.text))
+
+
+asyncio.run(main())
+```
+
+**Known and deliberately not acted on:** the server does not validate this value.
+Measured live on 2026-08-04, the streaming endpoint returned a complete, cited
+answer for the pinned label, the served label, and a fabricated
+`…_19700101.00_p0` alike. So the lane is not guarding a live dependency today —
+it exists so the pin cannot rot unwatched again, and so that the day chat does
+break on it, the report already says how far behind it had drifted.
+
+### Rebrand-host lane (`notebook.google.com`)
+
+The same nightly run also probes the post-rebrand host — batchexecute and
+`GenerateFreeFormStreamed` — in a **separate reporting lane**:
+
+- It carries **no exit code**. Its probes never enter the `CheckResult` list, so
+  `compute_exit_code` cannot see them. This is deliberate and load-bearing: the
+  "Non-transient ERROR detected" issue is deduped **by title alone**, so a probe
+  that legitimately fails every night would open one issue and then suppress
+  every later main-lane degradation issue filed under the same title.
+- It reports a **state change** (for example, `batchexecute:
+  PRESENT->ABSENT`), not a recurring error, against the previous run's state.
+  That state is cached between runs; a cache miss falls back to the checked-in
+  last-acknowledged status for each capability. An unchanged capability files
+  nothing.
+- On a change it opens its own issue, **"Rebrand host RPC availability
+  changed"** (label `automated`), with its own dedup search.
+- `UNKNOWN` (transport failure, 429, 5xx) is never recorded: a flake carries the
+  previous state forward instead of manufacturing a transition.
+- It runs **last** in the check and is paced like the method loop, so its two
+  extra requests cannot push the account into a rate limit that would then be
+  attributed to a main-lane probe.
+
+**Recorded decision (when the lane was introduced):** this was the first time
+the project's CI credentials were presented to `notebook.google.com`. Both
+hosts are Google's and are origins of the same app, so the exposure was the same
+credential to the same operator — but it was a deliberate choice, written down
+rather than arriving as a side effect.
+
+Two flags support it:
+
+```bash
+# Point the WHOLE run at a specific personal app host. Manual investigation
+# only — validated against notebooklm._env.PERSONAL_APP_HOSTS, and the nightly
+# stays on the default so the main, exit-coded signal exercises that host.
+uv run python scripts/check_rpc_health.py --base-url https://notebook.google.com
+
+# Where the lane reads/writes its previous state (omit: baseline-only, no write).
+uv run python scripts/check_rpc_health.py --rebrand-state-file rebrand-state.json
+```
+
+**Not answered by this lane:** whether the rebrand host serves `/upload/_/`
+(Scotty). `check_rpc_health.py` exercises `ADD_SOURCE_FILE` as an RPC only and
+issues no upload POST anywhere, so the report prints `upload NOT_PROBED` every
+run. Answering it needs a manual authenticated capture (upload-session start
+only, no bytes), scrubbed via `tests/cassette_patterns.py` before it leaves the
+machine.
 
 Routing:
 

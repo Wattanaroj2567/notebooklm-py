@@ -9,17 +9,36 @@ import notebooklm.cli._encoding as encoding_module
 from notebooklm.cli.error_handler import (
     _output_error,
     emit_cancelled_and_exit,
+    exit_with_code,
     handle_errors,
 )
 from notebooklm.exceptions import (
+    ArtifactNotFoundError,
+    ArtifactPendingTimeoutError,
     AuthError,
     ConfigurationError,
+    LabelNotFoundError,
+    MindMapNotFoundError,
     NetworkError,
     NotebookLimitError,
+    NotebookNotFoundError,
+    NoteNotFoundError,
+    NotFoundError,
     RateLimitError,
     RPCError,
+    SourceNotFoundError,
     ValidationError,
 )
+from notebooklm.types import GenerationStatus
+
+
+def _partial_upload(cause: Exception, *, source_id: str, stage: str) -> Exception:
+    """Mirror ``raise_partial_upload_failure()``: attach recovery context directly
+    to the real cause rather than wrapping it in a new exception type.
+    """
+    cause.source_id = source_id  # type: ignore[attr-defined]
+    cause.stage = stage  # type: ignore[attr-defined]
+    return cause
 
 
 class TestHandleErrorsExitCodes:
@@ -61,6 +80,13 @@ class TestHandleErrorsExitCodes:
             raise RuntimeError("Unexpected bug")
         assert exc_info.value.code == 2
 
+    def test_exit_with_code_is_canonical_raw_exit_path(self):
+        """Callers that already emitted output can still exit through error_handler."""
+        with pytest.raises(SystemExit) as exc_info:
+            exit_with_code(75)
+
+        assert exc_info.value.code == 75
+
 
 class TestHandleErrorsJsonOutput:
     """Test JSON error output format."""
@@ -99,6 +125,99 @@ class TestHandleErrorsJsonOutput:
         assert data["code"] == "RATE_LIMITED"
         assert "retry_after" not in data
 
+    @pytest.mark.parametrize(
+        ("cause", "expected_code"),
+        [
+            (RateLimitError("Too many requests", retry_after=30), "RATE_LIMITED"),
+            (AuthError("Session expired"), "AUTH_ERROR"),
+            (NetworkError("Connection reset"), "NETWORK_ERROR"),
+            (ValidationError("File type rejected"), "VALIDATION_ERROR"),
+        ],
+    )
+    def test_partial_upload_error_keeps_its_cause_category(self, capsys, cause, expected_code):
+        """A partial upload must not flatten to NOTEBOOKLM_ERROR.
+
+        The recovery context rides on the real cause as plain attributes rather
+        than a wrapper type, so the exception lands in whichever typed branch
+        already matched it — keeping its category and, with it, the re-auth hint /
+        retry hint / ``retry_after`` field.
+        """
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise _partial_upload(cause, source_id="src_123", stage="upload_finalize")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == expected_code
+        assert data["code"] != "NOTEBOOKLM_ERROR"
+
+    def test_partial_upload_error_preserves_retry_after(self, capsys):
+        """The cause-specific extras are untouched, not just the code."""
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise _partial_upload(
+                RateLimitError("Too many requests", retry_after=30),
+                source_id="src_123",
+                stage="start_session",
+            )
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "RATE_LIMITED"
+        assert data["retry_after"] == 30
+
+    @pytest.mark.parametrize(
+        ("cause", "expected_code"),
+        [
+            (ValidationError("File type rejected"), "VALIDATION_ERROR"),
+            (NetworkError("Connection reset"), "NETWORK_ERROR"),
+            (RateLimitError("Too many requests", retry_after=30), "RATE_LIMITED"),
+        ],
+    )
+    def test_partial_upload_json_keeps_category_and_recovery_together(
+        self, capsys, cause, expected_code
+    ):
+        """The typed branch's projection and the recovery context must coexist.
+
+        The category / ``retry_after`` projection comes from the typed branch; the
+        retained ``source_id`` / ``stage`` come from the attached attributes. Both
+        have to survive in the same envelope, or ``source add`` reports *why* it
+        failed without saying *what it left behind*.
+        """
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise _partial_upload(cause, source_id="src_123", stage="upload_finalize")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == expected_code
+        assert data["source_id"] == "src_123"
+        assert data["stage"] == "upload_finalize"
+        if isinstance(cause, RateLimitError):
+            assert data["retry_after"] == 30
+
+    def test_partial_upload_text_names_the_retained_source(self, capsys):
+        """Text mode must be actionable: which row was left, and how to drop it."""
+        with pytest.raises(SystemExit), handle_errors(json_output=False):
+            raise _partial_upload(
+                AuthError("Session expired"), source_id="src_123", stage="upload_finalize"
+            )
+
+        err = capsys.readouterr().err
+        assert "src_123" in err
+        assert "upload_finalize" in err
+        assert "notebooklm source delete src_123" in err
+        # The cause's own projection (here: the re-auth hint) still has to show.
+        assert "notebooklm login" in err
+        # ``stage`` is a location, not proof of transfer — never claim bytes moved.
+        assert "uploaded" not in err
+
+    def test_ordinary_error_gets_no_retained_source_context(self, capsys):
+        """The recovery block is opt-in: an error with no attached ``source_id``
+        must emit exactly the envelope it always did.
+        """
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise AuthError("Session expired")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "AUTH_ERROR"
+        assert "source_id" not in data
+        assert "stage" not in data
+
     def test_rpc_error_verbose_includes_method_id(self, capsys):
         """RPCError with verbose=True should include method_id in JSON."""
         with pytest.raises(SystemExit), handle_errors(json_output=True, verbose=True):
@@ -134,6 +253,46 @@ class TestHandleErrorsJsonOutput:
         assert "known_limits" not in data
         assert "method_id" not in data
         assert "rpc_code" not in data
+
+    def test_artifact_timeout_json_includes_poll_context(self, capsys):
+        """ArtifactTimeoutError should be a user error with structured context."""
+        with pytest.raises(SystemExit) as exc_info, handle_errors(json_output=True):
+            raise ArtifactPendingTimeoutError(
+                "nb_123",
+                "task_123",
+                600.0,
+                last_status="pending",
+                status_history=("pending",),
+                status_transitions=(
+                    GenerationStatus(
+                        "task_123",
+                        "pending",
+                        metadata={"raw_status": "completed", "media_ready": False},
+                    ),
+                ),
+            )
+
+        assert exc_info.value.code == 1
+        output = capsys.readouterr().out
+        data = json.loads(output)
+        assert data["error"] is True
+        assert data["code"] == "ARTIFACT_TIMEOUT"
+        assert data["notebook_id"] == "nb_123"
+        assert data["task_id"] == "task_123"
+        assert data["timeout_seconds"] == 600.0
+        assert data["last_status"] == "pending"
+        assert data["status_history"] == ["pending"]
+        assert data["status_transitions"] == [
+            {
+                "task_id": "task_123",
+                "status": "pending",
+                "url": None,
+                "error": None,
+                "error_code": None,
+                "metadata": {"raw_status": "completed", "media_ready": False},
+            }
+        ]
+        assert data["stalled_phase"] == "pending"
 
     def test_unexpected_error_json_format(self, capsys):
         """Unexpected errors should produce UNEXPECTED_ERROR code."""
@@ -179,6 +338,138 @@ class TestHandleErrorsJsonOutput:
         assert data["path"] == str(Path("tmp_test_path"))
 
 
+class TestHandleErrorsNotFound:
+    """The ``*NotFoundError`` family emits the typed ``NOT_FOUND`` envelope.
+
+    Regression guard for issue #1364: before the dedicated ``except
+    NotFoundError`` branch, any ``*NotFoundError`` reaching the centralized
+    handler fell through to the generic ``NOTEBOOKLM_ERROR`` catch-all. The
+    handler now emits ``code="NOT_FOUND"`` with exit ``1`` (matching the
+    per-command ``source``/``artifact``/``note get`` convention) and surfaces
+    the missing resource id in the JSON ``extra`` block.
+    """
+
+    # (exception, native id key, id value) for each concrete subclass. All
+    # five derive ``(NotFoundError, RPCError, <Domain>Error)`` so the umbrella
+    # ``except NotFoundError`` catches every one.
+    _CASES = [
+        (NotebookNotFoundError("nb_123"), "notebook_id", "nb_123"),
+        (SourceNotFoundError("src_456"), "source_id", "src_456"),
+        (ArtifactNotFoundError("art_789", "audio"), "artifact_id", "art_789"),
+        (NoteNotFoundError("note_111"), "note_id", "note_111"),
+        (MindMapNotFoundError("mm_222"), "mind_map_id", "mm_222"),
+        (LabelNotFoundError("label_333"), "label_id", "label_333"),
+    ]
+
+    @pytest.mark.parametrize(
+        ("exc", "id_key", "id_value"),
+        _CASES,
+        ids=lambda v: type(v).__name__ if isinstance(v, Exception) else str(v),
+    )
+    def test_not_found_json_envelope(self, capsys, exc, id_key, id_value):
+        """Each ``*NotFoundError`` produces NOT_FOUND + exit 1 + the resource id."""
+        with pytest.raises(SystemExit) as exc_info, handle_errors(json_output=True):
+            raise exc
+
+        assert exc_info.value.code == 1
+        data = json.loads(capsys.readouterr().out)
+        assert data["error"] is True
+        assert data["code"] == "NOT_FOUND"
+        # Native attribute key plus the generic ``id`` alias are both present so
+        # automation can read the id without knowing the exact subtype.
+        assert data[id_key] == id_value
+        assert data["id"] == id_value
+
+    @pytest.mark.parametrize(
+        ("exc", "id_key", "id_value"),
+        _CASES,
+        ids=lambda v: type(v).__name__ if isinstance(v, Exception) else str(v),
+    )
+    def test_not_found_exit_code_is_1(self, exc, id_key, id_value):
+        """Not-found is a user error (exit 1), never the system-error exit 2."""
+        with pytest.raises(SystemExit) as exc_info, handle_errors():
+            raise exc
+        assert exc_info.value.code == 1
+
+    def test_not_found_text_mode(self, capsys):
+        """Text mode prints the exception message (no traceback, exit 1)."""
+        with pytest.raises(SystemExit) as exc_info, handle_errors(json_output=False):
+            raise SourceNotFoundError("src_456")
+
+        assert exc_info.value.code == 1
+        output = capsys.readouterr().err
+        assert "Source not found: src_456" in output
+
+    def test_not_found_candidates_in_json_and_text_hint(self, capsys):
+        """Near-miss candidates (issue #1787) surface in JSON and as a text hint."""
+        err = NotebookNotFoundError("Scientific")
+        err.candidates = [{"id": "37fe5c1d", "title": "Scientific PDF Parsing"}]
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise err
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "NOT_FOUND"
+        assert data["candidates"] == [{"id": "37fe5c1d", "title": "Scientific PDF Parsing"}]
+
+        err2 = NotebookNotFoundError("Scientific")
+        err2.candidates = [{"id": "37fe5c1d", "title": "Scientific PDF Parsing"}]
+        with pytest.raises(SystemExit), handle_errors(json_output=False):
+            raise err2
+        text = capsys.readouterr().err
+        assert "Did you mean:" in text
+        assert "Scientific PDF Parsing" in text
+
+    def test_not_found_without_candidates_omits_candidates_key(self, capsys):
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise NotebookNotFoundError("Scientific")
+        data = json.loads(capsys.readouterr().out)
+        assert "candidates" not in data
+
+    def test_not_found_verbose_includes_method_id(self, capsys):
+        """With ``verbose``, the RPC ``method_id`` is surfaced in the envelope."""
+        with pytest.raises(SystemExit), handle_errors(json_output=True, verbose=True):
+            raise SourceNotFoundError("src_456", method_id="abc123")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "NOT_FOUND"
+        assert data["method_id"] == "abc123"
+
+    def test_not_found_non_verbose_excludes_method_id(self, capsys):
+        """Without ``verbose``, ``method_id`` stays out of the envelope."""
+        with pytest.raises(SystemExit), handle_errors(json_output=True, verbose=False):
+            raise SourceNotFoundError("src_456", method_id="abc123")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "NOT_FOUND"
+        assert "method_id" not in data
+
+    def test_not_found_branch_precedes_generic_rpc_error(self, capsys):
+        """A bare ``NotFoundError`` umbrella instance still maps to NOT_FOUND.
+
+        Confirms the dedicated branch sits before the generic
+        ``except NotebookLMError`` (the catch-all that would otherwise emit
+        ``NOTEBOOKLM_ERROR``). A future ``*NotFoundError`` subclass with no
+        recognized id attribute drops the (empty) ``extra`` cleanly.
+        """
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise NotFoundError("nothing here")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "NOT_FOUND"
+        assert "id" not in data
+
+    def test_generic_rpc_error_still_emits_notebooklm_error(self, capsys):
+        """A non-not-found ``RPCError`` is unaffected — still NOTEBOOKLM_ERROR.
+
+        Guards against the new branch widening too far and swallowing ordinary
+        RPC failures.
+        """
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise RPCError("RPC failed")
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "NOTEBOOKLM_ERROR"
+
+
 class TestHandleErrorsTextOutput:
     """Test text error output with hints."""
 
@@ -208,6 +499,23 @@ class TestHandleErrorsTextOutput:
         output = capsys.readouterr().err
         assert "notebook limit" in output.lower()
         assert "499/500" in output
+
+    def test_artifact_timeout_text_includes_poll_context(self, capsys):
+        """ArtifactTimeoutError should remain a user error in text mode."""
+        with pytest.raises(SystemExit) as exc_info, handle_errors(json_output=False):
+            raise ArtifactPendingTimeoutError(
+                "nb_123",
+                "task_123",
+                600.0,
+                last_status="pending",
+                status_history=("pending",),
+            )
+
+        assert exc_info.value.code == 1
+        output = capsys.readouterr().err
+        assert "Artifact timeout" in output
+        assert "task_123" in output
+        assert "last status: pending" in output
 
     def test_unexpected_error_shows_bug_report_hint(self, capsys):
         """Unexpected errors should show bug report hint."""
@@ -352,3 +660,67 @@ class TestEmitCancelledAndExit:
         data = json.loads(captured.out)
         assert data["task_id"] == "task_abc"
         assert data["resume_hint"] == "notebooklm artifact poll task_abc"
+
+
+def test_unconfirmed_create_overrides_the_typed_branch_retry_advice(capsys):
+    """The CLI must not tell a user to retry an unresolved create (#2220).
+
+    ``handle_errors`` dispatches on exception TYPE, and a probe re-raises its
+    transport/auth failure unchanged — so a marked ``RateLimitError`` lands in
+    the rate-limit branch and is told "Retry after Ns", a marked ``AuthError``
+    is told to re-login and retry, a marked ``NetworkError`` to try again. Each
+    is the duplicate the marker exists to prevent. The CLI has its own
+    ``except`` ladder rather than routing through ``_app.errors.classify``, so
+    the classifier fix does not reach it.
+
+    The machine-readable ``code`` is overridden too, not merely annotated: a
+    script keying on ``RATE_LIMITED`` would otherwise back off and retry
+    exactly as the message tells it not to.
+    """
+    from notebooklm._idempotency import mark_unconfirmed
+
+    for error in (
+        RateLimitError("Too many requests", retry_after=30),
+        AuthError("Token expired"),
+        NetworkError("Connection failed"),
+    ):
+        with pytest.raises(SystemExit), handle_errors(json_output=True):
+            raise mark_unconfirmed(error)
+
+        data = json.loads(capsys.readouterr().out)
+        assert data["code"] == "UNCONFIRMED_WRITE", f"{type(error).__name__} kept its own code"
+        assert data["unconfirmed"] is True
+        # The branch's own text carries the advice ("Retry after 30s"), so it
+        # must be REPLACED, not merely annotated — and ``retry_after`` is an
+        # instruction in machine-readable form, so it must not survive either.
+        # ``_output_error`` serializes ``extra`` but NOT ``hint``, which is why
+        # the hint is carried in ``extra`` for JSON.
+        assert "Retry after" not in data["message"]
+        assert "retry_after" not in data
+        assert "retrying blind can create a duplicate" in data["hint"]
+
+
+def test_unconfirmed_create_note_reaches_human_output(capsys):
+    """Text mode gets the same correction, appended rather than replacing."""
+    from notebooklm._idempotency import mark_unconfirmed
+
+    with pytest.raises(SystemExit), handle_errors():
+        raise mark_unconfirmed(NetworkError("Connection failed"))
+
+    out = capsys.readouterr()
+    combined = (out.out + out.err).lower()
+    assert "retrying blind can create a duplicate" in combined
+    # Once, not twice: text mode prints the hint after the message, so setting
+    # both would repeat the whole paragraph.
+    assert combined.count("retrying blind can create a duplicate") == 1
+    assert "could not be confirmed" in combined
+
+
+def test_ordinary_errors_keep_their_typed_branch_code(capsys):
+    """The override is opt-in — unmarked failures keep their own guidance."""
+    with pytest.raises(SystemExit), handle_errors(json_output=True):
+        raise RateLimitError("Too many requests", retry_after=30)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["code"] == "RATE_LIMITED"
+    assert "unconfirmed" not in data

@@ -7,6 +7,13 @@ import pytest
 
 from notebooklm.notebooklm_cli import cli
 
+from ._fixtures import (
+    ARTIFACT_NOTEBOOK_ID,
+    GENERATE_NOTEBOOK_ID,
+    GENERATE_PLACEHOLDER_NOTEBOOK_ID,
+    GENERATE_PLACEHOLDER_SOURCE_ID,
+    GENERATE_SOURCE_ID,
+)
 from .conftest import assert_command_success, notebooklm_vcr, skip_no_cassettes
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
@@ -49,9 +56,9 @@ class TestGenerateCommands:
                     "revise-slide",
                     "Move the title up",
                     "-n",
-                    "00000000-0000-0000-0000-000000000000",
+                    GENERATE_PLACEHOLDER_NOTEBOOK_ID,
                     "--artifact",
-                    "00000000-0000-0000-0000-000000000001",
+                    GENERATE_PLACEHOLDER_SOURCE_ID,
                     "--slide",
                     "0",
                 ],
@@ -86,10 +93,43 @@ class TestGenerateCommands:
                 [
                     "generate",
                     "mind-map",
+                    "--kind",
+                    "note-backed",
                     "-n",
-                    "bb00c9e3-656c-4fd2-b890-2b71e1cf3814",
+                    GENERATE_NOTEBOOK_ID,
                     "--source",
-                    "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad",
+                    GENERATE_SOURCE_ID,
                 ],
             )
             assert_command_success(result)
+
+    def test_mind_map_interactive(self, runner, mock_auth_for_vcr, mock_context, fast_sleep):
+        """`generate mind-map --kind interactive` drives CREATE_ARTIFACT + poll + tree.
+
+        Replays the recorded interactive flow (``generate_mind_map_interactive.yaml``):
+        ``CREATE_ARTIFACT`` (variant 4) → ``LIST_ARTIFACTS`` poll-to-completion →
+        ``GET_INTERACTIVE_HTML`` (``[0][9][3]``). ``fast_sleep`` collapses the poll
+        backoff so replay is instant; ``--json`` emits the converged
+        ``{mind_map, note_id, kind}`` payload with the tree inline (issue #1256).
+        """
+        import json
+
+        with notebooklm_vcr.use_cassette("generate_mind_map_interactive.yaml"):
+            result = runner.invoke(
+                cli,
+                [
+                    "generate",
+                    "mind-map",
+                    "--kind",
+                    "interactive",
+                    "--json",
+                    "-n",
+                    ARTIFACT_NOTEBOOK_ID,
+                ],
+            )
+            assert_command_success(result)
+        data = json.loads(result.output)
+        assert data["kind"] == "interactive"
+        assert isinstance(data["mind_map"], dict)
+        assert "name" in data["mind_map"]  # the node tree is fetched and inlined
+        assert data["note_id"]  # the interactive artifact id

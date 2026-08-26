@@ -4,9 +4,8 @@ SYNTHETIC error response — validates client exception mapping, not real Google
 error shapes. The cassettes in this module carry the canonical synthetic-error
 shapes from :mod:`tests.cassette_patterns.build_synthetic_error_response`
 (the plumbing landed in PR #638): minimal JSON bodies whose ONLY purpose is
-to drive the client's exception-mapping branches in
-``src/notebooklm/_core.py`` — status code + a stub body, NOT Google's actual
-error response semantics.
+    to drive the client's HTTP-status exception-mapping branches — status code +
+    a stub body, NOT Google's actual error response semantics.
 
 Three modes are exercised here:
 
@@ -31,21 +30,24 @@ a real-world error shape (e.g. a quota-exhaustion 429 with a real
 
 Recording note (maintainers)
 ----------------------------
-The synthetic-error transport wrapper in ``_core.py`` substitutes the response BEFORE
-httpcore is reached — and VCR's record hook patches ``httpcore.
-AsyncConnectionPool.handle_async_request``, so the wrapper ALSO bypasses the
-record hook. As a consequence these cassettes are hand-written from the
-canonical synthetic shapes in ``tests/cassette_patterns.py`` rather than
-captured by running the tests under ``NOTEBOOKLM_VCR_RECORD=1``. The replay
-path is unaffected — VCR returns the cassette's synthetic response to the
-client's httpx pipeline normally, and the exception-mapping branches fire as
-they would for a real upstream error.
+As of Tier-12 PR 12.6, synthetic-error substitution lives in
+:class:`notebooklm._middleware.error_injection.ErrorInjectionMiddleware`
+at the chain layer — well above the ``httpx`` transport. VCR's record
+hook patches ``httpcore.AsyncConnectionPool.handle_async_request`` (below
+httpx), so the chain short-circuit happens before VCR ever sees the
+request: the wrapper bypasses the record hook entirely. As a consequence
+these cassettes are hand-written from the canonical synthetic shapes in
+``tests/cassette_patterns.py`` rather than captured by running the tests
+under ``NOTEBOOKLM_VCR_RECORD=1``. The replay path is unaffected — VCR
+returns the cassette's synthetic response to the client's httpx pipeline
+normally, and the exception-mapping branches fire as they would for a
+real upstream error.
 
 The ``@pytest.mark.synthetic_error("<mode>")`` marker is intentionally NOT
-used here: it would activate the transport wrapper during replay too,
-short-circuiting VCR and making the cassette decorative. Leaving the env var
-unset lets VCR's cassette drive the response, which is the behavior we want
-the replay tests to exercise.
+used here: it would activate the chain middleware during replay too,
+short-circuiting VCR and making the cassette decorative. Leaving the env
+var unset lets VCR's cassette drive the response, which is the behavior
+we want the replay tests to exercise.
 
 See ``docs/development.md`` (section "Synthetic error cassettes") and
 ``tests/cassette_patterns.py:build_synthetic_error_response`` for the canonical
@@ -54,25 +56,17 @@ synthetic shapes these cassettes carry.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 
-# Add tests directory to sys.path for vcr_config + conftest helpers, mirroring
-# the pattern in ``test_auth_refresh_vcr.py``.
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-
-from conftest import skip_no_cassettes  # noqa: E402
-from notebooklm import NotebookLMClient  # noqa: E402
-from notebooklm.auth import AuthTokens  # noqa: E402
-from notebooklm.exceptions import (  # noqa: E402
+from notebooklm import NotebookLMClient
+from notebooklm.auth import AuthTokens
+from notebooklm.exceptions import (
     ClientError,
     RateLimitError,
     ServerError,
 )
-from vcr_config import notebooklm_vcr  # noqa: E402
+from tests.integration.conftest import skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # All tests in this module are VCR-tier. Skipped when cassettes are absent and
 # we're not in record mode (``NOTEBOOKLM_VCR_RECORD=1``).
@@ -111,8 +105,8 @@ class TestErrorPaths:
         POST returns HTTP 429 with a ``Retry-After: 1`` header and a minimal
         ``{"error": {"code": 429, ...}}`` body. With the rate-limit retry
         budget set to 0 on the client core, the first 429 surfaces directly
-        as :class:`RateLimitError` (the documented mapping in
-        ``_core.py::_TransportRateLimited`` → ``rpc_call`` exception handler).
+        as :class:`RateLimitError` (the documented
+        ``TransportRateLimited`` → ``RpcExecutor.rpc_call`` exception handler).
         """
         client = NotebookLMClient(_synthetic_auth())
         # Disable rate-limit retries so the single synthetic 429 in the
@@ -120,7 +114,7 @@ class TestErrorPaths:
         # has ONE interaction; with the default retry budget the client would
         # ask for a second cassette response that doesn't exist and VCR would
         # raise ``CannotOverwriteExistingCassetteException``.
-        client._core._rate_limit_max_retries = 0
+        client._composed.chain_host._rate_limit_max_retries = 0
 
         with notebooklm_vcr.use_cassette("error_synthetic_429_rate_limit.yaml") as cassette:
             async with client:
@@ -151,8 +145,8 @@ class TestErrorPaths:
         returns HTTP 500 with a minimal ``{"error": {"code": 500, ...}}`` body.
         With the server-error retry budget set to 0 on the client core, the
         first 500 surfaces as :class:`ServerError` via the
-        ``_TransportServerError`` → ``_raise_rpc_error_from_http_status`` chain
-        in ``_core.py``.
+        ``TransportServerError`` → ``RpcExecutor.raise_rpc_error_from_http_status``
+        chain.
         """
         client = NotebookLMClient(_synthetic_auth())
         # Disable 5xx retries so the single synthetic 500 in the cassette
@@ -160,7 +154,7 @@ class TestErrorPaths:
         # is exercised separately by the unit tests in
         # ``test_rate_limit_retry.py`` — here we focus on the terminal
         # exception-mapping branch.
-        client._core._server_error_max_retries = 0
+        client._composed.chain_host._server_error_max_retries = 0
 
         with notebooklm_vcr.use_cassette("error_synthetic_500_server.yaml") as cassette:
             async with client:
@@ -182,24 +176,24 @@ class TestErrorPaths:
 
         Replays ``error_synthetic_stale_csrf.yaml``: the first batchexecute
         POST returns HTTP 400 (NotebookLM's documented stale-CSRF response —
-        see :func:`notebooklm._core.is_auth_error`); the client's auth-refresh
+        see :func:`notebooklm._runtime.helpers.is_auth_error`); the client's auth-refresh
         branch fires once via the stub callback installed below; the second
         cassette interaction returns the same synthetic 400, which surfaces
         as :class:`ClientError` via the standard 4xx mapping in
-        ``_raise_rpc_error_from_http_status``.
+        ``RpcExecutor.raise_rpc_error_from_http_status``.
 
         The behavior under test is the REFRESH-PATH WIRING — that
         ``refresh_auth`` ran exactly once before the second 400 ended the
         attempt. The exact post-refresh exception type is incidental
         (``ClientError`` because 400 is not 401/403, 5xx, or 429); what
         matters is that the auth-refresh hook fired, observed via a spy
-        installed on ``_core._refresh_callback`` and corroborated by the
+        installed on ``client._collaborators.auth_coord._refresh_callback`` and corroborated by the
         ``play_count == 2`` assertion on the cassette.
         """
         client = NotebookLMClient(_synthetic_auth())
         # Eliminate the post-refresh retry delay so the test runs fast under
         # replay (mirrors ``test_auth_refresh_vcr.py``).
-        client._core._refresh_retry_delay = 0
+        client._composed.chain_host._refresh_retry_delay = 0
 
         # In-process refresh callback that issues NO HTTP traffic. This is
         # what lets the cassette capture only the TWO synthetic batchexecute
@@ -212,17 +206,24 @@ class TestErrorPaths:
         async def stub_refresh() -> AuthTokens:
             refresh_calls.append(None)
             # Mutate the in-memory CSRF token to simulate a successful refresh.
-            # The retry loop in ``_perform_authed_post`` rebuilds the request
-            # body from the live ``self.auth.csrf_token`` after refresh, so
+            # The retry loop rebuilds the request body from the refreshed
+            # auth snapshot after refresh, so
             # this mutation is observable on the wire — and the cassette's
             # request-side body would carry the refreshed value if VCR
             # matched on body (it doesn't; the default matcher uses
             # method/path/rpcids).
-            client._core.auth.csrf_token = "refreshed_csrf_token"
-            client._core.update_auth_headers()
-            return client._core.auth
+            client._auth.csrf_token = "refreshed_csrf_token"
+            # Wave 3 of plan ``host-protocol-removal`` deleted the
+            # Session-level ``update_auth_headers`` forward; call the
+            # canonical coordinator method directly with the explicit
+            # collaborator kwargs.
+            client._collaborators.auth_coord.update_auth_headers(
+                auth=client._auth,
+                kernel=client._collaborators.kernel,
+            )
+            return client._auth
 
-        client._core._refresh_callback = stub_refresh
+        client._collaborators.auth_coord._refresh_callback = stub_refresh
 
         with notebooklm_vcr.use_cassette("error_synthetic_stale_csrf.yaml") as cassette:
             async with client:

@@ -44,3 +44,15 @@ downloads/
 # add_file import drop folder (contents not tracked)
 mcp_imports/*
 !mcp_imports/.gitkeep
+
+# Local working notes (process scratch — not shipped)
+docs/scratch/
+
+# Baked into the wheel by hatch_build.py; never committed.
+src/notebooklm/_commit.py
+
+# Mobile reverse-engineering working files (local only)
+# The APK is ~39MB of Google's proprietary binaries — never commit it.
+notebooklm.apk/
+frida-scripts/
+error.log

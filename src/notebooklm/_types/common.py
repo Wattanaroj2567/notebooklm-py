@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
+
+from .research import ResearchSourceInput
 
 if TYPE_CHECKING:
     import httpx
@@ -17,34 +18,6 @@ class UnknownTypeWarning(UserWarning):
     This warning indicates the API returned a type code that this version
     of notebooklm-py doesn't recognize. Consider updating to the latest version.
     """
-
-
-# Tracks which deprecated ``@property`` accessors have already emitted their
-# DeprecationWarning in this process, so the warning fires at-most-once per
-# property regardless of how many instances or accesses occur. Shared across
-# ``_types/sources.py`` and ``_types/artifacts.py`` so a single dedupe surface
-# covers every deprecated dataclass property. Mirrors the per-module
-# ``_warned_source_types`` / ``_warned_artifact_types`` precedent. Keys are
-# the dotted ``"ClassName.property"`` tag so multiple sites share one set
-# without collision.
-_warned_deprecated_properties: set[str] = set()
-
-
-def _deprecated_property_warning_state() -> set[str]:
-    """Return the active dedupe set, honoring the public-facade rebinding hook.
-
-    Tests can rebind ``notebooklm.types._warned_deprecated_properties`` via
-    ``monkeypatch.setattr`` (or clear it directly) for isolation; this resolver
-    mirrors ``_source_warning_state`` / ``_artifact_warning_state`` so the
-    private warn-once logic always reads through the public surface when one
-    is registered.
-    """
-    public_types = sys.modules.get("notebooklm.types")
-    if public_types is not None:
-        public_state = getattr(public_types, "_warned_deprecated_properties", None)
-        if isinstance(public_state, set):
-            return public_state
-    return _warned_deprecated_properties
 
 
 @dataclass(frozen=True)
@@ -117,6 +90,31 @@ class ClientMetricsSnapshot:
     upload_queue_wait_seconds_max: float = 0.0
     lock_wait_seconds_total: float = 0.0
     lock_wait_seconds_max: float = 0.0
+    # Appended at the END so no existing positional parameter shifts — the
+    # public ``ClientMetricsSnapshot`` is constructed positionally in places,
+    # and inserting mid-list would be a breaking signature change (the
+    # api-compat audit flags a moved positional parameter). Keep new counters
+    # here at the tail.
+    rpc_decode_errors: int = 0
+    """Schema-drift failures surfaced at the **RPC executor's response-decode
+    boundary**.
+
+    Bumped whenever the executor rejects a decoded RPC response as schema
+    drift — a wrapped shape-drift error (bad JSON / missing key-or-index) or a
+    surfaced ``DecodingError`` / ``UnknownRPCMethodError`` raised while decoding
+    the response envelope (``safe_index`` inside the decoder). Wire-schema drift
+    is the stated #1 breakage class, so this counter separates "Google reshaped
+    a response" from an ordinary 5xx / network failure (which lands in
+    ``rpc_calls_failed`` via the transport-leg ``MetricsMiddleware``). A decode
+    error recovered by a refresh-and-retry is NOT counted; only the error that
+    ultimately surfaces is.
+
+    Scope note: this covers drift detected at the executor boundary. Positional
+    drift raised *later* by feature-layer ``safe_index`` navigation (after
+    ``rpc_call`` returns — e.g. ``_extract_summary``) propagates straight to the
+    caller and is not routed through this counter yet; broadening the counting
+    boundary to those sites is tracked as a follow-up.
+    """
 
 
 @dataclass(frozen=True)
@@ -126,31 +124,57 @@ class AccountLimits:
     notebook_limit: int | None = None
     source_limit: int | None = None
     raw_limits: tuple[Any, ...] = field(default_factory=tuple)
+    tier: int | None = None
+    """Subscription tier from ``GET_USER_SETTINGS`` limits[4] — same authoritative block
+    as the quota limits. An OPAQUE enum key, NOT an ordinal rank (Plus=4 is numerically
+    higher than Pro=2 but a lower plan) — look it up, never compare with ``<``/``>``. Mapping
+    (per support.google.com/notebooklm/answer/16213268): 1=Standard/Free, 2=Pro, 4=Plus,
+    3=Ultra(20TB), 6=Ultra(30TB); 5="Expanded" aligns with the Workspace "Expanded" access
+    level (inferred — not a consumer plan, hence absent from Google's consumer page).
+    Enterprise is separate. Live-confirmed: 1 and 2. ``None`` when the block is short
+    (e.g. legacy 4-element blocks) or the value is absent/non-positive. The full per-tier
+    notebook/source/studio limits keyed to these ints are in ``docs/quota-limits.md``.
+
+    Appended AFTER ``raw_limits`` deliberately: inserting mid-list would shift ``raw_limits``'s
+    positional slot and break the public-signature api-compat gate (see ``ClientMetricsSnapshot``
+    above for the same constraint)."""
 
 
 @dataclass(frozen=True)
-class AccountTier:
-    """Raw NotebookLM tier metadata returned by the homepage tier RPC."""
+class UserSettings:
+    """A single GET_USER_SETTINGS response, parsed into its two payloads.
 
-    tier: str | None = None
-    plan_name: str | None = None
+    Both ``get_account_limits`` and ``get_output_language`` read the same
+    ``GET_USER_SETTINGS`` response; ``get_user_settings`` returns both from one
+    fetch so callers that need both (e.g. MCP ``server_info``) avoid a duplicate
+    POST.
+    """
+
+    limits: AccountLimits = field(default_factory=AccountLimits)
+    output_language: str | None = None
 
 
 @dataclass(frozen=True)
 class CitedSourceSelection:
     """Result of applying cited-only filtering to research sources."""
 
-    sources: list[dict[str, Any]]
+    sources: list[ResearchSourceInput]
     cited_url_count: int
     matched_url_source_count: int
     used_fallback: bool = False
 
 
-def _datetime_from_timestamp(
-    value: Any, *, datetime_type: type[datetime] = datetime
-) -> datetime | None:
-    """Convert an API seconds timestamp to ``datetime``, returning ``None`` if invalid."""
+def _datetime_from_timestamp(value: Any) -> datetime | None:
+    """Convert an API seconds timestamp to a UTC ``datetime``, ``None`` if invalid.
+
+    Pinning ``tz=timezone.utc`` makes the result tz-aware and host-independent:
+    a naive ``fromtimestamp(value)`` would render in the host's local zone, so the
+    same epoch surfaced as a different wall-time string per CI runner / user box and
+    mis-stated the absolute instant. ``.timestamp()`` round-trips identically either
+    way, so internal sort/dedup/download ordering is unaffected — only the rendered
+    string changes (now offset-aware and identical everywhere).
+    """
     try:
-        return datetime_type.fromtimestamp(value)
+        return datetime.fromtimestamp(value, tz=timezone.utc)
     except (TypeError, ValueError, OSError, OverflowError):
         return None

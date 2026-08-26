@@ -60,23 +60,17 @@ chain is the test.
 from __future__ import annotations
 
 import asyncio
-import sys
 import uuid
 from pathlib import Path
 
 import pytest
 import yaml
 
-# Add tests/ to sys.path so vcr_config + integration/conftest resolve when
-# pytest imports this module without the repo root on sys.path (parity with
-# every other ``tests/integration/test_*_vcr.py`` in the repo).
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-from conftest import get_vcr_auth, skip_no_cassettes  # noqa: E402
-from notebooklm import NotebookLMClient  # noqa: E402
-from notebooklm.rpc import RPCMethod  # noqa: E402
-from notebooklm.types import ReportFormat  # noqa: E402
-from vcr_config import _is_vcr_record_mode, notebooklm_vcr  # noqa: E402
+from notebooklm import NotebookLMClient
+from notebooklm.rpc import RPCMethod
+from notebooklm.types import ReportFormat
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import _is_vcr_record_mode, notebooklm_vcr
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
 
@@ -116,7 +110,13 @@ class TestWorkflowTracerBullet:
         # here keeps the per-cassette ``match_on`` self-contained.
         match_on=["method", "scheme", "host", "port", "path", "rpcids", "freq"],
     )
-    async def test_full_workflow(self, tmp_path: Path, fast_sleep: None) -> None:
+    async def test_full_workflow(
+        self,
+        tmp_path: Path,
+        fast_sleep: None,
+        legacy_vcr_follow_up_probe,
+        legacy_vcr_add_url_baseline,
+    ) -> None:
         """End-to-end user journey produces a downloadable report.
 
         Asserts each phase's intermediate output:
@@ -223,7 +223,7 @@ class TestWorkflowTracerBullet:
                 # earlier assertion fails. Captured in the cassette so replay
                 # also drives the delete RPC.
                 deleted = await client.notebooks.delete(notebook_id)
-                assert deleted is True
+                assert deleted is None
 
     def test_cassette_size_under_budget(self) -> None:
         """Cassette stays under the 5 MB budget documented in the module docstring.

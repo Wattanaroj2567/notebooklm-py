@@ -26,14 +26,9 @@ from urllib.parse import parse_qs
 import pytest
 import yaml
 
-# Match the rest of ``tests/integration/test_vcr_*.py`` — these files are
-# imported by pytest with the repo root NOT on sys.path.
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-
-from conftest import _vcr_record_mode, get_vcr_auth, skip_no_cassettes  # noqa: E402
-from notebooklm import NotebookLMClient  # noqa: E402
-from vcr_config import notebooklm_vcr  # noqa: E402
+from notebooklm import NotebookLMClient
+from tests.integration.conftest import _vcr_record_mode, get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
 
@@ -154,24 +149,26 @@ class TestDeleteConversationVCR:
     @pytest.mark.vcr
     @pytest.mark.asyncio
     async def test_delete_conversation_round_trips(self) -> None:
-        """``delete_conversation`` returns True and produces no error envelope."""
+        """``delete_conversation`` returns None and produces no error envelope."""
         auth = await get_vcr_auth()
         async with NotebookLMClient(auth) as client:
             if _vcr_record_mode:
                 notebook_id, conversation_id = await _seed_scratch_conversation(client)
                 try:
                     with notebooklm_vcr.use_cassette(CASSETTE_NAME):
+                        # v0.8.0 (#1290): delete_conversation returns None on success.
                         assert (
                             await client.chat.delete_conversation(notebook_id, conversation_id)
-                            is True
+                            is None
                         )
                 finally:
                     await _teardown_scratch_notebook(client, notebook_id)
             else:
                 notebook_id, conversation_id = _load_cassette_inputs()
                 with notebooklm_vcr.use_cassette(CASSETTE_NAME):
+                    # v0.8.0 (#1290): delete_conversation returns None on success.
                     assert (
-                        await client.chat.delete_conversation(notebook_id, conversation_id) is True
+                        await client.chat.delete_conversation(notebook_id, conversation_id) is None
                     )
 
     def test_cassette_carries_expected_wire_shape(self) -> None:

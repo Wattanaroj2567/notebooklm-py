@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.repo_lint
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_coverage_thresholds.py"
 
@@ -239,10 +241,10 @@ def test_per_file_real_baselines_pass_against_repo_pyproject(tmp_path, capsys, s
             # Match the floors checked in — every path at exactly its floor
             # should pass (>= comparison).
             "src/notebooklm/__main__.py": 0.0,
-            "src/notebooklm/cli/_firefox_containers.py": 75.0,
-            "src/notebooklm/cli/doctor.py": 63.0,
-            "src/notebooklm/cli/profile.py": 74.0,
-            "src/notebooklm/cli/session.py": 83.0,
+            "src/notebooklm/cli/_firefox_containers.py": 95.0,
+            "src/notebooklm/cli/doctor_cmd.py": 63.0,
+            "src/notebooklm/cli/profile_cmd.py": 74.0,
+            "src/notebooklm/cli/session_cmd.py": 83.0,
         },
     )
     rc = script.main(

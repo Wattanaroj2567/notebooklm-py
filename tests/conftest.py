@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -11,6 +12,97 @@ from notebooklm.auth import AuthTokens
 from notebooklm.rpc import RPCMethod
 
 _PLAYWRIGHT_INSTALLED = importlib.util.find_spec("playwright") is not None
+
+# Reality probes are intentionally an explicit, small set. Inferring the
+# expected set from markers would let a deleted or deselected probe disappear
+# while the required lane still passed.
+REQUIRED_REALITY_PROBES = frozenset(
+    {
+        "tests/unit/cli/test_playwright_login_coverage.py::"
+        "test_probe_source_detects_both_states_against_real_playwright",
+        "tests/unit/cli/test_playwright_login_coverage.py::"
+        "test_chromium_launches_headless_against_real_playwright",
+    }
+)
+_REALITY_DEPENDENCY_MARKERS = frozenset({"requires_playwright", "requires_chromium"})
+_REALITY_REPORTS: dict[str, list[tuple[str, str]]] = {}
+
+
+# Mirror of ``tests/vcr_config._is_vcr_record_mode`` — duplicated (not imported)
+# so the *root* conftest, loaded for every test, stays free of the heavier
+# ``vcr_config`` (vcrpy) import. Kept byte-for-byte identical to the canonical
+# (same ``.casefold()``, no ``.strip()``) so the two never disagree on a padded
+# value and split the config into a half-recording state; ``test_home_isolation``
+# pins the parity. (#1263)
+_VCR_RECORD_ENV = "NOTEBOOKLM_VCR_RECORD"
+
+
+def _vcr_recording() -> bool:
+    """Whether VCR is in record mode (``NOTEBOOKLM_VCR_RECORD`` truthy)."""
+    return os.environ.get(_VCR_RECORD_ENV, "").casefold() in ("1", "true", "yes")
+
+
+def _should_use_real_home(*, e2e: bool, vcr: bool, recording: bool) -> bool:
+    """Whether a test should see the developer's real ``~/.notebooklm`` profile
+    rather than an isolated tmp ``NOTEBOOKLM_HOME``.
+
+    - **E2E** tests always use it (they mint live tokens).
+    - **VCR** tests use it only while *recording* (``NOTEBOOKLM_VCR_RECORD=1``):
+      recording captures against the live API and needs real auth, which both
+      ``get_vcr_auth()`` (via ``AuthTokens.from_storage()``) and the CLI auth
+      path read out of ``NOTEBOOKLM_HOME``. Replay runs and non-VCR tests stay
+      isolated, so the suite is reproducible and a stray ``NOTEBOOKLM_VCR_RECORD``
+      on a normal run never lets a test touch the real profile (issue #1263).
+    """
+    return e2e or (vcr and recording)
+
+
+def _isolation_home(request, tmp_path):
+    """The ``NOTEBOOKLM_HOME`` the autouse fixture should pin, or ``None`` to
+    leave the developer's real ``~/.notebooklm`` profile in place.
+
+    Split out from the fixture so the marker/env wiring is directly unit-testable
+    (see ``tests/unit/test_home_isolation.py``) without unwrapping the fixture.
+
+    Keys on the ``vcr`` *marker* only (not the ``@notebooklm_vcr.use_cassette``
+    decorator / ``vcr`` fixture that the integration tier also recognizes): a
+    cassette test must carry ``@pytest.mark.vcr`` to record against the real
+    profile — most do via a module-level ``pytestmark``. Tests that re-pin
+    ``NOTEBOOKLM_HOME`` themselves (e.g. the settings/profile/doctor cli_vcr
+    tests, which isolate config writes on purpose) override this deferral and are
+    not auto-recordable through pytest. Both gaps fail safe (isolated home, not a
+    leaked real one).
+    """
+    if _should_use_real_home(
+        e2e=request.node.get_closest_marker("e2e") is not None,
+        vcr=request.node.get_closest_marker("vcr") is not None,
+        recording=_vcr_recording(),
+    ):
+        return None
+    return str(tmp_path / "notebooklm-home")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_notebooklm_home(request, tmp_path, monkeypatch):
+    """Pin ``NOTEBOOKLM_HOME`` at a per-test tmp dir.
+
+    Without this, tests that route through the real CLI auth path read the
+    developer's actual ``~/.notebooklm/`` state. An empty or partial
+    ``storage_state.json`` there fails ``_validate_required_cookies`` inside
+    ``build_cookie_jar`` and produces hundreds of ``exit_code=2`` failures
+    locally while CI (with a clean ``HOME``) passes. Pinning
+    ``NOTEBOOKLM_HOME`` at a tmp dir gives every test the same empty-storage
+    view CI sees, so the suite is reproducible across machines.
+
+    Two opt-outs use the real ``~/.notebooklm/`` profile instead (see
+    :func:`_should_use_real_home` / :func:`_isolation_home`): ``@pytest.mark.e2e``
+    tests (mint live tokens) and ``@pytest.mark.vcr`` tests while recording
+    (``NOTEBOOKLM_VCR_RECORD=1``) — the latter lets a cassette be recorded
+    through pytest rather than a standalone script (issue #1263).
+    """
+    home = _isolation_home(request, tmp_path)
+    if home is not None:
+        monkeypatch.setenv("NOTEBOOKLM_HOME", home)
 
 
 @pytest.fixture(autouse=True)
@@ -24,17 +116,27 @@ def _reset_poke_state():
        per-profile. Without clearing, the first test to poke any profile sets
        the timestamp and subsequent tests in that file see "we just poked"
        and silently skip the POST they're asserting on.
-    2. ``_POKE_LOCKS_BY_LOOP`` (``WeakKeyDictionary[loop, dict[..., Lock]]``) —
+    2. ``_POKE_LOCKS_BY_LOOP`` (``WeakKeyDictionary[loop, WeakValueDictionary[..., Lock]]``) —
        in production each per-loop entry is reclaimed automatically when its
        loop is GC'd. In tests the loop typically outlives the explicit
        cleanup point (pytest-asyncio's loop teardown happens after fixtures
        run), so we clear it eagerly to keep tests independent.
     3. ``_SECONDARY_BINDING_WARNED`` — one-shot flag for the Tier 2 cookie
        warning. Reset so tests can independently observe the warning fire.
+    4. ``LegacyPromotionScheduler.process_default()`` — the detached retryable
+       legacy-account promotion (ADR-0033 PR 5.1). A read of
+       a legacy-only profile schedules a background writer, so teardown must
+       JOIN it before clearing: a worker still running when the next test
+       starts would write into a ``tmp_path`` that test believes it owns, and
+       a leftover active-path entry would suppress the very promotion another
+       test is asserting on (``tmp_path`` uniqueness makes real path collisions
+       unlikely, but the drain makes the durable half deterministic).
     """
     from notebooklm import auth as _auth
     from notebooklm._auth import cookie_policy as _cookie_policy
-    from notebooklm._auth import storage as _auth_storage
+    from notebooklm._auth.profile_migration import LegacyPromotionScheduler
+
+    scheduler = LegacyPromotionScheduler.process_default()
 
     # ``_LAST_POKE_ATTEMPT_MONOTONIC`` and ``_POKE_LOCKS_BY_LOOP`` are shared
     # by identity across ``notebooklm.auth`` and ``notebooklm._auth.keepalive``
@@ -45,17 +147,18 @@ def _reset_poke_state():
     # PR-2 retired the ``_AuthFacadeModule`` write-through. Reset on the
     # owner directly; the auth-module re-export captured at import time was
     # never the canonical store.
-    # ``_FLOCK_UNAVAILABLE_WARNED`` is reset for the same reason — the
-    # storage seam owns the flag.
     _auth._LAST_POKE_ATTEMPT_MONOTONIC.clear()
     _auth._POKE_LOCKS_BY_LOOP.clear()
     _cookie_policy._SECONDARY_BINDING_WARNED = False
-    _auth_storage._FLOCK_UNAVAILABLE_WARNED = False
+    scheduler._reset_for_tests()
     yield
     _auth._LAST_POKE_ATTEMPT_MONOTONIC.clear()
     _auth._POKE_LOCKS_BY_LOOP.clear()
     _cookie_policy._SECONDARY_BINDING_WARNED = False
-    _auth_storage._FLOCK_UNAVAILABLE_WARNED = False
+    # Join first, then clear — clearing while a worker is mid-write would let
+    # it land in the next test's world.
+    scheduler.drain(30.0)
+    scheduler._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -68,10 +171,11 @@ def _synthetic_error_mode(request, monkeypatch):
     auto-reverted on teardown). Without the marker, the env var is left
     untouched — preserving the spec's "opt-in" contract.
 
-    Set BEFORE the client constructs its HTTP transport (markers are read at
-    setup time): the transport wrapper in ``_core.py:_get_error_injection_mode``
-    reads the env var only during ``ClientCore.open()``, so the var must be
-    in place before the fixture under test enters its ``async with`` block.
+    Set before the client constructs its runtime and enters the middleware chain
+    (markers are read at setup time): ``_error_injection._get_error_injection_mode``
+    is consulted by the construction guard and by ``ErrorInjectionMiddleware``, so
+    the var must be in place before the fixture under test enters its
+    ``async with`` block.
 
     Production behavior is unchanged when the marker is absent.
     """
@@ -90,10 +194,10 @@ def _synthetic_error_mode(request, monkeypatch):
             f"@pytest.mark.synthetic_error: invalid mode {mode!r}; valid modes are {sorted(valid)}."
         )
     # Import the env-var name from the production module so a future rename
-    # in ``_core.py`` cascades automatically; the constant is also exposed
-    # from ``tests/vcr_config.py`` but going through ``_core`` is the
-    # production-faithful path.
-    from notebooklm._core import ERROR_INJECT_ENV_VAR
+    # in ``_error_injection.py`` cascades automatically; the constant is also exposed
+    # from ``tests/vcr_config.py`` but importing from the canonical seam
+    # is the production-faithful path.
+    from notebooklm._error_injection import ERROR_INJECT_ENV_VAR
 
     monkeypatch.setenv(ERROR_INJECT_ENV_VAR, mode)
 
@@ -126,8 +230,69 @@ def _mock_keepalive_poke(request):
     )
 
 
+def pytest_addoption(parser):
+    """Register the dev-only ``--update-baselines`` regen flag (ADR-0022).
+
+    When set, the regenerable-baseline freeze test
+    (``test_baseline_matches_committed_file``) REWRITES each committed baseline
+    file from ``derive()`` instead of asserting. ``scripts/regen_baselines.py``
+    is the discoverable wrapper that shells ``pytest ... --update-baselines``.
+
+    **Dev-only-regen invariant (ADR-0022):** CI must NEVER pass this flag — it
+    only ever diffs. The ``update_baselines`` fixture additionally refuses to
+    regenerate when a CI environment is detected, so wiring the flag into a CI
+    command can't silently rewrite baselines; it fails loudly instead.
+    """
+    parser.addoption(
+        "--update-baselines",
+        action="store_true",
+        default=False,
+        help=(
+            "DEV ONLY: rewrite committed baseline fixtures from live code instead "
+            "of asserting against them. CI must never pass this (it only diffs). "
+            "Prefer `python scripts/regen_baselines.py`."
+        ),
+    )
+    parser.addoption(
+        "--require-reality",
+        action="store_true",
+        default=False,
+        help=(
+            "Require every expected external-reality probe to be collected and "
+            "pass exactly once; intended for the explicit browser CI lane."
+        ),
+    )
+
+
+@pytest.fixture
+def update_baselines(request) -> bool:
+    """Whether the dev-only baseline regen was requested (``--update-baselines``).
+
+    Enforces the dev-only-regen invariant: if the flag is set while a CI
+    environment is detected (``CI`` env var truthy, as GitHub Actions and most
+    CI providers set), this fails the test rather than silently rewriting the
+    committed baselines. Locally (no ``CI``), the flag enables regen.
+    """
+    requested = bool(request.config.getoption("--update-baselines"))
+    if requested and os.environ.get("CI", "").strip():
+        raise pytest.UsageError(
+            "--update-baselines must not be used in CI: baselines are dev-only "
+            "regenerated and CI only diffs (ADR-0022). Unset CI or drop the flag."
+        )
+    return requested
+
+
 def pytest_configure(config):
     """Register custom markers and configure test environment."""
+    xdist_active = (
+        config.getoption("numprocesses", default=None) not in (None, 0)
+        or config.getoption("dist", default="no") != "no"
+    )
+    if config.getoption("--require-reality") and xdist_active:
+        raise pytest.UsageError(
+            "--require-reality cannot be combined with xdist; run the required "
+            "reality lane serially so the controller can account for every probe"
+        )
     config.addinivalue_line(
         "markers",
         "vcr: marks tests that use VCR cassettes (may be skipped if cassettes unavailable)",
@@ -170,13 +335,118 @@ def pytest_collection_modifyitems(config, items):
     no-op there.
     """
     if _PLAYWRIGHT_INSTALLED:
+        chromium_available = None
+        for item in items:
+            if "requires_chromium" not in item.keywords:
+                continue
+            if chromium_available is None:
+                chromium_available = _chromium_available()
+            if not chromium_available:
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=(
+                            "Chromium is not installed or launchable; run: "
+                            "uv run playwright install chromium"
+                        )
+                    )
+                )
         return
     skip_marker = pytest.mark.skip(
         reason="playwright not installed; install with: uv sync --extra browser"
     )
     for item in items:
-        if "requires_playwright" in item.keywords:
+        if _REALITY_DEPENDENCY_MARKERS.intersection(item.keywords):
             item.add_marker(skip_marker)
+
+
+def _chromium_available() -> bool:
+    """Return whether Playwright can launch the installed Chromium executable."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            if not os.path.isfile(playwright.chromium.executable_path):
+                return False
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                return True
+            finally:
+                browser.close()
+    except Exception:
+        return False
+
+
+def _is_xdist_worker(config) -> bool:
+    """Required reality accounting belongs to the xdist controller only."""
+    return getattr(config, "workerinput", None) is not None
+
+
+def pytest_collection_finish(session) -> None:
+    """Validate the exact reality-probe set after all selection filters apply."""
+    if not session.config.getoption("--require-reality") or _is_xdist_worker(session.config):
+        return
+
+    selected = {item.nodeid: item for item in session.items}
+    missing = sorted(REQUIRED_REALITY_PROBES - selected.keys())
+    unexpected = sorted(
+        item.nodeid
+        for item in session.items
+        if "reality" in item.keywords and item.nodeid not in REQUIRED_REALITY_PROBES
+    )
+    invalid_dependencies = sorted(
+        item.nodeid
+        for item in session.items
+        if item.nodeid in REQUIRED_REALITY_PROBES
+        and not _REALITY_DEPENDENCY_MARKERS.intersection(item.keywords)
+    )
+    unmarked_expected = sorted(
+        nodeid
+        for nodeid in REQUIRED_REALITY_PROBES
+        if nodeid in selected and "reality" not in selected[nodeid].keywords
+    )
+    if missing or unexpected or invalid_dependencies or unmarked_expected:
+        problems = []
+        if missing:
+            problems.append(f"missing expected probes: {missing}")
+        if unexpected:
+            problems.append(f"unexpected reality probes: {unexpected}")
+        if invalid_dependencies:
+            problems.append(f"probes lack a recognized dependency marker: {invalid_dependencies}")
+        if unmarked_expected:
+            problems.append(f"expected probes lack the reality marker: {unmarked_expected}")
+        raise pytest.UsageError(
+            "--require-reality collection contract failed: " + "; ".join(problems)
+        )
+
+    _REALITY_REPORTS.clear()
+    for nodeid in REQUIRED_REALITY_PROBES:
+        _REALITY_REPORTS[nodeid] = []
+
+
+def pytest_runtest_logreport(report) -> None:
+    """Record every phase so skipped/setup-error probes cannot count as passes."""
+    if report.nodeid in _REALITY_REPORTS:
+        _REALITY_REPORTS[report.nodeid].append((report.when, report.outcome))
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    """Turn a missing or non-passing reality call phase into a hard failure."""
+    if not session.config.getoption("--require-reality") or _is_xdist_worker(session.config):
+        return
+
+    failures = []
+    for nodeid in sorted(REQUIRED_REALITY_PROBES):
+        reports = _REALITY_REPORTS.get(nodeid, [])
+        calls = [outcome for phase, outcome in reports if phase == "call"]
+        if calls != ["passed"] or any(outcome != "passed" for _phase, outcome in reports):
+            failures.append(f"{nodeid}: phases={reports!r}")
+    if failures:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+        if terminal is not None:
+            terminal.write_line("--require-reality execution contract failed:")
+            for failure in failures:
+                terminal.write_line(f"  {failure}")
 
 
 @pytest.fixture
@@ -266,8 +536,26 @@ def build_rpc_response():
 
 
 @pytest.fixture
+def rpc_request_params():
+    """Decode the positional params out of an outgoing ``batchexecute`` request.
+
+    The inverse of :func:`build_rpc_response` for assertions on request shape:
+    unwraps the ``f.req`` form body and returns the params list the client sent.
+    Shared here rather than duplicated per test module, since both tiers assert on
+    wire shape and ``tests/_guardrails/test_no_cross_test_imports.py`` forbids one
+    test module importing another.
+    """
+
+    def _params(request) -> list:
+        outer = json.loads(parse_qs(request.content.decode())["f.req"][0])
+        return json.loads(outer[0][0][1])
+
+    return _params
+
+
+@pytest.fixture
 def mock_get_conversation_id(httpx_mock, build_rpc_response):
-    """Register a batchexecute response for ``ChatAPI.get_conversation_id``.
+    """Register batchexecute responses for an existing conversation.
 
     After issue #659, ``ChatAPI.ask`` calls ``get_conversation_id``
     (wire-level ``hPTbtc``) post-ask for new conversations to recover the
@@ -275,7 +563,8 @@ def mock_get_conversation_id(httpx_mock, build_rpc_response):
     chat response. Any test that exercises the new-conversation path
     through ``client.chat.ask(...)`` without a ``conversation_id``
     argument must register a response, or the SDK will time out retrying
-    the unmocked call.
+    the unmocked call. The optional ``khqZz`` response gives that id one
+    existing turn when ``ask`` probes implicit follow-up state (#1973).
 
     Usage::
 
@@ -302,9 +591,94 @@ def mock_get_conversation_id(httpx_mock, build_rpc_response):
             method="POST",
             is_reusable=reusable,
         )
+        turns_response = build_rpc_response(
+            RPCMethod.GET_CONVERSATION_TURNS,
+            [[[None, None, 1, "Existing question?"]]],
+        )
+        httpx_mock.add_response(
+            url=re.compile(r".*batchexecute.*rpcids=khqZz.*"),
+            content=turns_response.encode(),
+            method="POST",
+            is_optional=True,
+            is_reusable=True,
+        )
         return conv_id
 
     return _add
+
+
+@pytest.fixture
+def legacy_vcr_follow_up_probe(monkeypatch):
+    """Supply the prior-turn count omitted from legacy chat cassettes.
+
+    The old recordings contain the current-conversation lookup and chat POST,
+    but not the pre-POST ``khqZz`` count fetch added across #1973 and #1976.
+    Keep those recordings immutable; dedicated characterization tests exercise
+    the real request and its empty, non-empty, multi-turn, and failure branches.
+    """
+
+    from notebooklm._chat import api as chat_api_module
+
+    async def _count_prior_server_turns(fetch_turns, notebook_id: str, conversation_id: str) -> int:
+        """Replay a legacy cassette whose current conversation had one prior turn."""
+        return 1
+
+    monkeypatch.setattr(chat_api_module, "count_prior_server_turns", _count_prior_server_turns)
+
+
+@pytest.fixture
+def legacy_vcr_add_url_baseline(monkeypatch):
+    """Answer the pre-create source baseline omitted from legacy add_url cassettes.
+
+    ``sources.add_url`` snapshots the notebook's source ids before issuing the
+    create so its idempotency probe can tell a source it created from one that
+    was already there (#2204). Cassettes recorded before that change hold no
+    such ``GET_NOTEBOOK``. Without this fixture the read still *fires*: VCR
+    refuses it, the add swallows the failure, and the call proceeds with the
+    probe disabled — green, and silently not testing the thing it names. In a
+    cassette that also records later ``GET_NOTEBOOK``s the miss is worse, since
+    the baseline consumes a poll's response and desynchronises the journey.
+
+    Keep those recordings immutable and answer only the missing read. Every
+    consumer of this fixture replays a cassette whose create **succeeds**, so
+    the probe never runs and the returned value is never compared against
+    anything — ``[]`` is the neutral answer, not a claim about the notebook.
+    That invariant is enforced rather than trusted: a second call means the
+    probe fired, and the fixture fails the test instead of letting an invented
+    empty baseline license a match. Every other list still replays from the
+    cassette. The probe itself is covered against explicit request sequences in
+    ``tests/integration/test_sources_idempotency.py``, so nothing here is its
+    only coverage. Mirrors :func:`legacy_vcr_follow_up_probe`.
+    """
+    from notebooklm._source.add import SourceAddService
+
+    original_add_url = SourceAddService.add_url
+
+    async def _add_url(self, notebook_id, url, *, list_sources, **kwargs):
+        calls = 0
+
+        async def _list_sources(nb_id: str):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise AssertionError(
+                    "legacy_vcr_add_url_baseline: the idempotency probe fired, so this "
+                    "cassette's create did not succeed. The stubbed empty baseline would "
+                    "decide the probe's answer — record the probe's GET_NOTEBOOK instead "
+                    "of stubbing the baseline."
+                )
+            return []
+
+        result = await original_add_url(
+            self, notebook_id, url, list_sources=_list_sources, **kwargs
+        )
+        assert calls == 1, (
+            "legacy_vcr_add_url_baseline: add_url no longer captures a pre-create "
+            "baseline, so this fixture is stale — drop it."
+        )
+        return result
+
+    monkeypatch.setattr(SourceAddService, "add_url", _add_url)
 
 
 @pytest.fixture

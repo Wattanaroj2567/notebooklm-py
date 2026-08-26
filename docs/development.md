@@ -1,7 +1,7 @@
 # Contributing Guide
 
 **Status:** Active
-**Last Updated:** 2026-05-14
+**Last Updated:** 2026-07-04
 
 This guide covers everything you need to contribute to `notebooklm-py`: architecture overview, testing, and releasing.
 
@@ -13,25 +13,35 @@ This guide covers everything you need to contribute to `notebooklm-py`: architec
 
 ## Architecture
 
+> **Canonical post-refactor map:** see [`docs/architecture.md`](./architecture.md)
+> for the current adapter/app/client/runtime/RPC graph and
+> capability-protocol model. This section
+> remains as the contributor on-ramp (package layout + adding-features
+> guidance) and links out to the architecture doc rather than duplicating it.
+
 ### Package Structure
 
 ```
 src/notebooklm/
 ├── __init__.py          # Public exports
 ├── client.py            # NotebookLMClient main class
-├── auth.py              # Authentication handling
+├── auth.py              # Public auth facade
 ├── types.py             # Dataclasses and type definitions
-├── _core.py             # Core HTTP/RPC infrastructure
+├── _app/                # Transport-neutral business logic shared by adapters
+├── _client_composed.py  # Client-owned composition holder
+├── _runtime/            # Runtime contracts, config, lifecycle, auth, transport
 ├── _notebooks.py        # NotebooksAPI implementation
 ├── _notebook_metadata.py # Private notebook metadata composition service
 ├── _sources.py          # SourcesAPI implementation
-├── _source_*.py         # Private source services
+├── _source/             # Private source services
 ├── _artifacts.py        # ArtifactsAPI implementation
-├── _artifact_*.py       # Private artifact services
-├── _chat.py             # ChatAPI implementation
+├── _artifact/           # Private artifact services
+├── _chat/               # ChatAPI implementation (facade + chat helpers)
 ├── _research.py         # ResearchAPI implementation
 ├── _notes.py            # NotesAPI implementation
 ├── _mind_map.py         # Private note-backed mind-map service
+├── _mind_maps_api.py    # MindMapsAPI implementation
+├── _labels.py           # LabelsAPI implementation
 ├── _settings.py         # SettingsAPI implementation
 ├── _sharing.py          # SharingAPI implementation
 ├── _sharing_manager.py  # Private legacy notebook share-link service
@@ -40,25 +50,22 @@ src/notebooklm/
 │   ├── types.py         # RPCMethod enum and constants
 │   ├── encoder.py       # Request encoding
 │   └── decoder.py       # Response parsing
-└── cli/                 # CLI implementation
-    ├── __init__.py      # CLI package exports
-    ├── helpers.py       # Shared utilities
-    ├── session.py       # login, use, status, clear
-    ├── notebook.py      # list, create, delete, rename
-    ├── source.py        # source add, list, delete
-    ├── artifact.py      # artifact list, get, delete
-    ├── generate.py      # generate audio, video, etc.
-    ├── download.py      # download audio, video, etc.
-    ├── chat.py          # ask, configure, history
-    └── ...
+├── cli/                 # Click adapter (`*_cmd.py`) plus `cli/services/`
+├── mcp/                 # FastMCP adapter (optional `mcp` extra)
+└── server/              # FastAPI REST adapter (optional `server` extra)
 ```
 
 ### Layered Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         CLI Layer                           │
-│   cli/session.py, cli/notebook.py, cli/generate.py, etc.    │
+│                      Adapter Layer                          │
+│        cli/ (Click), mcp/ (FastMCP), server/ (FastAPI)       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                  App Core Layer (`_app/`)                    │
+│        transport-neutral request/plan/result workflows       │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -68,8 +75,8 @@ src/notebooklm/
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│                       Core Layer                            │
-│              ClientCore → _rpc_call(), HTTP client          │
+│                      Runtime Layer                          │
+│          RpcExecutor, RuntimeTransport, Kernel, lifecycle    │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -82,39 +89,56 @@ src/notebooklm/
 
 | Layer | Files | Responsibility |
 |-------|-------|----------------|
-| **CLI** | `cli/*.py` | User commands, input validation, Rich output |
+| **Adapters** | `cli/`, `mcp/`, `server/` | User commands/tools/routes, transport-specific input/output, auth envelopes |
+| **App core** | `_app/*.py` | Transport-neutral workflows reused by adapters |
 | **Client** | `client.py`, `_*.py` | High-level Python API, returns typed dataclasses |
-| **Core** | `_core.py`, `_core_*.py` | `ClientCore` orchestrator + seam-module helpers (HTTP client lifecycle, RPC dispatch, metrics, drain bookkeeping, request-id counter, auth refresh, conversation cache, polling registry, cookie persistence) |
+| **Runtime** | `client.py`, `_client_composed.py`, `_runtime/init.py`, `_kernel.py`, runtime collaborators | `NotebookLMClient` composition root plus seam-module helpers (HTTP client lifecycle, RPC dispatch, metrics, drain bookkeeping, request-id counter, auth refresh, conversation cache, polling registry, cookie persistence) |
 | **RPC** | `rpc/*.py` | Protocol encoding/decoding, method IDs |
 
-#### Core-layer seam modules
+#### Runtime seam modules
 
-The `Core` layer is split across `_core.py` (orchestrator) and a family of
-single-responsibility `_core_*.py` helper modules. Each helper exposes a
-Protocol-shim host interface so it can be unit-tested against a stub `ClientCore`:
+The client runtime is split across `NotebookLMClient` (composition root),
+`ClientComposed` (holder), `_runtime/init.py` (construction helpers),
+`_kernel.py` (HTTP client owner), and single-responsibility collaborator
+modules. (The legacy `_core.py` compatibility shim was deleted in v0.5.0;
+callers import directly from the canonical modules.) Each helper exposes
+a narrow Protocol surface so it can be unit-tested against a stub:
 
 | Module | Class | Responsibility |
 |---|---|---|
-| `_core.py` | `ClientCore` | Orchestrator owning the `httpx.AsyncClient` + `AuthTokens`; module-level constants and re-exports; error-injection seam (`_SyntheticErrorTransport`, `_get_error_injection_mode`) used by `_core_transport`'s retry loops via `httpx.AsyncBaseTransport` wrapping. |
-| `_core_metrics.py` | `ClientMetrics` | `ClientMetricsSnapshot` counters, queue-wait recorders, `on_rpc_event` async callback. |
-| `_core_drain.py` | `TransportDrainTracker` | In-flight transport counters, `_TransportOperationToken`, lazy `asyncio.Condition` powering `client.drain(...)`. |
-| `_core_reqid.py` | `ReqidCounter` | Monotonic `_reqid` counter for chat backend (baseline 100000, step 100000). |
-| `_core_auth.py` (Phase 2 in progress) | `AuthRefreshCoordinator` | Refresh-task lifecycle, refresh lock, `_AuthSnapshot` rotation. |
-| `_core_lifecycle.py` (Phase 2 in progress) | `ClientLifecycle` | Loop-affinity guard, `aclose` plumbing, keepalive task wiring. |
-| `_core_rpc.py` | `RpcExecutor` | RPC dispatch executor with `DecodeResponse` + `RpcOwner` Protocols. |
-| `_core_transport.py` | `AuthedTransport` | Authed HTTP POST path, retry loops (429 + 5xx). |
-| `_core_cache.py` | `ConversationCache` | Per-instance LRU conversation cache for `ChatAPI` continuity. |
-| `_core_polling.py` | `PollRegistry` | Pending-poll registry shared by long-running artifact generations. |
-| `_core_cookie_persistence.py` | `CookiePersistence` | Cookie-jar → storage-state serialization, `__Secure-1PSIDTS` rotation. |
+| `_client_composed.py` | `ClientComposed` | Client-owned holder for transport, executor, chain host, middleware metadata, and session collaborator bundle. |
+| `_runtime/init.py` | `RuntimeCollaborators` helpers | Validates constructor args, builds collaborators, wires middleware, and binds `ClientComposed`. |
+| `_client_metrics.py` | `ClientMetrics` | `ClientMetricsSnapshot` counters, queue-wait recorders, `on_rpc_event` async callback. |
+| `_transport_drain.py` | `TransportDrainTracker` | In-flight transport counters, `_TransportOperationToken`, lazy `asyncio.Condition` powering `client.drain(...)`. |
+| `_reqid_counter.py` | `ReqidCounter` | Monotonic `_reqid` counter for chat backend (baseline 100000, step 100000). |
+| `_runtime/auth.py` | `AuthRefreshCoordinator` | Refresh-task lifecycle, refresh lock, `AuthSnapshot` rotation. |
+| `_runtime/contracts.py` | Runtime Protocols | Shared capability Protocols: `Kernel`, `RpcCaller`, and `LoopGuard`. Single-consumer capabilities stay local to their owner modules. |
+| `_runtime/lifecycle.py` | `ClientLifecycle` | Loop-affinity guard, `aclose` plumbing, keepalive task wiring. |
+| `_runtime/transport.py` | `RuntimeTransport` | Authenticated transport leg used by `RpcExecutor` and the middleware chain terminal. |
+| `_rpc_executor.py` | `RpcExecutor` | RPC dispatch executor with direct collaborator dependencies. |
+| `_request_types.py` | `AuthSnapshot`, `BuildRequest`, request materialization | Shared request construction Interface. |
+| `_transport_errors.py` | transport exceptions, `parse_retry_after`, `raise_mapped_post_error` | Terminal `Kernel.post` error mapping for middleware retry/auth behavior. |
+| `_streaming_post.py` | `stream_post_with_size_cap` | Low-level POST streaming and response-size guard. |
+| `_conversation_cache.py` | `ConversationCache` | Per-instance true-LRU conversation cache for `ChatAPI` continuity. Caps the conversation count (`MAX_CONVERSATION_CACHE_SIZE`) and the turns retained per conversation (`MAX_TURNS_PER_CONVERSATION`). |
+| `_polling_registry.py` | `PollRegistry` | Pending-poll registry shared by long-running artifact generations. |
+| `_cookie_persistence.py` | `CookiePersistence` | Per-path typed baselines, ordered `ProfileStore` cookie merges, `__Secure-1PSIDTS` rotation, and the concrete v0.x snapshot adapter. |
 
-The capability surface that sub-clients depend on is pinned in
-`notebooklm._capabilities` via 9 narrow Protocols (`CoreRPCProvider`,
-`SourceListProvider`, `CoreReqIdProvider`, `ChatStreamingProvider`,
-`PollRegistryProvider`, `AuthRouteProvider`, `CookieJarProvider`,
-`TransportOperationProvider`, `UploadConcurrencyProvider`), composed into
-the concrete `ClientCoreCapabilities` adapter. Adding or removing a
-method on `ClientCore` is a Protocol change — review `_capabilities.py`
-alongside any change to the orchestrator's public method surface.
+The feature-facing surface is the set of **capability Protocols** in
+`notebooklm._runtime.contracts` — `Kernel`, `RpcCaller`, and
+`LoopGuard`. Single-consumer capability shapes stay in the owning
+feature module (`AuthMetadata` in `_source/upload.py`,
+`OperationScopeProvider` in `_artifact/polling.py`), and the unused
+`AsyncWorkRuntime` composite was deleted. The broad `Session` Protocol
+that previously bundled these together was deleted in the final phase
+of the capability refactor (see [`docs/refactor-history.md`](refactor-history.md)
+and ADR-0013); each feature now depends on the narrowest slice it needs
+and takes those collaborators by keyword-only constructor argument. The
+feature-local composite-runtime Protocols (`ChatRuntime`,
+`ArtifactsRuntime`, `UploadRuntime`) and their adapter dataclasses that
+previously bundled three capability Protocols apiece were retired once
+it was clear they only hid stable collaborators with one production
+satisfier; see ADR-0013 for the promotion criterion (at least two
+production consumers) that still gates adding any new shared Protocol.
 
 Private service modules sit inside the client layer but below the public
 facades. They own cross-facade composition without importing sibling facades:
@@ -126,33 +150,42 @@ services.
 
 ### Boundary Guardrails
 
+These are the same family as the *Architecture & invariant gates* (`tests/_guardrails/`)
+described below. The **pure** ones (e.g. `test_cli_boundary.py`) have been
+consolidated into `tests/_guardrails/`; the **hybrids** that pair a gate with
+behavioral tests (e.g. `test_public_shims.py`) keep their behavioral half in
+`tests/unit/` and split the gate half into a dedicated `tests/_guardrails/`
+file.
+
 The architecture tests encode the current layer contract:
 
-- `tests/unit/test_public_shims.py` has a documented public import manifest.
-  When a docs change adds or removes a supported import path, update the
-  manifest in the same PR so public API drift is intentional and reviewable.
-- `tests/unit/test_cli_boundary.py` parses `src/notebooklm/cli/**/*.py` and
-  rejects CLI imports from `notebooklm._*`, `notebooklm.rpc.*`, or `_private`
-  names exposed by public modules. Promote needed symbols through a public
-  facade (`notebooklm.types`, `notebooklm.auth`, `notebooklm.research`, etc.)
-  before using them from the CLI.
+- `tests/_guardrails/test_public_surface_manifest.py` has a documented public
+  import manifest. When a docs change adds or removes a supported import path,
+  update the manifest in the same PR so public API drift is intentional and
+  reviewable. The behavioral half of the public-shim suite (the
+  `select_cited_sources` / `ResearchAPI` back-compat delegations, the
+  `UnknownTypeWarning` filter behaviour, and `NotebookLMClient.rpc_call`
+  forwarding) stays in `tests/unit/test_public_shims.py`.
+- `tests/_guardrails/test_cli_boundary.py` parses `src/notebooklm/cli/**/*.py`
+  and rejects CLI imports from `notebooklm._*`, `notebooklm.rpc.*`, or
+  `_private` names exposed by public modules. Promote needed symbols through a
+  public facade (`notebooklm.types`, `notebooklm.auth`, `notebooklm.research`,
+  etc.) before using them from the CLI.
 - Auth internals may move under `notebooklm._auth` during architecture work,
   but first-party callers continue to import through `notebooklm.auth`. The
-  compatibility manifest in `tests/unit/test_public_shims.py` enforces the
-  current first-party surface for that move; it is not a broader public API
-  decision, and removing a listed name needs a separate deprecation plan.
-- `tests/unit/test_init_order.py` records the temporary baseline of feature
-  APIs that still access `ClientCore` private state directly. Future capability
-  migration PRs should reduce that baseline as private state moves behind
-  explicit `ClientCore` methods; do not add new entries unless the PR also
-  explains the follow-up migration path.
-- `tests/unit/test_init_order.py` also guards the notebook-composition
-  boundaries: `NotebookLMClient` constructs `SourcesAPI` before `NotebooksAPI`
-  and passes it through the legacy `sources_api=` slot; notebook metadata
-  services must not import or construct `SourcesAPI`; artifact/source/notebook
-  composition services must not runtime-import facade APIs or `ClientCore`.
-  Add new private services to those guard lists when they take ownership of
-  cross-facade behavior.
+  compatibility manifest in `tests/_guardrails/test_public_surface_manifest.py`
+  enforces the current first-party surface for that move; it is not a broader
+  public API decision, and removing a listed name needs a separate deprecation
+  plan.
+- `tests/_guardrails/test_no_facade_reach_in.py` holds the AST reach-in /
+  runtime-import boundary gates: notebook metadata services must not import or
+  construct `SourcesAPI`; artifact/source/notebook composition services must
+  not runtime-import facade APIs. Add new private services to those guard
+  lists when they take ownership of cross-facade behavior. The construction /
+  init-order behaviour tests — `NotebookLMClient` constructs `SourcesAPI`
+  before `NotebooksAPI` and passes it through the legacy `sources_api=` slot,
+  plus the mind-map decoupling flows — stay in
+  `tests/unit/test_init_order.py`.
 
 ### Key Design Decisions
 
@@ -161,6 +194,13 @@ The architecture tests encode the current layer contract:
 **Why namespaced APIs?** `client.notebooks.list()` instead of `client.list_notebooks()` - better organization, scales well, tab-completion friendly.
 
 **Why async?** Google's API can be slow. Async enables concurrent operations and non-blocking downloads.
+
+**Naming conventions.** See [`docs/conventions.md`](./conventions.md) for the
+canonical tiebreakers on waiting/polling verbs (`poll_X` / `wait_for_X` /
+`wait_until_X` / `await_X` / `_wait_for_X`), RPC-callable Protocol names
+(`NextCall` / `RpcCallback` / `RpcCaller`), and
+metrics method verbs (`record_X` vs `emit_X`). New code should pick names
+from those catalogues rather than introducing parallel patterns.
 
 ### Adding New Features
 
@@ -172,9 +212,30 @@ The architecture tests encode the current layer contract:
 5. Add CLI command if user-facing
 
 **New API Class:**
-1. Create `_newfeature.py` with `NewFeatureAPI` class
-2. Add to `client.py`: `self.newfeature = NewFeatureAPI(self._core)`
-3. Export types from `__init__.py`
+1. Create `_newfeature.py` with `NewFeatureAPI` class.
+2. Type each constructor parameter against the **narrowest shared
+   capability Protocol** it actually uses (`RpcCaller`, `LoopGuard`,
+   `Kernel` — see
+   [`docs/architecture.md`](./architecture.md) for the protocol
+   catalog). If the capability has only one consumer, define the
+   Protocol locally beside that consumer instead of promoting it to
+   `_runtime/contracts.py`. Pass each collaborator by keyword-only
+   argument; do not bundle them into a feature-local composite-runtime
+   Protocol unless a second production consumer materialises. **Do NOT
+   depend on a broad runtime facade for type annotations** — there is no
+   concrete `Session` class (the broad `Session` Protocol was deleted;
+   see ADR-0013).
+3. Add the wiring in `_client_assembly.py::_assemble_client(...)`, not
+   directly in `client.py`. The assembly seam is shared by
+   `NotebookLMClient.__init__` and the canonical test factory; set every
+   constructor-time attribute there and thread concrete collaborators
+   from `compose_client_internals(...)`.
+4. **Tests** should inject the narrow collaborator the feature actually
+   needs. `tests/_fixtures/fake_core.py:FakeSession` remains available
+   for legacy broad-fixture tests, but new direct feature tests should
+   prefer `MagicMock(spec=RpcCaller, rpc_call=AsyncMock(...))`-style
+   fakes or local protocol fakes.
+5. Export types from `__init__.py`.
 
 ---
 
@@ -183,41 +244,221 @@ The architecture tests encode the current layer contract:
 Multiple `notebooklm` processes (parallel CLI runs, an in-process keepalive
 beside a cron-driven `notebooklm auth refresh`, container start-up races,
 `xargs -P` fan-outs) can target the same `NOTEBOOKLM_HOME` simultaneously.
-The library coordinates with **cross-process file locks** (POSIX `flock` /
-Windows `LockFileEx`, via the [`filelock`](https://pypi.org/project/filelock/)
-package) so reads and writes against shared on-disk state never tear or
-clobber a sibling's update.
+The library coordinates with **cross-process file locks** — the project-internal
+`StorageLockManager` (`_auth/storage_lock.py`, using `flock`/`msvcrt`) for
+`storage_state.json` and its sibling credential file, and the
+[`filelock`](https://pypi.org/project/filelock/) package for `migration.py` and
+`context.json` — so reads and writes against shared on-disk state never tear or
+clobber a sibling's update. See
+[ADR-0029](adr/0029-canonical-storage-writer.md) for why the split exists.
 
 All locks are sibling files next to the resource they guard (zero-byte,
-left on disk after release — `filelock` reuses them).
+left on disk after release — both lock implementations reuse them).
 
 | Lock file | Owner | Scope | Acquisition |
 |---|---|---|---|
-| `<profile>/storage_state.json.lock` | `auth.save_cookies_to_storage` (`auth.py:1935`) | Read-merge-write of `storage_state.json` (cookie sync after a rotation or 302) | Blocking exclusive |
-| `<profile>/.storage_state.json.rotate.lock` | `auth._poke_session` (`auth.py:2817`) | Cross-process dedup of the `accounts.google.com/RotateCookies` keepalive POST | Non-blocking exclusive (`LOCK_NB`); skip on contention |
-| `<home>/.migration.lock` | `migration.migrate_to_profiles` (`migration.py:28`) | One-shot legacy→profile layout migration on startup | Blocking exclusive, 30s timeout (raises `MigrationLockTimeoutError`) |
-| `<profile>/context.json.lock` | `cli.helpers.set_context` / `clear_context` via `_atomic_io.atomic_update_json` (`_atomic_io.py:136`) | Read-modify-write of the active-notebook/account-routing context for a profile | Blocking exclusive, 10s timeout |
+| `<profile>/.storage_state.json.lock` | `_auth/profile_store.py` transaction owner via `_auth/storage_lock.py`; `_auth/storage.py` retains compatibility adapters | Every mutation of `storage_state.json`: cookie CAS, typed in-band account update/clear, and remint/login/minted full replacement | Cookie methods: blocking exclusive, fail-open. Account update and minted replacement: bounded 90s, fail-closed; clear: bounded best-effort; browser/remint and login: bounded typed status. |
+| `<profile>/.master_token.json.lock` | `_auth/master_token_file.py` via the `ProfileStore` derived-token methods; `_auth/storage.py` retains the arbitrary-path v0.x adapter | Writes to `master_token.json` (the durable L4 credential) | Same bounded manager acquire as above (90s deadline), fail-closed. |
+| `<profile>/.storage_state.json.rotate.lock` | `_auth/keepalive.py::_poke_session` via `_auth/storage_lock.py` | Cross-process dedup of the `accounts.google.com/RotateCookies` keepalive POST | Non-blocking exclusive; skip on contention |
+| `<profile>/.storage_state.json.refresh.lock` | `_auth/refresh.py` via `_auth/keepalive.py` and `_auth/storage_lock.py` | Cross-process dedup of the `NOTEBOOKLM_REFRESH_CMD` subprocess | Non-blocking exclusive; skip on contention, waiter polls asynchronously with jittered backoff |
+| `<profile>/.storage_state.json.lock.bootstrap` | `_auth/master_token_bootstrap.py::MasterTokenBootstrapper.bootstrap_storage`; `_auth/master_token.py` retains the v0.x adapter | Cross-process exclusion for the FIRST-TIME mint of a profile that has only a `master_token.json` — held across the mint, whose persist takes `.storage_state.json.lock` *inside* this section (so the two must never share a path) | Non-blocking exclusive (`filelock`), retried on a 50ms async sleep up to a 90s deadline |
+| `<home>/.migration.lock` | `migration.py::migrate_to_profiles` | One-shot legacy→profile layout migration on startup | Blocking exclusive, 30s timeout (raises `MigrationLockTimeoutError`) |
+| `<profile>/context.json.lock` | `_atomic_io.py::atomic_update_json` through CLI context helpers; also `_auth/profile_migration.py::LegacyAccountContext.scrub` for legacy `account` cleanup | Read-modify-write of the active-notebook/account-routing context for a profile | Blocking exclusive, 10s timeout (`filelock`); migration cleanup keeps best-effort error handling and the public atomic JSON writer |
 
 Design notes:
 
-- **Two layered storage locks (not one).** The `.lock` and `.rotate.lock`
-  files protect the *same* `storage_state.json` but serve different access
-  patterns: a long-running save must not block — or be blocked by — a
-  best-effort rotation poke. Keeping them separate prevents the keepalive
-  from queueing behind a slow cookie write (and vice-versa).
-- **Fail-open on lock infrastructure failure.** When the lock file itself
-  cannot be created (read-only home dir, NFS without `flock`, permission
-  denied), `_poke_session` proceeds *without* coordination rather than
-  wedging forever. A duplicate rotation across processes is bounded and
-  harmless; a permanently-suppressed rotation is not.
-- **Locks are sibling files, never the resource itself.** `filelock` reuses
-  the sentinel across invocations, so cleanup is not required — and a
-  TOCTOU race between unlink and reacquire is avoided.
+- **Three layered storage locks (not one).** The `.lock`, `.rotate.lock`, and
+  `.refresh.lock` files protect the *same* `storage_state.json` but serve
+  different access patterns: a full-replace write must not block — or be
+  blocked by — a best-effort rotation poke or a refresh-cmd subprocess.
+  Keeping them separate prevents any one from queueing behind another. The
+  fourth sibling, `.lock.bootstrap`, is separate for a harder reason than
+  throughput: the mint it guards acquires `.storage_state.json.lock` *inside*
+  its critical section — and the two sides use different mechanisms
+  (`filelock.FileLock` outside, `StorageLockManager` inside), so the in-process
+  lock registry never sees the outer hold. What makes sharing one path fatal is
+  the OS lock: both take an exclusive `flock` on the sentinel, and `flock`
+  conflicts between two open file descriptions even inside one process, so the
+  inner acquire would be guaranteed-unavailable rather than merely contended.
+- **One derivation, four files, three different base-path policies.** Every
+  credential lock path is `.<name>.<kind>` next to the storage file, computed in
+  exactly one place (`_auth/paths.py::_lock_sibling`). What differs per lock is
+  the *base* it is derived from, and that choice decides whether two spellings
+  of one profile collapse onto the same lock:
+  - `.storage_state.json.lock.bootstrap` canonicalizes **inside** the helper
+    (`_bootstrap_lock_path` -> `canonical_storage_key`, degrading to
+    `expanduser()` on a symlink loop), because its cold-start callers get
+    whatever spelling the CLI was handed and two processes must not both mint.
+  - `.refresh.lock` is alias-proof **by its callers**: both production sites
+    (`refresh._fetch_tokens_with_refresh`, `refresh.try_refresh_cmd_reauth`)
+    pass the already-canonicalized path they key the single flight on.
+  - `.rotate.lock` is alias-proof only on the keepalive route, where
+    `_client_assembly` canonicalizes the keepalive storage path once at client
+    assembly; the PSIDTS rotation-recovery route passes its load path through
+    unchanged.
+  - `.storage_state.json.lock` never canonicalizes for I/O: `ProfileStore` and
+    the compatibility transaction alias derive `_storage_state_lock_path` from
+    the caller's raw path, so two processes
+    reaching the same file through different path spellings (e.g. a symlink vs.
+    its resolved target) can take different main-write locks and race. Callers
+    are expected to reach a profile's storage file through one consistent path
+    (`paths.py`'s resolvers), which holds in every in-tree call site today.
+
+  These filenames are a cross-version contract — a mixed-version window (old CLI
+  + new server on one profile) loses updates the moment two versions disagree on
+  a lock name — so all four are pinned against hard-coded strings in
+  `tests/unit/test_auth_lock_path_derivation.py`.
+- **Per-intent fail-open/fail-closed split ([ADR-0029](adr/0029-canonical-storage-writer.md)).**
+  The cookie CAS merge and the rotation/refresh-cmd pokes fail **open** on lock
+  infrastructure failure (read-only home dir, NFS without `flock`, permission
+  denied) rather than wedging forever — availability wins, and the CAS guard
+  (or the reactive nature of a poke) keeps correctness. Full-file
+  read-modify-write intents (account update, master-token persist/re-mint)
+  fail **closed**, raising `LockUnavailableError`, because failing open there
+  could silently overwrite a concurrent CAS delta.
+
+`ProfileStore` also owns typed account reads, best-effort clear, and the complete
+browser/remint, login/import, and minted-session replacement transactions. Remint carries the
+latest whole raw `notebooklm` namespace only when requested, filters through the pure
+`_auth/cookie_filter.py` leaf, and commits once. Browser capture constructs a
+`RemintWriteRequest` and consumes the native `ReplaceResult` directly;
+`storage.replace_from_remint` remains only the v0.x direct-call adapter. Login filtering,
+required-name validation, KEEP/SET/CLEAR construction, optional backup, and commit run under one
+bounded store lock. `_auth/profile_migration.py` owns the path-shaped
+`replace_profile_from_login` operation and the legacy-account boundary:
+`LegacyAccountMigrator` performs lossless in-band/legacy/in-band two-read resolution, typed legacy
+sanitization, only-if-absent promotion, and embed-before-scrub ordering;
+`LegacyAccountContext` owns the sibling file and lock. `LegacyPromotionScheduler` owns the
+canonical per-path active-work registry and daemon workers. Reads only schedule and return; the
+path becomes eligible again after a worker settles, and an in-band record with a stale legacy copy
+schedules the privacy scrub, making lock failures and write-then-scrub interruption self-healing.
+Concurrent readers still share one active worker; the
+process-default exit hook drains outstanding workers within one shared budget
+(30 seconds by default, configurable via `NOTEBOOKLM_PROMOTION_EXIT_TIMEOUT`),
+warning if any is still running when it expires.
+
+First-party app and CLI flows pass primitive account modes to `replace_profile_from_login` and
+consume `ReplaceResult`; `storage.replace_from_login` keeps its v0.x signature and projects that
+native result to `LoginWriteOutcome`. Post-`APPLIED`, outside-lock promotion/scrub remains owned by
+`LoginProfileWriter`; failed store results do no sibling work. Raw source account key presence
+still chooses scrub versus promotion. `AccountMetadataWriter` similarly preserves the
+distinct update-then-scrub and best-effort-clear-then-scrub order, while naturally escaping store
+exceptions abort before scrub. For minted persistence,
+`storage.persist_minted_jar` eagerly snapshots the live jar with the raw master-token serializer
+fields (including `same_site="None"`) and deep-copies the runtime-permissive email in the same
+repr-hidden request before path/lock work. It does not use the filtering and SameSite-lossy
+`CookieJar.from_httpx()` constructor. `ProfileStore.replace_minted_session` then owns the
+same-lock latest-owner decision, default filter, destination preservation/rebind, and one commit;
+the adapter translates its private refusal outside the handler to context-free canonical
+`MasterTokenError`. This immutable jar-and-email snapshot is the intentional isolation correction.
+An empty in-band account mapping does not
+block promotion but is still preserved when remint carries the whole namespace;
+a non-empty unknown-only mapping remains present and wins.
+
+`_auth/master_token_bootstrap.py` owns the concrete bootstrap, re-mint, and
+missing-storage transaction over one `ProfileStore`. Keep new behavior tests on
+`MasterTokenBootstrapper`, `MintService`, `ProfileStore`, and the call-time
+strict-loader seam; do not restore patches of the v0.x coarse functions in
+`_auth/master_token.py`. The adapter composes one store/service/bootstrap lock
+and retains late-bound bridges for legacy owner lookup, Android-ID generation,
+strict reload, and default verification. Session persistence finishes before
+token persistence; a missing-storage leader remains shielded to settlement
+before its bootstrap lock is released. At the extraction freeze the coordinator
+is 373 lines and the compatibility adapter is 463 lines.
+
+The current measured persistence boundary is 1,090 lines in `_auth/storage.py`, 602 in
+`_auth/profile_migration.py`, 876 in `_auth/profile_store.py`, 96 in
+`_auth/cookie_filter.py`, and 89 in `_auth/master_token_file.py` (2,753 total). `storage.py`
+remains the v0.x signature/result facade; the extracted owners do not create a second facade.
+
+`_auth/tokens.py` now owns the Phase 9 stored-auth composition: captured-inline/file sources,
+`LoadPolicy`, paired `SessionSeed`/`TokenAcquisition`, final-attempt `AccountRouteResolver`, the
+closed `LoadedAuth` result, and `StoredAuthLoader`. Its only structural test seam is
+`TokenAcquirer`; inject that seam for ladder-result tests, and patch the call-time
+`tokens._load_stored_auth` provider for `AuthTokens.from_storage`/client composition tests. Raw
+loads and PSIDTS heal, file-account resolution, and the initial `ProfileStore` merge remain worker
+offloads. `_auth/cookies.py` owns one-sample live/SameSite-preserving seed provenance.
+`_auth/recovery.py` now owns the complete cold operation. A fresh, one-shot
+`ColdRecoveryCoordinator` spells L2.5 → L3 → L4 directly; its class-owned `_drive_cold` and
+`_coalesce_cold` methods are the sole ladder and flight bodies. `ColdRecoveryState` owns the
+synchronized weak-loop path-lock/generation maps, and `SingleFlight` owns cross-loop flights and
+canonical-path success epochs. The exact-signature module functions are compatibility adapters to
+the process-default owners, not second implementations. The coordinator claims under a threading
+lock before its first await and deletes all eleven collaborator references on every exit.
+
+The sole production composition remains in `refresh.py`; its late-bound closures retain DEBUG skip
+and WARNING start/failure logs, raw caller / canonical L2.5 / raw caller route timing, original
+exception precedence, and exact traceback projection. Waiter cancellation propagates only after
+the shared flight settles and never cancels sibling work; a leader cancellation is mirrored as the
+original `CancelledError`. Cancellation before jar replacement leaves the caller jar untouched,
+while later cancellation does not roll back a completed replacement. Test isolated owners through
+constructor injection. Use process-default module adapters only when testing v0.x lookup seams;
+their reset helpers reject live/locked work and clear only quiescent state.
+
+`RotationState` similarly owns keepalive's weak-loop locks and per-canonical-path monotonic stamps.
+The claim is atomic and occurs before the POST, so HTTP failure and cancellation consume the
+60-second slot; the historical `_POKE_*` dictionaries/lock are identity views into that owner, not
+independent state. `AccountRepairService` is also one-shot: cookie loading alone is offloaded,
+write/clear remain synchronous, only the frozen handled exception set becomes a result, and all six
+collaborators are scrubbed on every exit. Patch these services through constructor injection rather
+than adding module monkeypatch sites.
+
+PSIDTS load composition now receives the pure cookie loader as an explicit callable. Keep
+conversion in `CookieJar`, raw-row fidelity in `ProfileDocument`, and persistence in `ProfileStore`;
+do not restore `psidts_recovery -> cookies` or `psidts_recovery -> storage`. Preserve the sentinel,
+contended-reread, acquired-full-reread, pre-POST observation, typed CAS, and post-save disk-live
+winner order. Its catches are intentionally narrow: cancellation, Unicode failures, and unlisted
+errors must not be normalized into a silent decline. The master-token exception follows the same
+compatibility rule: define it only in `master_token_types.py`, but preserve
+`__module__ == "notebooklm._auth.master_token"`, facade/storage identity, cause chains, and old
+pickle payloads.
+
+`fetch_tokens_with_domains` now loads one paired live jar and SameSite-preserving baseline, then
+passes that baseline through the unchanged exact-baseline ladder. After the final fetch it captures
+an immutable `CookieJar` observation on the caller thread and makes exactly one direct positional
+`asyncio.to_thread` handoff to the private synchronous helper and one concrete `ProfileStore`.
+`HARD_FAILURE` retains the exact selected initial/L2.5/L3/L4 baseline object; every advancing
+result selects the exact returned next-baseline object. Cancellation is ordinary `to_thread`
+cancellation: the caller is cancelled immediately, while an already-dispatched worker may finish
+and commit. File auth alone constructs the store; inline env auth logs the existing skip and does
+not persist. Patch the private typed helper/store method for these tests, not the retired private
+`refresh.save_cookies_to_storage` alias. The public saver/facade and client/runtime saver-injection
+seams remain exact. Phase 12C measures **40 modules / 15,237 lines / 128 unique edges (117 module +
+11 function-local)**. Module-only and all-scope SCC sets are both empty. The final touched production
+LOC is: account 252, account-repair 132, account-types 50, cookie-types 396, cookies 961, keepalive
+438, master-token 455, master-token-types 68, PSIDTS recovery 1,222, recovery 530, refresh 1,184,
+single-flight 268, and storage 1,127. These are ratchet evidence, not a budget to spend.
+
+Phase 10 completes runtime ownership. `NotebookLMClient.from_storage` registers a
+`FileLoadedAuth` result's exact `ProfileStore`/baseline pair with `CookiePersistence`, without a
+second disk read. A direct file client prepares its baseline once before transport construction;
+missing, malformed, or invalid input becomes a sticky typed failure for canonical saves. A
+fileless client records only a one-shot live compatibility projection and creates no typed state.
+
+First-party `_from_store` persistence retains no `AuthTokens`. A missing saver routes
+unconditionally through the private canonical merge. Only an explicit `cookie_saver=` routes
+through `_save_v0_callback`; it lazily initializes its own retryable adapter snapshot and suppresses
+the writer when the source is invalid.
+`ClientLifecycle` alone owns the client `AuthTokens` mirror and refreshes `cookie_snapshot` after
+open and accepted canonical or compatibility saves. Tests inject a saver on the client when they
+intend to exercise the callback contract; canonical tests target the private typed seam.
+Measured owners are 457 lines in `_cookie_persistence.py`, 618 in `_runtime/init.py`, 628 in
+`_runtime/lifecycle.py`, and 992 in `client.py`.
+
+- **In-process lock before OS lock.** `StorageLockManager` takes an in-process
+  `threading.Lock` keyed by the exact raw lock-path spelling *before* the OS lock, so
+  threads within one process serialize before ever touching the OS primitive —
+  layered under the per-loop `asyncio.Lock` dedup described below.
+- **Locks are sibling files, never the resource itself.** Both lock
+  implementations reuse the sentinel across invocations, so cleanup is not
+  required — and a TOCTOU race between unlink and reacquire is avoided.
 - **In-process serializers complement, not replace, file locks.**
-  `auth._poke_session` also takes an `asyncio.Lock` keyed on
-  `(event_loop, profile)` to dedupe an `asyncio.gather` fan-out before
-  reaching the cross-process flock — the file lock only sees one
-  contender per process per rate-limit window.
+  `_auth/keepalive.py::_poke_session` takes an `asyncio.Lock` keyed on
+  `(event_loop, profile)` to dedupe an `asyncio.gather` fan-out before reaching
+  the cross-process flock; the refresh-cmd path does the same but *across event
+  loops in one process* via `_auth/single_flight.py`
+  ([ADR-0030](adr/0030-one-recovery-ladder.md)) — the file lock only sees one
+  contender per process per rate-limit window either way.
 
 Path resolution for all locked resources flows through `paths.py`
 (`get_storage_path`, `get_context_path`, `get_home_dir`), so a `--storage`
@@ -241,6 +482,12 @@ lock sibling and the two invocations never contend.
    several unit tests import and patch `playwright.sync_api`. The command
    `uv sync --frozen --extra dev` installs the test tools, but not Playwright.
 
+   **Adapter tests need their extras.** The MCP unit tests (`tests/unit/mcp/`)
+   and REST suite (`tests/server/`) `importorskip` `fastmcp` / `fastapi`, so
+   without `--extra mcp --extra server` they **silently skip** — you'll see a
+   green run that never exercised the adapter surface. Add both extras
+   (CI installs `--extra mcp --extra server --extra impersonate`) to run them.
+
    CI runs the same lint gate with `uv run pre-commit run --all-files`, so local hook results should match the `quality` job.
 
 2. **Authenticate:**
@@ -260,6 +507,16 @@ lock sibling and the two invocations never contend.
 # Unit + integration tests (no auth needed)
 uv run pytest
 
+# Same suite in parallel — the full suite is ~10.6k tests and runs single-process
+# by default (slow). pytest-xdist (a dev dep) cuts wall-clock to ~1–2 min. CI runs
+# `-n auto --dist loadgroup`; loadgroup keeps @pytest.mark.xdist_group tests pinned
+# to one worker. Mirror it locally when running the whole suite.
+uv run pytest -n auto --dist loadgroup
+
+# Fast local loop — skip repo-wide audit / release-gate checks (~40s saved).
+# CI still runs these; the marker just lets you iterate quickly.
+uv run pytest tests/unit tests/integration -m "not repo_lint"
+
 # E2E tests (requires auth + test notebook)
 uv run pytest tests/e2e -m readonly        # Read-only tests only
 uv run pytest tests/e2e -m "not variants"  # Skip parameter variants
@@ -268,6 +525,174 @@ uv run pytest tests/e2e --include-variants # All tests including variants
 # Select a profile for E2E tests
 uv run pytest tests/e2e -m e2e --profile work
 ```
+
+The `repo_lint` marker tags cassette-shape lint, public-surface scans,
+docstring/install-doc drift guards, version-sync, and CI-script audits.
+These are valuable release/CI guardrails but cost ~30–45s locally. See
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#fast-local-loop-skip-repo-wide-audit-checks)
+for the canonical fast-loop guidance.
+
+### Testing across boundaries and against reality
+
+The test pyramid has three distinct jobs:
+
+1. **Unit/component tests** use deterministic collaborators and synthetic
+   outputs to cover branches, error handling, and security contracts.
+2. **Composition/replay tests** cross the real in-process boundary, such as
+   CLI → client → RPC, REST → client → RPC, or MCP → client. VCR replay proves
+   that the recorded wire shape is handled; it does not prove that a fixture
+   reflects the current external service.
+3. **Reality probes** run an external executable or environment that production
+   code interprets. They are required for assumptions about subprocess output,
+   browser/tool availability, platform behavior, or third-party strings.
+
+Synthetic subprocess output is still appropriate for tier-1 tests. It is not
+evidence that the real executable emits that output. The initial runtime seam
+audit is intentionally bounded to production behavior that interprets external
+results:
+
+| Seam | Evidence/disposition |
+| --- | --- |
+| `NotebookLMClient.notebooks.list()` → RPC executor → decoder | `tests/integration/test_rpc_seam_matrix.py` asserts the RPC ID, encoded `f.req` envelope, CSRF form field, and typed adapter result; response RPC-ID drift fails through the same path. |
+| CLI `source list` → source service → client | `tests/unit/cli/test_source.py::TestSourceList::test_source_list_composes_cli_service_and_client_boundary` invokes the real Click command and verifies the client-backed result, so fabricated command output cannot pass. |
+| MCP `notebook_list` → app/client → RPC | `tests/integration/mcp_vcr/test_notebooks.py::test_mcp_notebook_list_crosses_adapter_to_client_boundary` drives an in-memory FastMCP client through the real client and an existing RPC cassette. |
+| REST `POST /v1/notebooks/{id}/sources/url` → source service → client | `tests/server/test_integration_real_client.py::TestRestSeamMatrix::test_url_add_crosses_rest_to_client_boundary` drives the real FastAPI route, client, decoder, and response projection through an existing cassette. |
+| `cli/services/playwright_login.py::ensure_chromium_installed` | The programmatic probe is checked against real Playwright, and a separate required Chromium launch smoke checks usability. |
+| Playwright launch/error classification | Synthetic classification tests remain valid; add a reality probe only when claiming a specific third-party message shape. |
+| `_auth/refresh.py` custom refresh command | Classification/security contract only; the command is operator-supplied, so there is no fixed third-party output contract. |
+| Auth refresh composition (`AuthRefreshCoordinator` → `NotebookLMClient.refresh_auth` → `_auth/session.py`) | `tests/unit/test_auth_refresh_seam.py` crosses the production assembly with a deterministic homepage response; the existing VCR test covers the stale-RPC → homepage-refresh → retry path. No live reality probe is used because it would require mutable authenticated external state and would not provide a stable CI contract. |
+| `_version_info.py` git lookup | Local-tool lookup with fallback behavior; synthetic and fallback tests are sufficient. |
+| `scripts/` subprocesses | Audited `audit_public_api_compat.py`, `regen_baselines.py`, and `audit_test_suite.py`: each invokes a local developer/CI tool, not a product boundary. Their wrappers are covered by `tests/unit/test_ci_audit_scripts.py` and related audit tests; no external-output reality probe is claimed. |
+
+The bounded MCP seam-matrix slice is
+[`tests/integration/mcp_vcr/test_notebooks.py::test_mcp_notebook_list_crosses_adapter_to_client_boundary`](../tests/integration/mcp_vcr/test_notebooks.py).
+It drives the in-memory FastMCP client through the registered MCP tool, the
+real `NotebookLMClient.notebooks.list()` service, RPC decoding, and the MCP
+structured-content projection. VCR replays the existing notebook-list
+recording, so this composition check uses no live credentials or network while
+still failing if the adapter bypasses or mis-wires the client boundary.
+
+The two Playwright probes are marked `reality` and named in the required-mode
+contract. In the browser-enabled CI lane, run them explicitly and serially:
+
+```bash
+uv run pytest tests/unit/cli/test_playwright_login_coverage.py \
+  -m reality --require-reality
+```
+
+`--require-reality` fails when an expected probe is missing, filtered out,
+skipped, xfailed, errors during setup/teardown, or does not produce exactly one
+passing call-phase result. Ordinary local runs retain actionable dependency
+skips. The required lane is deliberately serial and rejects xdist, because the
+controller must own complete collection and phase accounting. This distinction
+is deliberate: a skipped reality probe must never look like evidence that the
+external assumption was tested.
+
+### Live authentication matrix
+
+`scripts/live_auth_matrix.py` is the maintainer/release runner for live cookie,
+master-token, recovery, RPC, REST, MCP, concurrency, and crash-safety checks. It
+reads the selected source/browser profiles but performs every write inside a
+disposable `NOTEBOOKLM_HOME`, scrubs credential values from its report, and
+removes the temporary credential copies in a `finally` block. Its default cells
+are unattended:
+
+```bash
+uv run --extra browser --extra cookies --extra headless --extra mcp --extra server \
+  python scripts/live_auth_matrix.py \
+  --profile <source-profile> \
+  --browser 'chromium::Profile 3' \
+  --account <account-email> \
+  --output live-matrix.json
+```
+
+The three generic human-interaction cells are available but deliberately off by
+default. Start an operator-owned Chrome/Chromium with a loopback-only CDP root,
+then opt in. On X11, set `DISPLAY` and `XAUTHORITY` for both commands so every
+headed window appears on the maintainer's desktop:
+
+```bash
+DISPLAY=:10 XAUTHORITY="$HOME/.Xauthority" google-chrome \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/notebooklm-live-cdp
+
+DISPLAY=:10 XAUTHORITY="$HOME/.Xauthority" \
+uv run --extra browser --extra cookies --extra headless --extra mcp --extra server \
+  python scripts/live_auth_matrix.py \
+  --profile <source-profile> \
+  --browser 'chromium::Profile 3' \
+  --account <account-email> \
+  --include-interactive \
+  --interactive-timeout 600 \
+  --cdp-url http://127.0.0.1:9222 \
+  --output live-matrix.json
+```
+
+The opt-in lane runs ordinary headed Playwright login, initial headed
+master-token bootstrap, and CDP-attached master-token bootstrap in separate
+disposable profiles. Each cell verifies the expected credential files and a
+passive live request. The CDP cell probes the endpoint before and after login,
+so it also proves the matrix did not close the operator-owned browser. Remote,
+credential-bearing, query-bearing, and non-root CDP URLs are rejected before
+any cell runs. `--interactive-timeout` is forwarded into each CLI browser wait;
+the matrix gives the child process 30 additional seconds to report failure and
+tear down. Workspace/SSO, regional-account, and long-duration-expiry cases remain
+account-specific manual validation.
+
+#### The extras above are load-bearing — especially `headless`
+
+Run the matrix with the full set shown in the commands above
+(`browser`, `cookies`, `headless`, `mcp`, `server`). They are not
+interchangeable with the contributor install in
+[CLAUDE.md](../CLAUDE.md), which deliberately mirrors CI's test job and
+includes neither `cookies` nor `headless` — CI never runs this matrix.
+
+`headless` (`gpsoauth`) is load-bearing. Without it, master-token cells now
+stop with an actionable `MissingDependencyError`:
+
+```text
+Master-token auth needs gpsoauth. Install: pip install 'notebooklm-py[headless]'
+```
+
+The dependency fault bypasses `MasterTokenError` and the recovery rung's
+ordinary `False` decline. MCP/REST adapters classify it as `DEPENDENCY`; the CLI
+reports the actionable configuration error. A genuinely revoked token still
+reports the authentication failure. This distinction is pinned by
+[#2239](https://github.com/teng-lin/notebooklm-py/issues/2239).
+
+Similarly, without `cookies` (`rookiepy`) the browser discovery/login and
+browser-refresh cells cannot run at all; use `--skip-browser` rather than
+reading their absence as a pass.
+
+#### Where a cell's code lives
+
+`scripts/live_auth_matrix.py` owns isolation, execution, and reporting only. The
+realistic recovery cells — storage reload, sibling re-mint, master-token
+fallback, REST recovery, MCP recovery, browser refresh, and the crash-safety
+writer — live in `scripts/_live_auth_scenarios/` as ordinary modules and are
+launched one per child process:
+
+```bash
+python -m scripts._live_auth_scenarios.<cell>
+```
+
+Each cell exports `async def scenario() -> ScenarioResult` plus a `main()`, and
+prints exactly one JSON object on stdout (the orchestrator parses it verbatim).
+Assertions go through `require(...)`, never `assert`, because these programs may
+run under `python -O`. Adding or renaming a cell means updating
+`SCENARIO_MODULES` in `tests/unit/test_live_auth_matrix.py`, which pins the
+module list, its profile constants, and child-process importability.
+
+To run one cell by hand against a disposable home:
+
+```bash
+PYTHONPATH="$PWD/src:$PWD" NOTEBOOKLM_HOME=/tmp/live-cell \
+  uv run python -m scripts._live_auth_scenarios.storage_reload
+```
+
+These modules are excluded from the shipped package on purpose and are
+type-checked by the `Run type checking` CI step alongside `src/notebooklm`.
 
 ### Selecting a profile for E2E tests
 
@@ -305,34 +730,217 @@ NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID=<work-nb-id> \
 ```
 tests/
 ├── unit/                            # No network, fast, mock everything
+│   ├── app/                         # _app/ transport-neutral core
+│   ├── cli/                         # CLI command tests
+│   └── mcp/                         # MCP adapter unit tests (importorskip fastmcp)
+├── server/                          # REST adapter suite — FastAPI routes (importorskip fastapi)
+├── _guardrails/                     # Architecture/invariant gates (custom AST + filesystem lint)
+├── _baselines/                      # Regenerable-baseline registry (ADR-0022): derive/store/compare
+├── fixtures/
+│   └── baselines/                   # Committed derived baselines (types_all.json, ungated_surface.json)
 ├── integration/                     # Mocked HTTP responses + VCR cassettes
-│   ├── test_artifacts.py            # ArtifactsAPI integration
+│   ├── test_artifacts_integration.py # ArtifactsAPI integration
 │   ├── test_artifacts_drift.py      # CREATE_ARTIFACT payload drift guard
+│   ├── test_auth_refresh_vcr.py     # Auth refresh token VCR test
 │   ├── test_auto_refresh.py         # Keepalive/refresh integration
-│   ├── test_chat.py                 # ChatAPI integration
-│   ├── test_cli_source_delete.py    # CLI source-delete path
-│   ├── test_core.py                 # ClientCore + RPC plumbing
+│   ├── test_chat_delete_conversation_vcr.py
+│   ├── test_chat_multi_source_vcr.py
+│   ├── test_chat_passage_resolver.py
+│   ├── test_cli_session_local.py
 │   ├── test_download_multi_artifact.py
+│   ├── test_error_paths_vcr.py      # Synthetic and VCR error paths
 │   ├── test_get_summary_drift.py    # GET_NOTEBOOK_SUMMARY drift guard
-│   ├── test_notebooks.py            # NotebooksAPI integration
-│   ├── test_notes.py                # NotesAPI integration
-│   ├── test_research_api.py         # ResearchAPI integration
-│   ├── test_settings.py             # SettingsAPI integration
-│   ├── test_sharing.py              # SharingAPI integration
+│   ├── test_notebooks_integration.py # NotebooksAPI integration
+│   ├── test_notes_integration.py     # NotesAPI integration
+│   ├── test_notes_idempotency.py
+│   ├── test_polling_vcr.py
+│   ├── test_research_deep_poll_vcr.py
+│   ├── test_research_idempotency.py
+│   ├── test_save_chat_as_note_integration.py
+│   ├── test_session_integration.py  # Client init + RPC plumbing
+│   ├── test_settings_integration.py  # SettingsAPI integration
+│   ├── test_settings_vcr.py
+│   ├── test_sharing_integration.py   # SharingAPI integration
+│   ├── test_sharing_vcr.py
 │   ├── test_skill_packaging.py      # Packaging smoke (skills, entry-points)
-│   ├── test_sources.py              # SourcesAPI integration
+│   ├── test_sources_integration.py   # SourcesAPI integration
 │   ├── test_vcr_comprehensive.py    # End-to-end VCR walkthrough
 │   ├── test_vcr_example.py          # VCR pattern reference
 │   ├── test_vcr_real_api.py         # VCR against real-API cassettes
 │   ├── cli_vcr/                     # CLI → Client → RPC VCR tests
+│   ├── mcp_vcr/                     # MCP adapter VCR tier (replays CLI cassettes)
 │   └── concurrency/                 # Cross-process / asyncio races
-└── e2e/                             # Real API calls (requires auth)
+└── e2e/                             # Real API calls (requires auth; incl. test_mcp*.py, test_cli_live.py)
 ```
 
 The `*_drift.py` tests are payload-shape canaries: they decode a recorded
 RPC response (or assemble a synthetic one) and assert the live decoder still
 produces the expected dataclass. They fail loudly when Google changes a
 payload field, so the failure shows up here before users hit it.
+
+### Architecture & invariant gates (`tests/_guardrails/`)
+
+`tests/_guardrails/` holds the project's **custom lint gates** — pytest tests that
+enforce architectural decisions a general-purpose linter can't express. They are
+not style checks; each file encodes one project-specific invariant, usually the
+executable half of an ADR ("enforce, don't document" — un-enforced consistency
+is the failure mode this directory exists to prevent).
+
+**What belongs here vs `tests/unit/`.** This directory is the home for a *pure*
+gate — a file whose whole purpose is enforcing a repo-wide invariant, with no
+module-under-test. A unit test that only *embeds* a boundary assertion among
+behavioral checks stays in `tests/unit/` (see *Boundary Guardrails* above). Pure
+architecture gates — e.g. `test_cli_boundary.py`, `test_cassette_shapes.py`,
+`test_public_surface.py` — have been consolidated into this directory; the gate
+halves of former hybrids live alongside them (e.g.
+`test_public_surface_manifest.py`, `test_no_facade_reach_in.py`).
+
+**How they differ from ruff / mypy.** Ruff and mypy run in the `quality` job and
+enforce *generic* rules (style, unused imports, types) from a fixed catalogue.
+The `tests/_guardrails/` gates are collected by the normal `uv run pytest` run and
+enforce *bespoke* rules by doing their own analysis: most parse the source with
+`ast.parse` (or scan files with regex / `rglob`), and some **import the module and reflect on
+the live object** — something a purely-static linter cannot do.
+
+A representative slice (run `ls tests/_guardrails/` for the full set):
+
+| Gate | Enforces |
+|---|---|
+| `test_no_raw_positional_rpc_indexing.py` | No chained positional indexing (`x[0][9][3]`) of `batchexecute` payloads outside the sanctioned `_row_adapters/` — the project's #1 fragility class |
+| `test_rpc_method_ids_only_in_types.py` | Obfuscated RPC IDs live only in `rpc/types.py` (the source of truth) |
+| `test_no_forbidden_monkeypatches.py` | The forbidden monkeypatch shapes under `tests/` (ADR-0007) |
+| `test_no_inline_deprecation_warnings.py` | No inline `warnings.warn(..., DeprecationWarning)` outside `_deprecation.py` (ADR-0018) |
+| `test_cli_rpc_envelope.py` | Every *RPC-touching* Click leaf command (call graph reaches `NotebookLMClient`) routes its errors into the JSON envelope |
+| `test_module_size_ratchet.py` | No module grows past the size budget (ADR-0008) — a burn-down ratchet |
+| `test_v080_release_gate.py` | The v0.8.0 breaking-change set flips in lockstep at the version bump |
+| `test_adr_reference_format.py` | ADR references are 4-digit and resolve to a real `docs/adr/NNNN-*.md` |
+| `test_cli_boundary.py` | CLI modules import only public `notebooklm` surface — no `notebooklm._*` / `notebooklm.rpc.*` / `_private` reach-in |
+| `test_no_facade_reach_in.py` | Feature APIs and service modules don't reach into Session internals or runtime-import facade APIs |
+| `test_public_surface_manifest.py` | The documented public-import manifest + re-export identity pins for `notebooklm` / `auth` / `types` / shims stay intact |
+
+**Conventions when adding a gate:**
+
+- **One invariant per file**, with a module docstring that states the rule, *why*
+  it matters (cite the ADR), and how a violation is fixed. The assertion message
+  is the contributor's first — and often only — explanation, so make it
+  actionable.
+- **Make the detector a pure function and self-test it** against known good/bad
+  inputs in the same file, so the gate can't silently become vacuous (a regex
+  that matches nothing must fail its own self-test, not pass everything).
+- **Shrink-only allowlists.** A gate that would fail on pre-existing violations
+  may grandfather them in an allowlist — but it must be a *one-way ratchet* that
+  only shrinks (e.g. `test_module_size_ratchet.py`,
+  `tests/scripts/check_method_coverage.py`). The rule lands without a giant
+  cleanup PR, and the gate fails when an allowlisted entry becomes clean so it
+  gets removed. (One recorded exception:
+  [ADR-0033](adr/0033-auth-consolidation-policy.md) sanctioned-merge entries
+  under `src/notebooklm/_auth/`, where a consolidation may add or raise an
+  annotated entry at its measured LOC — see that gate's own docstring.)
+- **Scan yourself too.** A gate that shows the *wrong* form in its examples
+  should use placeholders (or build them at runtime) rather than excluding its
+  own file, so it still polices its own references
+  (`test_adr_reference_format.py`).
+
+Most gates are fast and run in the normal loop; the slow repo-wide cassette scan
+(`test_cassettes_clean.py`) carries the `repo_lint` marker (see
+[Quick Reference](#quick-reference)).
+
+**Trade-off.** Because some gates import internals and reflect on them, they
+couple more tightly to implementation than a static linter — a
+behavior-preserving refactor can still trip one. That coupling is deliberate: it
+catches architecture drift that ruff and mypy structurally cannot see.
+
+### The wire contract (`test_wire_contract.py`)
+
+`batchexecute` responses are positional JSON: index `3` carries no clue what it
+means, so a wrong index is *silent* — it yields a plausible value of the wrong
+thing. Worse, a unit test written from the same misunderstanding will confirm the
+mistake rather than catch it. That has happened here: two constants named
+"failed-artifact error text" and "nested error payload" actually pointed at
+`sources` and `isPubliclyReadable`, and had passing tests built around the
+imaginary shape.
+
+The gate closes that loop using two recovered reference artifacts, both checked
+into `docs/`:
+
+| file | what it pins |
+|---|---|
+| `mobile/schema.proto` | 282 messages / 767 fields with real names and tag numbers |
+| `mobile/enums.txt` | 77 enums / ~1900 values with exact integers |
+
+Both come from the official Android app, which speaks the *same backend messages*
+over gRPC — where fields are tag-addressed rather than positional. The two line up
+exactly: **JSON index `i` == protobuf tag `i + 1`**. That equivalence is what lets
+a positional client be checked against a named schema.
+
+Four checks run:
+
+- **Declared mappings hold** — for each entry in `_wire_contract.MAPPINGS`,
+  `constant == tag - 1`. Known-wrong entries are `xfail` with an issue reference;
+  the fixing PR removes the marker.
+- **Nothing escapes review** — every `_*_POS`-style constant in the scanned
+  modules must appear in `MAPPINGS`, `UNMAPPED`, or `PINNED`. A new positional
+  read cannot land without someone recording what it points at.
+- **Pinned values stay frozen** — entries in `PINNED` read `addUnused()` slots the
+  proto cannot confirm, so the check freezes the value rather than validating it.
+  A change-detector, not a validation.
+- **Enums agree** — client enum members match the recovered backend enum, and
+  declared gaps stay honest.
+
+**Adding a constant.** Three destinations, in descending order of strength:
+
+| destination | when | what the test does |
+|---|---|---|
+| `MAPPINGS` | you can name the protobuf field it reads | asserts `constant == tag - 1` |
+| `PINNED` | the proto has no name for the slot (`addUnused()`), but live evidence establishes the meaning | freezes the value; record the evidence |
+| `UNMAPPED` | you don't know | nothing — but the reason is on the record |
+
+*An honest `UNMAPPED`
+entry is better than a guessed mapping* — a wrong mapping lends false confidence
+to exactly the defect class this gate exists to catch. Several `UNMAPPED` reasons
+carry hard-won warnings (e.g. one index collides with a block that is only safe
+because rows happen to arrive in a particular order); read them before assuming an
+index is fine.
+
+Widening `_SCANNED_DIRS` / `_SCANNED_FILES` in the test is the intended way to
+bring more of the client under the contract — the coverage check will then demand
+a registry entry for each newly-visible constant.
+
+**Caveats.** The proto declares several messages twice (wire vs the app's local
+persistence schema, with *different* tags), so lookups take a section hint and
+refuse ambiguous matches rather than guessing. And the upstream extractor emits
+the literal placeholder `fieldType` where it could not recover a name — those
+fields can only be pinned by tag, with provenance recorded in the mapping's note.
+
+### Updating baselines
+
+Some gates freeze a *snapshot* of a value the code already derives, so a public
+surface change is a deliberate, diff-visible act. These **regenerable baselines**
+(ADR-0022) are registered in `tests/_baselines/registry.py` and committed under
+`tests/fixtures/baselines/` (plus the CLI contract at
+`tests/fixtures/cli_contract_baseline.json`):
+
+| Baseline | Derives from | Committed file |
+|---|---|---|
+| `types_all` | `notebooklm.types.__all__` | `tests/fixtures/baselines/types_all.json` |
+| `ungated_surface` | collected `__all__` of each ungated public module | `tests/fixtures/baselines/ungated_surface.json` |
+| `cli_contract` | `build_cli_contract()` | `tests/fixtures/cli_contract_baseline.json` |
+
+The freeze test `test_baseline_matches_committed_file` (in
+`tests/_guardrails/test_public_surface_manifest.py`) asserts each committed file
+equals `derive()`. When you intentionally change a public surface — e.g. add an
+export to `notebooklm.types.__all__` or a CLI option — that test fails. Regenerate
+the committed files in the **same PR**:
+
+```bash
+python scripts/regen_baselines.py
+git diff tests/fixtures/baselines tests/fixtures/cli_contract_baseline.json
+```
+
+Review the diff — each changed line is the deliberate acknowledgement of the
+surface change. Regen is **dev-only**: it shells `pytest … --update-baselines`,
+which both the wrapper and the `update_baselines` fixture refuse to run when a
+`CI` environment is detected. **CI never regenerates — it only diffs.**
 
 ### VCR Testing (Recorded HTTP)
 
@@ -400,14 +1008,66 @@ The script is a manual maintainer helper — CI never runs it.
 NOTEBOOKLM_VCR_RECORD=1 uv run pytest tests/integration/test_vcr_*.py -v
 ```
 
+> **Recording reads your real `~/.notebooklm` profile.** Normally the suite
+> pins `NOTEBOOKLM_HOME` at a throwaway tmp dir (autouse `_isolate_notebooklm_home`
+> in `tests/conftest.py`) so runs are reproducible and never touch your real
+> profile. Under `NOTEBOOKLM_VCR_RECORD=1`, `@pytest.mark.vcr` tests instead read
+> the real profile — so `get_vcr_auth()` (via `AuthTokens.from_storage()`) and
+> the CLI auth path resolve live credentials to record against. CLI-VCR tests
+> additionally skip their `mock_auth_for_vcr` patch in record mode for the same
+> reason. Replay runs and non-VCR tests stay isolated (a stray
+> `NOTEBOOKLM_VCR_RECORD` on a normal run never un-isolates a non-VCR test). The
+> test must carry the `vcr` marker — most do via a module-level `pytestmark`.
+> Before #1263 this deferral did not exist and cassettes could only be recorded
+> with a standalone script.
+>
+> **Limitation:** a few cli_vcr tests (`settings` / `profile` / `doctor`)
+> re-pin `NOTEBOOKLM_HOME` at their own tmp dir to isolate config/profile
+> writes. They override this deferral and so are not auto-recordable through
+> pytest — re-record those with a standalone script (or, as a future
+> enhancement, inject `NOTEBOOKLM_AUTH_JSON` from the real storage so auth is
+> resolved independently of `NOTEBOOKLM_HOME`).
+
 The scrubbing pipeline (`tests/vcr_config.py`) redacts cookies, CSRF tokens,
 emails, and other sensitive patterns before the cassette hits disk. Verify
 the result with the cassette guard before committing:
 
 ```bash
-# Current guard (a Python replacement is planned)
-tests/check_cassettes_clean.sh
+# Verify recorded cassettes are clean of credentials
+uv run python tests/scripts/check_cassettes_clean.py
 ```
+
+#### Long-running recordings (deep research, multi-minute polling)
+
+Recording a cassette that polls a multi-minute server-side operation — the Deep
+Research lifecycle (`test_research_deep_poll_vcr.py`) is the canonical example —
+hits a few non-obvious snags. Lessons from the v0.8 full-lifecycle re-record
+(PR #1566):
+
+- **`httpx.PoolTimeout` after ~15–20 min of idle polling.** The default
+  `ConnectionLimits(keepalive_expiry=30.0)` keeps an idle pooled connection
+  around long enough to be silently dropped server-side, and the next acquire
+  stalls. In **record mode only**, build the client with a shorter keepalive and
+  a generous read timeout:
+  `NotebookLMClient(auth, timeout=60.0, limits=ConnectionLimits(keepalive_expiry=10.0))`.
+  Note `async_client_factory` is **not** a public constructor kwarg — use the
+  public `timeout=` / `limits=` seams.
+- **`pytest-timeout` kills the run.** The global per-test timeout aborts a
+  ~30-min recording. Mark the recording test `@pytest.mark.timeout(3600)`.
+- **`start()` task_id ≠ the poll-reported task_id.** Deep Research's kickoff id
+  is not the id `POLL_RESEARCH` echoes back, so a filtered
+  `research.poll(task_id=…)` returns `NOT_FOUND` every poll. The record loop must
+  mirror `wait_for_completion`: first poll unfiltered, then pin the
+  *poll-reported* id.
+- **Trim with a byte-exact text slice, not `yaml.safe_dump`.** Long deep-research
+  poll bodies accumulate large markdown, so trim redundant middle `in_progress`
+  polls to stay under the cassette size cap. Re-serializing via `yaml.safe_dump`
+  re-wraps long scalars and breaks Windows YAML parsing (CI catches it) — slice
+  the VCR-native YAML text instead.
+- **Cleanliness is necessary-not-sufficient.** After recording, run the cassette
+  guard (above) *and* manually grep the new file for live cookie/token/email
+  shapes (`SID` / `HSID` / `SAPISIDHASH` / Bearer / the account email) — the
+  name-anchored scrubber can miss credentials in un-allowlisted fields.
 
 #### Synthetic error cassettes
 
@@ -430,10 +1090,13 @@ response. Three modes are supported:
 
 The plumbing has three opt-in layers:
 
-1. **Env var**: `NOTEBOOKLM_VCR_RECORD_ERRORS=<mode>` activates the transport
-   wrapper inside `ClientCore.open()`.
+1. **Env var**: `NOTEBOOKLM_VCR_RECORD_ERRORS=<mode>` activates the
+   `ErrorInjectionMiddleware` in the middleware chain (the env var is
+   consulted when the client opens).
 2. **Pytest marker**: `@pytest.mark.synthetic_error("<mode>")` sets the env
-   var for the duration of a single test (auto-reverted on teardown).
+   var for the duration of a single test (auto-reverted on teardown). Note
+   that the `synthetic_error` marker is registered dynamically in
+   `tests/conftest.py:149` (rather than statically listed in `pyproject.toml`).
 3. **Filename prefix**: cassettes recorded under this mode MUST be named
    `error_synthetic_<mode>_<slug>.yaml` — use
    `tests.cassette_patterns.synthetic_error_cassette_name(mode, slug)` to
@@ -447,7 +1110,7 @@ ships only the plumbing):
 ```bash
 NOTEBOOKLM_VCR_RECORD=1 \
 NOTEBOOKLM_VCR_RECORD_ERRORS=429 \
-  uv run pytest tests/integration/test_error_cassettes.py::test_rate_limit_records
+  uv run pytest tests/integration/test_error_paths_vcr.py
 ```
 
 Production behavior is unchanged when `NOTEBOOKLM_VCR_RECORD_ERRORS` is
@@ -476,14 +1139,12 @@ The gate is a pure-text static check (no pytest, no network) and runs in the
 - at least one cassette whose recorded request/response body contains the
   RPC id.
 
-**Pre-existing gaps.** A small `PREEXISTING_GAPS` set inside the script
-grandfathers methods that lacked coverage when the gate first landed
-(currently: `GET_INTERACTIVE_HTML`, `GET_SUGGESTED_REPORTS`,
-`IMPORT_RESEARCH`, `REFRESH_SOURCE`). The set is a **one-way ratchet** —
-it must not grow. When you backfill coverage for a grandfathered method,
-delete its entry from `PREEXISTING_GAPS` in the same PR. The gate prints a
-`NOTICE:` to stderr when a `PREEXISTING_GAPS` entry has acquired full
-coverage so maintainers see the prompt to remove it.
+**Pre-existing gaps.** A small `PREEXISTING_GAPS` set inside the script can
+grandfather methods that lacked coverage when the gate first landed. It is
+currently empty. The set is a **one-way ratchet** — it must not grow. When
+you backfill coverage for a grandfathered method, delete its entry from
+`PREEXISTING_GAPS` in the same PR. The gate fails when a stale
+`PREEXISTING_GAPS` entry has acquired full coverage so maintainers remove it.
 
 ```bash
 # Run locally before pushing changes that touch RPCMethod
@@ -532,7 +1193,7 @@ Need network?
 
 ### Credential redaction
 
-The package handler installed by `configure_logging()` has a `RedactingFilter` attached. It runs for every record reaching the handler, including records originating in child loggers (`notebooklm._core`, `notebooklm._chat`, etc.) via Python logging's default propagation. The filter scrubs:
+The package handler installed by `configure_logging()` has a `RedactingFilter` attached. It runs for every record reaching the handler, including records originating in child loggers (`notebooklm._rpc_executor`, `notebooklm._transport_errors`, `notebooklm._chat`, etc.) via Python logging's default propagation. The filter scrubs:
 
 - CSRF tokens (`at=...`)
 - Session IDs (`f.sid=...`)
@@ -542,7 +1203,7 @@ The package handler installed by `configure_logging()` has a `RedactingFilter` a
 
 The filter pre-renders `record.exc_info` traceback into a scrubbed `record.exc_text` while preserving `record.exc_info` itself. The live exception object is not mutated.
 
-To add a new secret pattern: edit `_REDACT_PATTERNS` in `src/notebooklm/_logging.py` and add a unit test in `tests/unit/test__logging.py` before merging.
+To add a new secret pattern: edit `_REDACT_PATTERNS` in `src/notebooklm/_logging.py` and add a unit test in `tests/unit/test_logging.py` before merging.
 
 ### Attaching your own handler
 
@@ -565,23 +1226,29 @@ Use `%`-style log calls, not f-strings:
 
 ```python
 logger.warning("Failed for %s in %.2fs", name, elapsed)  # OK
-logger.warning(f"Failed for {name} in {elapsed:.2f}s")    # BAD
+logger.warning(f"Failed for {name} in {elapsed:.2f}s")  # BAD
 ```
 
 f-string eager evaluation defeats lazy formatting and (although the filter would still scrub via `record.getMessage()`) makes profile-time cost unconditional.
 
 ### Third-party loggers
 
-`httpx`, `urllib3`, and `asyncio` can emit at DEBUG with full URLs and headers containing notebooklm-py credentials. The CLI calls `install_redaction` automatically when `-vv` is set:
+`httpx`, `urllib3`, and `asyncio` can emit at DEBUG with full URLs and headers containing notebooklm-py credentials.
+
+For `httpx` and `urllib3`, `configure_logging()` (run automatically at package import) attaches a *logger-level* `RedactingFilter` to each. That filter runs before records propagate to ancestor loggers, so a library consumer who enables those loggers via `logging.basicConfig(level=logging.DEBUG)` gets credential-scrubbed request URLs and headers with no extra setup — and without notebooklm-py adding any handler of its own to those loggers.
+
+If you also want those loggers to *emit* through notebooklm-py's default handler (the CLI does this when `-vv` is set), call `install_redaction`, which adds both the filter and a default StreamHandler:
 
 ```python
-from notebooklm._logging import install_redaction
+from notebooklm.log import install_redaction
+
 install_redaction("httpx", "urllib3")
 ```
 
-Library consumers must do the same if they enable DEBUG on these loggers. If a third-party library sets `propagate=False` on its internal loggers (rare), pass child names explicitly:
+To cover additional third-party loggers (e.g. `asyncio`) or libraries that set `propagate=False` on internal loggers (rare), pass the names explicitly:
 
 ```python
+install_redaction("asyncio")
 install_redaction("httpx._client", "urllib3.connectionpool")
 ```
 
@@ -591,7 +1258,7 @@ The `RedactingFilter` preserves `record.exc_info` (the live exception object) so
 
 - Standard `logging.Formatter` uses `record.exc_text` (scrubbed by our filter) and does NOT re-render from `exc_info`. Safe.
 - Custom formatters that ignore `exc_text` and read `exc_info` directly may render an unredacted traceback. **Mitigation**: wrap such handlers with `apply_redaction()` so the formatter is decorated and post-scrubs the final output regardless of which exception attribute it reads.
-- Records propagate to root by default (`notebooklm.propagate = True`) so `caplog` and `basicConfig` work without changes. Our filter mutates the record before propagation, so downstream handlers (including root's) see the scrubbed version. **Caveat**: if a user attaches an unredacted handler directly to a child logger (`notebooklm._core`), that handler fires *before* propagation reaches our parent handler. Mitigation: `apply_redaction(child_handler)`.
+- Records propagate to root by default (`notebooklm.propagate = True`) so `caplog` and `basicConfig` work without changes. Our filter mutates the record before propagation, so downstream handlers (including root's) see the scrubbed version. **Caveat**: if a user attaches an unredacted handler directly to a child logger (`notebooklm._rpc_executor`), that handler fires *before* propagation reaches our parent handler. Mitigation: `apply_redaction(child_handler)`.
 - Applications that want notebooklm logs *isolated* from root can set `logging.getLogger('notebooklm').propagate = False` themselves.
 
 ---
@@ -603,24 +1270,54 @@ The `RedactingFilter` preserves `record.exc_info` (the live exception object) so
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `test.yml` | Push/PR | Unit tests, linting, type checking |
-| `nightly.yml` | Daily 6 AM UTC | E2E tests with real API |
-| `rpc-health.yml` | Daily 7 AM UTC | RPC method ID monitoring (see [stability.md](stability.md#automated-rpc-health-check)) |
+| `nightly.yml` | Daily 6 AM UTC (`main`), manual dispatch for `release/*` | E2E tests with real API |
+| `rpc-health.yml` | Daily 7 AM UTC (`main`), manual dispatch for `release/*` | RPC method ID monitoring (see [stability.md](stability.md#automated-rpc-health-check)) |
 | `testpypi-publish.yml` | Manual dispatch | Publish to TestPyPI |
 | `verify-package.yml` | Manual dispatch | Verify TestPyPI or PyPI install + E2E |
 | `publish.yml` | Tag push | Publish to PyPI |
 
 ### Setting Up Nightly E2E Tests
 
-1. Get storage state: `cat ~/.notebooklm/storage_state.json`
+1. Bootstrap a master token once: `notebooklm login --master-token --account <you@gmail.com>`
+   (needs the `[headless]` extra; see
+   [installation.md → master-token auth](installation.md#alternative-master-token-auth-no-cookie-file-to-ship-survives-expiry)).
 2. Add GitHub secrets:
-   - `NOTEBOOKLM_AUTH_JSON`: Storage state JSON
+   - `NOTEBOOKLM_MASTER_TOKEN_JSON` (**required**): contents of
+     `~/.notebooklm/profiles/default/master_token.json`. The workflows exit `1`
+     when it is empty — it is the only credential they ship.
    - `NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID`: Your test notebook ID
+
+   `NOTEBOOKLM_AUTH_JSON` is **no longer used by any workflow**. Any other
+   active client supersedes a cookie snapshot within ~10 minutes (the ~600 s
+   rotation cadence), and a *superseded* value has been observed failing
+   within roughly half an hour — so a snapshot exported on a workstation was
+   routinely dead before a scheduled run started (see
+   [auth-cookie-lifecycle.md §2.5](auth-cookie-lifecycle.md#25-four-timers-people-confuse)).
+
+The live-E2E workflows (`verify-package.yml`, `nightly.yml`, `rpc-health.yml`,
+`verify-artifacts.yml`) ship no inline credential at all. Their "Materialize
+auth profile" step writes `master_token.json` to a real on-disk profile (mode
+`0600`) because the layer-4 re-mint only engages when the token sits beside the
+profile's `storage_state.json` — env-var auth bypasses it entirely. The step
+then runs `notebooklm login --master-token-refresh`, which **bootstraps**
+`storage_state.json` from the token, preserving a deterministic fresh-jar CI
+setup;
+ordinary file-backed cold loading now also reaches layer 4 after a confirmed
+login redirect, and layer 4 continues to cover mid-run expiry. So as long as
+the pre-mint succeeds, a cookie secret that Google has rotated no longer fails
+the run. The pre-mint is non-fatal: on failure (e.g. a revoked master
+token) the step logs a `::warning::` and falls back to the cookie snapshot,
+which then must still be live for the run to pass. Without the master-token
+secret, behavior degrades to the old cookie-only mode.
+
+Scheduled canaries target `main` only. Release canaries are manual: dispatch
+`nightly.yml` or `rpc-health.yml` with `custom_branch=release/vX.Y.Z`.
 
 ### Maintaining Secrets
 
 | Task | Frequency |
 |------|-----------|
-| Refresh credentials | Every 1-2 weeks |
+| Refresh credentials | Every 1-2 weeks (cookie-only); rarely needed once `NOTEBOOKLM_MASTER_TOKEN_JSON` is set — the master token survives cookie rotation until revoked |
 | Check nightly results | Daily |
 
 ### Workflow secret gates
@@ -632,14 +1329,37 @@ credentials by dispatching a workflow on a feature branch:
 
 | Gate | Where | Mechanism |
 |------|-------|-----------|
-| `environment: protected-readonly` | Job-level | GitHub Environment with a required reviewer — secrets do not resolve until the maintainer approves the run. Use `${{ github.event_name == 'workflow_dispatch' && 'protected-readonly' \|\| '' }}` to require approval only on manual dispatch while leaving scheduled cron canaries unattended. |
-| `needs.<job>.outputs.is_standard == 'true'` | Step-level `if:` | Pin secret-using steps to standard branches (`main` / `develop` / scheduled cron). Non-standard branches skip the step outright — no secret values land in the runner env. |
+| `environment: protected-readonly` | Job-level | GitHub Environment hosting the canonical secret values. Bind it **unconditionally** (`environment: protected-readonly`) so every trigger — scheduled `cron` and `workflow_dispatch` alike — sees the same secret. **Note:** the earlier conditional form (`${{ github.event_name == 'workflow_dispatch' && 'protected-readonly' \|\| '' }}`) silently broke scheduled crons once the secrets stopped existing at repo level (issue #1009); the same env binding is now the single source of truth. If you want to block `workflow_dispatch` behind manual approval, add a **required reviewers** rule on the environment — but be aware scheduled runs will then queue at the same gate. |
+| `needs.<job>.outputs.is_standard == 'true'` | Job/step-level `if:` | Pin secret-using jobs or steps to standard branches (`main` / `release/*` / scheduled cron). Non-standard branches skip outright — no secret values land in the runner env. |
 | `github.event.sender.login == 'teng-lin'` | Job-level `if:` | Pin webhook-triggered workflows (e.g. `claude.yml`) to a specific maintainer actor. Any other actor's trigger never reaches the secret-bearing steps. |
 
 `scripts/check_workflow_secret_gates.py` (wired into the `test.yml` quality job)
 asserts every workflow file in `.github/workflows/` satisfies at least one of
 the above gates for every `secrets.*` reference (except `secrets.GITHUB_TOKEN`,
 which is covered separately by `scripts/check_workflow_permissions.py`).
+
+The checker also **rejects the conditional `environment:` shape** outright:
+
+```yaml
+# REJECTED (silently broke #1009 once the secret was migrated env-only)
+environment: ${{ github.event_name == 'workflow_dispatch' && 'protected-readonly' || '' }}
+
+# REQUIRED — unconditional binding
+environment: protected-readonly
+```
+
+The empty-string fallback in the expression form means "no environment", so
+secrets that live only in environments resolve to empty under that branch.
+Binding the environment unconditionally is the single source of truth.
+
+Additionally, **every job that consumes `NOTEBOOKLM_AUTH_JSON` runs a
+fail-fast preflight** (`if [ -z "$NOTEBOOKLM_AUTH_JSON" ]; then exit 1`)
+before the test/script step — in the live-E2E workflows this lives at the top
+of the "Materialize auth profile" step. Without the preflight, an empty secret
+would let pytest skip every auth-requiring test silently and the job would land
+green with 0 tests run (issue #1009). The preflight surfaces an `::error::`
+annotation linked to the secret-config misconfig so the failure is visible
+in the GitHub UI rather than hidden behind "0 passed".
 
 #### One-time GitHub Environment setup
 
@@ -699,8 +1419,10 @@ When introducing a workflow that touches `secrets.*`:
 
 1. Pick the gate shape that matches the trigger surface:
    - `workflow_dispatch` only → job-level `environment: protected-readonly`.
-   - `workflow_dispatch` + `schedule` → conditional environment expression
-     (approve manual runs, leave cron unattended).
+   - `workflow_dispatch` + `schedule` → also job-level `environment: protected-readonly`
+     (unconditional — issue #1009). Pair with an upstream `is_standard`
+     gate so a non-maintainer's feature-branch dispatch can't reach the
+     secret-bearing job at all.
    - Webhook-triggered (`issue_comment`, etc.) → job-level `if:` pinning
      `sender.login` to the maintainer.
    - Multi-branch CI (`push`, `pull_request`, nightly) → step-level `if:`
@@ -754,17 +1476,26 @@ When introducing a workflow that touches `secrets.*`:
 **Why:** The `login` command saves to a file, which conflicts with environment-based auth.
 
 **Solution:**
-- Don't run `login` in CI/CD - use the env var for auth instead
-- If you need to refresh auth, do it locally and update the secret
+- With inline env-var auth, don't run browser `login` in CI/CD — use the env var for auth instead, and refresh it locally when needed
+- With a materialized file-based profile, prefer `notebooklm auth refresh`. This repo's live-E2E workflows intentionally use the legacy `login --master-token-refresh` route because they require an unconditional fresh jar before each run
 
 #### Session expired in CI/CD
 
 **Cause:** Google sessions expire periodically (typically every 1-2 weeks).
 
-**Solution:**
+**Solution (cookie-only auth):**
 1. Re-run `notebooklm login` locally
-2. Copy the contents of `~/.notebooklm/storage_state.json`
+2. Copy the contents of `~/.notebooklm/profiles/default/storage_state.json`
 3. Update your GitHub secret
+
+**Solution (file-based profile with `NOTEBOOKLM_MASTER_TOKEN_JSON`):** usually none
+needed — the materialize step pre-mints fresh cookies from the master token each run,
+and the client's layer-4 re-mint covers mid-run expiry. If the run still fails on auth,
+check the materialize step's log: a `::warning::` about a failed re-mint means the run
+fell back to the (possibly expired) cookie snapshot — it does not by itself identify
+the cause. Inspect the login error above the warning: a transient network/gpsoauth
+blip just needs a re-run, while an invalid or revoked master token requires re-running
+the `notebooklm login --master-token` bootstrap and updating both secrets.
 
 #### Multiple accounts in CI/CD
 

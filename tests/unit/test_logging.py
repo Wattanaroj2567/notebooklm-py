@@ -119,6 +119,16 @@ _GOOGLE_COOKIE_PAIRS = [
     ("__Secure-3PSID", "psid_qrs"),
     ("__Secure-1PSIDCC", "psidcc_xyz"),
     ("__Secure-3PSIDCC", "psidcc_qrs"),
+    # PSIDTS — rotating token-state cookies. Pre-fix these only redacted when
+    # they appeared inside a ``Cookie:`` / ``Set-Cookie:`` header value; a
+    # standalone ``__Secure-1PSIDTS=<value>`` token (as appears in refresh-cmd
+    # stdout/stderr captured at DEBUG) passed through unredacted.
+    ("__Secure-1PSIDTS", "psidts_xyz"),
+    ("__Secure-3PSIDTS", "psidts_qrs"),
+    # PAPISID — auth-API session cookies. Without an explicit alternative the
+    # captured ``\1`` group would resolve to the ``APISID`` suffix only.
+    ("__Secure-1PAPISID", "papisid_xyz"),
+    ("__Secure-3PAPISID", "papisid_qrs"),
     ("SIDCC", "sidcc_val"),
     ("HSID", "hsid_val"),
     ("SSID", "ssid_val"),
@@ -137,12 +147,230 @@ def test_formatter_scrubs_google_session_cookies():
         assert secret not in out
 
 
+#: Session / host cookies that #1517 added to the runtime redaction set. Each
+#: previously round-tripped VERBATIM through ``scrub_secrets`` because the
+#: cookie-name alternation omitted them (``NID`` / ``LSOLH`` are not substrings
+#: of any prior alternative; ``__Host-GAPS`` had no umbrella). The real leak
+#: sink is ``_auth.refresh._run_refresh_cmd`` logging refresh-cmd stdout/stderr
+#: at DEBUG through the redacting logger.
+_ISSUE_1517_COOKIE_PAIRS = [
+    ("NID", "g.a000-nidsecrettokenvalue123"),
+    ("LSOLH", "g.a000-lsolhsecrettokenvalue"),
+    ("__Host-GAPS", "gapssecretcookievalue456"),
+]
+
+
+@pytest.mark.parametrize(("cookie_name", "secret"), _ISSUE_1517_COOKIE_PAIRS)
+def test_formatter_scrubs_issue_1517_session_cookies(cookie_name, secret):
+    """Bare ``NID`` / ``LSOLH`` / ``__Host-GAPS`` tokens are redacted (#1517).
+
+    Red-first: before the runtime registry, the cookie-name alternation omitted
+    these three names, so a refresh-cmd stdout line like ``NID=g.a000-...`` (the
+    DEBUG sink in ``_auth.refresh``) passed through ``scrub_secrets`` verbatim.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record(f"refresh stdout: {cookie_name}={secret}")
+    out = fmt.format(rec)
+    assert secret not in out, f"{cookie_name} value leaked: {out!r}"
+    assert f"{cookie_name}=***" in out, f"missing {cookie_name}=***: {out!r}"
+
+
+#: ``(carrier-name, token, residual-prefix)`` triples. The carrier name is NOT
+#: on the cookie alternation, so only the field-agnostic auth-token-shape
+#: catch-all can redact these — defense in depth so disclosure fails closed
+#: regardless of which field carries the value (#1517).
+_AUTH_TOKEN_SHAPE_CASES = [
+    ("X_UNKNOWN", "g.a000-leakytokenunderunknownfield", "g.a000-"),
+    ("X_UNKNOWN", "sidts-1234567890abcdefghij", "sidts-"),
+    ("X_UNKNOWN", "ya29.aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789", "ya29."),
+    # Google API key (``AIza`` + 35-char tail). Red-first: the key shape was
+    # absent from the runtime catch-alls, so ``JrWMbf``-carried keys routed
+    # through data_at_failure / payload_preview leaked (codex review of #1517).
+    ("X_UNKNOWN", "AIza" + "A" * 35, "AIza"),
+]
+
+
+@pytest.mark.parametrize(("carrier", "token", "prefix"), _AUTH_TOKEN_SHAPE_CASES)
+def test_formatter_scrubs_auth_token_shape_under_unknown_carrier(carrier, token, prefix):
+    """A token-shaped value under an UNKNOWN carrier name is still redacted.
+
+    Red-first: the cookie-name alternation only fires on known cookie names, so
+    ``X_UNKNOWN=g.a000-...`` would leak without the carrier-agnostic token-shape
+    catch-all ported from the cassette registry's ``_AUTH_TOKEN_PATTERNS``.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record(f"payload: {carrier}={token}")
+    out = fmt.format(rec)
+    assert token not in out, f"token leaked under unknown carrier: {out!r}"
+    assert prefix not in out, f"token prefix survived: {out!r}"
+    assert "***" in out
+
+
+def test_formatter_still_scrubs_osid_cookie():
+    """OSID stays redacted — it is caught by the ``SID`` alternative (#1517 regression guard).
+
+    The #1517 fix must not regress the cookies already covered; ``OSID`` was
+    incidentally caught by the ``SID`` alternation before the registry refactor
+    and must remain caught after it.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record("cookie jar: OSID=osidsecretvalue789")
+    out = fmt.format(rec)
+    assert "osidsecretvalue789" not in out
+    assert "OSID=***" in out
+
+
+#: ``(cookie-name, opaque-value)`` for ``__Secure-*`` / ``__Host-*`` cookies
+#: NOT enumerated in any name list — including a hypothetical future name with
+#: an OPAQUE (non-token-shaped) value, which only the prefix umbrella can catch.
+_UMBRELLA_COOKIE_CASES = [
+    ("__Secure-NEWSESSION", "opaqueBase64ValueNoTokenShape123"),
+    ("__Host-NEWTHING", "anotherOpaqueValue456nottoken"),
+    # Enumerated names still covered by the umbrella (they were dropped from the
+    # bare name list once the umbrella became the mechanism).
+    ("__Secure-OSID", "opaqueSecureOsidValue789"),
+    ("__Host-GAPS", "opaqueGapsValueabc"),
+    # RFC 6265 ``token``-charset names containing ``.`` / ``+`` / ``_`` and the
+    # rarer token punctuation (``! # $ % & ' * ^ ` | ~``). A name class narrower
+    # than "any run up to ``=``" (e.g. ``[A-Za-z0-9_-]+``) leaks these because
+    # the first non-class char (``.`` / ``+`` / ``'``) breaks the match early —
+    # codex re-review of #1517.
+    ("__Secure-NEW.SESSION", "opaqueDottedNameValue1"),
+    ("__Host-GAPS.v2", "opaqueDottedHostValue2"),
+    ("__Secure-A+B", "opaquePlusNameValue3"),
+    ("__Secure-x.y_z", "opaqueMixedNameValue4"),
+    ("__Host-a!#$%&'*+.^_`|~b", "opaqueFullTokenCharValue5"),
+]
+
+
+@pytest.mark.parametrize(("cookie_name", "opaque"), _UMBRELLA_COOKIE_CASES)
+def test_formatter_scrubs_secure_host_umbrella_cookies(cookie_name, opaque):
+    """ANY ``__Secure-*`` / ``__Host-*`` cookie value is redacted by prefix.
+
+    Red-first: with the secure/host names dropped from the enumerated list (the
+    umbrella is the mechanism), a name-list-only guard would leak a future
+    ``__Secure-NEWSESSION=opaqueBase64`` carrying an opaque, non-token-shaped
+    value (codex review of #1517). A too-narrow NAME charset additionally leaks
+    RFC 6265 ``token``-set names like ``__Secure-NEW.SESSION`` (codex re-review).
+    The umbrella's "any run up to ``=``" name class fails closed by construction.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record(f"refresh stdout: {cookie_name}={opaque}; Path=/")
+    out = fmt.format(rec)
+    assert opaque not in out, f"{cookie_name} opaque value leaked: {out!r}"
+    assert f"{cookie_name}=***" in out, f"missing {cookie_name}=***: {out!r}"
+    # The trailing cookie attribute is preserved (umbrella stops at ``;``).
+    assert "Path=/" in out
+
+
+#: ``(cookie-name, value)`` whose value the log line wraps in RFC 6265 double
+#: quotes (``cookie-value = … / DQUOTE *cookie-octet DQUOTE``). Covers a bare
+#: session cookie, both umbrellas, and a quoted TOKEN (caught two ways). Each
+#: leaked before the value classes gained an optional surrounding quote: the
+#: leading ``"`` was excluded by the value class so the whole name-anchored
+#: pattern failed to match and the value round-tripped verbatim.
+_QUOTED_VALUE_CASES = [
+    ("SID", "opaqueQuotedSessionValue1"),
+    ("__Secure-NEWSESSION", "opaqueQuotedSecureValue2"),
+    ("__Host-GAPS", "opaqueQuotedHostValue3"),
+    ("NID", "g.a000-quotedtokenvalue"),
+]
+
+
+@pytest.mark.parametrize(("cookie_name", "value"), _QUOTED_VALUE_CASES)
+def test_formatter_scrubs_double_quoted_cookie_values(cookie_name, value):
+    """An RFC 6265 double-quoted cookie value is redacted (gemini review of #1530).
+
+    Red-first: the value class excluded ``"``, so a quoted value's leading quote
+    made the name-anchored cookie / umbrella pattern fail to match entirely and
+    the (opaque, non-token-shaped) value LEAKED. The shared quote-aware suffix
+    now redacts the inner value while preserving the surrounding quotes.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record(f'refresh stdout: {cookie_name}="{value}"; Path=/')
+    out = fmt.format(rec)
+    assert value not in out, f"{cookie_name} quoted value leaked: {out!r}"
+    # Quotes preserved, value collapsed to ``***``.
+    assert f'{cookie_name}="***"' in out, f'missing {cookie_name}="***": {out!r}'
+    assert "Path=/" in out
+
+
+def test_formatter_double_quote_in_prose_not_swallowed():
+    """A double-quote in surrounding prose is not over-redacted (gemini #1530).
+
+    The optional outer quotes must not let the cookie pattern reach across
+    unrelated quoted prose; only the cookie value collapses to ``***``.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record('note "see the docs" then SID=plainvalue and more text')
+    out = fmt.format(rec)
+    assert "see the docs" in out, f"prose quote swallowed: {out!r}"
+    assert "plainvalue" not in out
+    assert "SID=***" in out
+
+
+#: ``(rendered-fragment, secret, expected-substring)`` for the query / form /
+#: header value patterns when the value is RFC 6265 / JSON double-quoted. These
+#: share the cookie patterns' root cause: the value class excluded ``"``, so a
+#: quoted value made the whole ``name=`` pattern miss and the value LEAKED
+#: (gemini review of #1530). Extended for consistency across ALL value-bearing
+#: name-anchored patterns, not just cookies.
+_QUOTED_QUERY_CASES = [
+    ('body at="SECRET_AT_TOKEN"', "SECRET_AT_TOKEN", 'at="***"'),
+    ('csrf="SECRET_CSRF_TOKEN"', "SECRET_CSRF_TOKEN", 'csrf="***"'),
+    ('f.sid="SECRET_FSID_VAL"', "SECRET_FSID_VAL", 'f.sid="***"'),
+    ('upload_id="SECRET_UPLOAD"', "SECRET_UPLOAD", 'upload_id="***"'),
+    ('refresh_token="SECRET_RT_VAL"', "SECRET_RT_VAL", 'refresh_token="***"'),
+    ('Authorization: Bearer "SECRET_BEARER_TOK"', "SECRET_BEARER_TOK", 'Bearer "***"'),
+]
+
+
+@pytest.mark.parametrize(("fragment", "secret", "expected"), _QUOTED_QUERY_CASES)
+def test_formatter_scrubs_double_quoted_query_and_header_values(fragment, secret, expected):
+    """Double-quoted query / form / header values are redacted (gemini #1530).
+
+    Red-first: the value classes excluded ``"``, so a JSON/prose fragment like
+    ``f.sid="opaque"`` or ``Bearer "token"`` round-tripped verbatim. The shared
+    optional-quote suffix now redacts the inner value, preserving the quotes.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record(fragment)
+    out = fmt.format(rec)
+    assert secret not in out, f"quoted value leaked: {out!r}"
+    assert expected in out, f"missing {expected!r}: {out!r}"
+
+
+def test_formatter_scrubs_google_api_key():
+    """A Google API key (``AIza…``) is redacted wherever it appears (codex #1517).
+
+    Red-first: the API-key shape was missing from the runtime catch-alls, so a
+    ``WIZ_global_data`` key (``JrWMbf`` / ``B8SWKb`` / ``VqImj``) surfaced in a
+    log line or — via the now-scrubbed ``data_at_failure`` — an exception leaked
+    the key verbatim. Mirrors the cassette registry's ``AIza`` + 35-char shape.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    key = "AIza" + "Z" * 35
+    rec = _record(f'WIZ field {{"JrWMbf":"{key}"}}')
+    out = fmt.format(rec)
+    assert key not in out, f"API key leaked: {out!r}"
+    assert "AIza" not in out
+    assert "***" in out
+
+
 def test_formatter_scrubs_fsid_query_param():
     fmt = RedactingFormatter(logging.Formatter("%(message)s"))
     rec = _record("requesting f.sid=tok-xyz-123")
     out = fmt.format(rec)
     assert "tok-xyz-123" not in out
     assert "f.sid=***" in out
+
+
+def test_formatter_scrubs_upload_id_query_param():
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record("uploading to https://notebooklm.google.com/upload/_/?upload_id=SECRET_UPLOAD_ID")
+    out = fmt.format(rec)
+    assert "SECRET_UPLOAD_ID" not in out
+    assert "upload_id=***" in out
 
 
 def test_formatter_preserves_non_secret_text():
@@ -184,6 +412,254 @@ def test_formatter_scrubs_set_cookie_response_header():
     out = fmt.format(rec)
     assert "server_minted_value" not in out
     assert "Set-Cookie: ***" in out
+
+
+def test_formatter_scrubs_bare_csrf_and_session_markers():
+    """Bare ``SNlM0e`` / ``FdrFJe`` markers must be redacted in every shape
+    they appear in — JSON (``"SNlM0e":"AF1_QpN-..."``), query/form
+    (``FdrFJe=...``), HTML-escaped (``&quot;...&quot;``), and diagnostic prose
+    (``SNlM0e value is AF1_QpN-...``).
+
+    Pre-fix the redactor only matched the canonical wire shapes (``at=``,
+    ``f.sid=``, cookies); a third-party logger or exception text emitting a
+    bare ``SNlM0e``/``FdrFJe`` value — or the ``csrf=`` alias — leaked a
+    credential-equivalent token (the CSRF token authorizes all RPC mutations).
+    See issue #1165.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    cases = [
+        # marker, full input, secret value that must NOT survive
+        ("SNlM0e", "SNlM0e value is AF1_QpN-PROSE_SECRET reported", "AF1_QpN-PROSE_SECRET"),
+        ("FdrFJe", "session FdrFJe=1234567890123456 in url", "1234567890123456"),
+        ("csrf", "form body csrf=AF1_QpN-CSRF_ALIAS&hl=en", "AF1_QpN-CSRF_ALIAS"),
+        ("SNlM0e", 'wiz data {"SNlM0e":"AF1_QpN-JSON_SECRET"}', "AF1_QpN-JSON_SECRET"),
+        ("SNlM0e", "single {'SNlM0e':'AF1_QpN-SQ_SECRET'}", "AF1_QpN-SQ_SECRET"),
+        (
+            "FdrFJe",
+            "escaped {&quot;FdrFJe&quot;:&quot;9988776655&quot;}",
+            "9988776655",
+        ),
+    ]
+    for marker, text, secret in cases:
+        rec = _record(text)
+        out = fmt.format(rec)
+        assert secret not in out, f"{secret!r} leaked from {text!r}: got {out!r}"
+        # The marker name itself is preserved (only the value is redacted).
+        assert marker in out, f"marker {marker!r} stripped from {text!r}: got {out!r}"
+        assert "***" in out, f"no redaction placeholder in {out!r}"
+
+    # Surrounding punctuation / quotes / brackets must be preserved exactly —
+    # only the value is replaced. (gemini-code-assist: guard against the
+    # unquoted value class swallowing trailing sentence punctuation or the
+    # enclosing parens / JSON quotes.)
+    exact = [
+        ("SNlM0e value is AF1_QpN-PROSE_SECRET.", "SNlM0e value is ***."),
+        ("(FdrFJe=1234567890123456)", "(FdrFJe=***)"),
+        ('{"SNlM0e":"AF1_QpN-JSON_SECRET"}', '{"SNlM0e":"***"}'),
+        ("{'SNlM0e':'AF1_QpN-SQ_SECRET'}", "{'SNlM0e':'***'}"),
+        (
+            "{&quot;FdrFJe&quot;:&quot;9988776655&quot;}",
+            "{&quot;FdrFJe&quot;:&quot;***&quot;}",
+        ),
+    ]
+    for text, expected in exact:
+        rec = _record(text)
+        assert fmt.format(rec) == expected, f"unexpected redaction of {text!r}"
+
+
+def test_csrf_marker_regex_capture_groups():
+    """Directly pin the compiled marker patterns' capture groups so a future
+    edit can't silently shift what gets captured (and therefore reproduced
+    verbatim) vs. redacted. A string-shape assertion alone can't distinguish
+    "captured the right span" from "coincidental prefix preservation."
+    (gemini-code-assist suggestion.)
+    """
+    from notebooklm._logging import (
+        _CSRF_MARKER_HTML_ESCAPED,
+        _CSRF_MARKER_QUOTED,
+        _CSRF_MARKER_UNQUOTED,
+    )
+
+    m = _CSRF_MARKER_QUOTED.search('{"SNlM0e":"AF1_QpN-JSON_SECRET"}')
+    assert m is not None
+    assert m.group(1) == "SNlM0e"
+    assert m.group(2) == '":'  # key-closing quote through the colon
+    assert m.group(3) == '"'  # value quote, back-referenced as the closer
+    assert "AF1_QpN-JSON_SECRET" in m.group(0)
+
+    m = _CSRF_MARKER_UNQUOTED.search("FdrFJe value is AF1_QpN-PROSE_SECRET.")
+    assert m is not None
+    assert m.group(1) == "FdrFJe"
+    assert m.group(2) == " value is "
+    # The trailing period is NOT part of the match (value class excludes it).
+    assert m.group(0).endswith("AF1_QpN-PROSE_SECRET")
+
+    m = _CSRF_MARKER_HTML_ESCAPED.search("{&quot;SNlM0e&quot;:&quot;sekret&quot;}")
+    assert m is not None
+    assert m.group(1) == "SNlM0e"
+    assert m.group(2) == "&quot;:"
+    assert m.group(3) == "&quot;"
+
+
+def test_formatter_scrubs_bare_af1_qpn_csrf_token():
+    """A standalone Google CSRF token (``AF1_QpN-...`` family) is redacted even
+    with no surrounding marker — the prefix is the credential's stable shape.
+
+    The ``AF1_QpN-`` prefix is preserved as a diagnostic shape hint; the secret
+    suffix is dropped. Regression for issue #1165 (defense-in-depth)."""
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record("rejected token AF1_QpN-LOOSE_SECRET_SUFFIX seen on the wire")
+    out = fmt.format(rec)
+    assert "LOOSE_SECRET_SUFFIX" not in out
+    assert "AF1_QpN-***" in out
+
+
+def test_formatter_marker_redaction_preserves_benign_at_suffix_fields():
+    """The CSRF/session markers must not over-redact benign fields.
+
+    ``csrf_protected``/``nb_sid`` contain fast-path token substrings (``csrf``,
+    ``sid``) so the gate opens and the regex sweep genuinely runs — proving the
+    anchored markers don't redact fields that merely *contain* a token
+    substring (and that the cookie / ``csrf=`` patterns don't fire on a
+    ``csrf_protected=`` prefix). Guards against an overbroad #1165 fix.
+    (coderabbitai: the original input had no fast-path token and so was
+    short-circuited before any pattern ran.)"""
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    rec = _record(
+        "metrics rate=10 coordinate=5 valid=true latency_ms=420 csrf_protected=yes nb_sid=keepme"
+    )
+    out = fmt.format(rec)
+    for keep in (
+        "rate=10",
+        "coordinate=5",
+        "valid=true",
+        "latency_ms=420",
+        "csrf_protected=yes",
+        "nb_sid=keepme",
+    ):
+        assert keep in out, f"benign field {keep!r} over-redacted: {out!r}"
+
+
+def test_formatter_scrubs_psidts_in_non_header_shapes():
+    """Standalone ``__Secure-[13]PSIDTS=<value>`` tokens must be redacted in
+    every HTTP-shaped form they appear in (refresh-cmd stdout/stderr,
+    comma-separated cookie listings) — not just inside a ``Cookie:`` header.
+
+    Pre-fix, the cookie-name alternation listed ``__Secure-[13]PSID`` and
+    ``__Secure-[13]PSIDCC`` but NOT the ``PSIDTS`` (token-state) family. A
+    ``RuntimeError`` traceback containing ``__Secure-1PSIDTS=abc123`` from a
+    refresh subprocess therefore leaked the value verbatim through any error
+    surface that wasn't fronted by the ``Cookie:`` / ``Set-Cookie:`` regex.
+
+    Scope note: JSON-shaped ``"name":"__Secure-1PSIDTS","value":"..."`` is
+    NOT covered by this runtime redactor — that storage-state shape lives in
+    the VCR cassette sanitizer (see ``tests/vcr_config.py`` and
+    ``tests/unit/test_cookie_redaction.py``).
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+
+    cases = [
+        # Refresh-cmd stdout/stderr shape: plain ``name=value`` standalone token.
+        "rotation: __Secure-1PSIDTS=SECRET_PSIDTS_VALUE_A refreshed",
+        # Comma-separated listing.
+        "cookies: __Secure-1PSIDTS=SECRET_PSIDTS_VALUE_B, __Secure-3PSIDTS=SECRET_PSIDTS_VALUE_C",
+    ]
+    for text in cases:
+        rec = _record(text)
+        out = fmt.format(rec)
+        for secret in (
+            "SECRET_PSIDTS_VALUE_A",
+            "SECRET_PSIDTS_VALUE_B",
+            "SECRET_PSIDTS_VALUE_C",
+        ):
+            assert secret not in out, f"PSIDTS value {secret!r} leaked from {text!r}: got {out!r}"
+
+
+def test_formatter_psid_family_redacts_independently():
+    """The PSIDTS / PSIDCC / PSID variants must redact INDEPENDENTLY.
+
+    Python's ``re`` engine backtracks, so the bare ``__Secure-1PSID``
+    alternative does NOT shadow ``__Secure-1PSIDTS`` even if listed first
+    (the engine commits, finds no ``=`` immediately after, then retries
+    the next alternative). The longer-first ordering in the source regex
+    is a defensive convention + microscale perf, not load-bearing for
+    correctness.
+
+    This test pins what IS load-bearing: each of the three suffix variants
+    (``PSID`` / ``PSIDCC`` / ``PSIDTS``) must scrub when present together,
+    independent of any ordering subtlety.
+    """
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    text = (
+        "jar: __Secure-1PSID=BARE_PSID_VAL; "
+        "__Secure-1PSIDCC=PSIDCC_VAL; "
+        "__Secure-1PSIDTS=PSIDTS_VAL"
+    )
+    rec = _record(text)
+    out = fmt.format(rec)
+    for secret in ("BARE_PSID_VAL", "PSIDCC_VAL", "PSIDTS_VAL"):
+        assert secret not in out, f"{secret} leaked: {out!r}"
+    for redacted in (
+        "__Secure-1PSID=***",
+        "__Secure-1PSIDCC=***",
+        "__Secure-1PSIDTS=***",
+    ):
+        assert redacted in out, f"missing {redacted}: {out!r}"
+
+
+def test_formatter_scrubs_papisid_with_correct_captured_name():
+    """``__Secure-[13]PAPISID`` must be matched as its own alternative.
+
+    Without an explicit alternative, the engine would match the ``APISID``
+    suffix at position 11 instead, capturing only ``APISID`` as ``\\1``
+    while leaving the ``__Secure-1P`` prefix in place. The substituted
+    output looks identical at the surface (``__Secure-1PAPISID=***``)
+    because the unmatched prefix is preserved verbatim, so a string-shape
+    assertion alone cannot distinguish "full name captured" from
+    "coincidental prefix preservation."
+
+    We pin the invariant directly: walk ``_REDACT_PATTERNS`` and assert
+    that the first cookie-pattern match on a PAPISID input has
+    ``group(1) == "__Secure-1PAPISID"``. Removing the PAPISID alternative
+    from the regex would flip ``group(1)`` to ``"APISID"``, which this
+    assertion catches even though the substituted output would still look
+    correct.
+    """
+    from notebooklm._logging import _REDACT_PATTERNS
+    from notebooklm._secrets import COOKIE_VALUE_REPLACEMENT
+
+    # Find the cookie pattern (the one whose replacement is the shared
+    # quote-aware cookie replacement and whose source mentions __Secure-).
+    # Don't hardcode an index.
+    cookie_pattern = next(
+        p
+        for p, repl in _REDACT_PATTERNS
+        if repl == COOKIE_VALUE_REPLACEMENT and "__Secure" in p.pattern
+    )
+
+    # group(1) must be the FULL cookie name, not the APISID suffix.
+    m1 = cookie_pattern.search("__Secure-1PAPISID=SECRET_1PAPISID")
+    assert m1 is not None
+    assert m1.group(1) == "__Secure-1PAPISID", (
+        f"capture group resolved to suffix instead of full name: {m1.group(1)!r}"
+    )
+    m3 = cookie_pattern.search("__Secure-3PAPISID=SECRET_3PAPISID")
+    assert m3 is not None
+    assert m3.group(1) == "__Secure-3PAPISID", (
+        f"capture group resolved to suffix instead of full name: {m3.group(1)!r}"
+    )
+
+    # End-to-end shape check via the formatter (regression for the visible
+    # substitution + the no-PAPAPISID corruption guard).
+    fmt = RedactingFormatter(logging.Formatter("%(message)s"))
+    text = "jar: __Secure-1PAPISID=SECRET_1PAPISID; __Secure-3PAPISID=SECRET_3PAPISID"
+    rec = _record(text)
+    out = fmt.format(rec)
+    assert "SECRET_1PAPISID" not in out
+    assert "SECRET_3PAPISID" not in out
+    assert "__Secure-1PAPISID=***" in out
+    assert "__Secure-3PAPISID=***" in out
+    assert "PAPAPISID" not in out
 
 
 def test_formatter_handles_nonstring_record_msg():
@@ -516,6 +992,79 @@ def test_install_redaction_no_root_mutation(saved_external_logger, saved_root_lo
 
 
 # ---------------------------------------------------------------------------
+# Third-party logger-level redaction installed at import / configure_logging
+# (issue #1166: library consumers who enable httpx DEBUG must not leak f.sid)
+# ---------------------------------------------------------------------------
+
+
+def test_configure_logging_installs_thirdparty_filters(saved_logger_state, saved_external_logger):
+    """configure_logging attaches a logger-level RedactingFilter to httpx/urllib3.
+
+    It must NOT add a handler — a consumer who never enables these loggers
+    should see no behavior change beyond the in-place scrubbing filter.
+    """
+    httpx_logger = saved_external_logger("httpx")
+    urllib3_logger = saved_external_logger("urllib3")
+
+    configure_logging()
+
+    for lg in (httpx_logger, urllib3_logger):
+        assert any(isinstance(f, RedactingFilter) for f in lg.filters)
+        # No handler is added to third-party loggers (no surprise stdout output).
+        assert not any(getattr(h, "_notebooklm_redacting", False) for h in lg.handlers)
+
+
+def test_configure_logging_thirdparty_filter_is_idempotent(
+    saved_logger_state, saved_external_logger
+):
+    """Re-running configure_logging does not stack duplicate filters on httpx."""
+    httpx_logger = saved_external_logger("httpx")
+
+    configure_logging()
+    configure_logging()
+
+    redacting = [f for f in httpx_logger.filters if isinstance(f, RedactingFilter)]
+    assert len(redacting) == 1
+
+
+def test_httpx_request_url_redacted_for_library_consumer(
+    saved_logger_state, saved_external_logger, saved_root_logger
+):
+    """A library consumer enabling httpx DEBUG via basicConfig gets scrubbed URLs.
+
+    Reproduces issue #1166: without the logger-level filter, the httpx
+    'HTTP Request: GET ...?f.sid=<session>' line propagates to the root
+    handler unredacted. configure_logging() must prevent that leak even
+    though notebooklm-py adds no handler to the httpx logger.
+    """
+    httpx_logger = saved_external_logger("httpx")
+    # httpx ships its logger at NOTSET, so it inherits the effective level from
+    # root. Mirror that here (the fixture parks it at WARNING for isolation).
+    httpx_logger.setLevel(logging.NOTSET)
+    configure_logging()
+
+    # Simulate logging.basicConfig(level=DEBUG): a handler on root, no handler
+    # on the httpx logger itself. The record propagates from httpx -> root.
+    buf = io.StringIO()
+    root_handler = logging.StreamHandler(buf)
+    root_handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    saved_root_logger.addHandler(root_handler)
+    saved_root_logger.setLevel(logging.DEBUG)
+
+    # httpx emits its "HTTP Request: ..." line from logging.getLogger("httpx")
+    # directly (not a child logger), so the logger-level filter on "httpx"
+    # scrubs the record before it propagates to the root handler.
+    logging.getLogger("httpx").info(
+        "HTTP Request: GET https://notebooklm.google.com/_/batchexecute?f.sid=SESSION_LEAK "
+        '"HTTP/1.1 200 OK"'
+    )
+
+    out = buf.getvalue()
+    assert "SESSION_LEAK" not in out
+    assert "f.sid=***" in out
+
+
+# ---------------------------------------------------------------------------
 # Fast-path gate (SECRET_FAST_PATH_TOKENS) — correctness + perf
 # ---------------------------------------------------------------------------
 
@@ -550,6 +1099,10 @@ def test_fast_path_tokens_cover_every_redaction_pattern():
     # token (case-insensitively) AND get rewritten by scrub_secrets.
     samples = [
         ("at=", "posted body at=SECRET_X&hl=en"),
+        ("snlm0e", 'wiz data "SNlM0e":"AF1_QpN-SECRET_X"'),
+        ("fdrfje", "session FdrFJe=SECRET_SID_X"),
+        ("csrf", "form csrf=AF1_QpN-SECRET_X"),
+        ("af1_qpn-", "bare token AF1_QpN-SECRET_X in prose"),
         ("f.sid", "url ?f.sid=ABC_DEF"),
         ("_token=", "oauth body refresh_token=RT&access_token=AT&id_token=IT"),
         ("code=", "oauth callback code=AUTH_X"),

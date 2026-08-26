@@ -3,7 +3,7 @@
 Audit items:
 - §25: `NotebookLMClient.__aexit__` lacked try/except, so a `close()` exception
   masked the body's exception (and could leave the transport open).
-- §7: `_core.close()` did not shield `aclose()`, so a `CancelledError` arriving
+- §7: `client.close()` did not shield `aclose()`, so a `CancelledError` arriving
   mid-close could leak the underlying httpx client.
 
 Coverage:
@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from notebooklm import NotebookLMClient
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
 
 # mock-based __aexit__ arbitration tests; no HTTP, no cassette.
 # Opt out of the tier-enforcement hook in tests/integration/conftest.py.
@@ -29,28 +30,44 @@ pytestmark = pytest.mark.allow_no_vcr
 
 
 @pytest.fixture(autouse=True)
-def _stub_open(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make `_core.open()` a no-op that just installs a stub `_http_client`.
+def _stub_open(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Make `lifecycle.open()` a no-op that just installs a stub `_http_client`.
 
     The full `open()` path constructs a real `httpx.AsyncClient` and runs
     auth refresh; for these arbitration tests we only need a non-None
     `_http_client` whose `aclose()` we can control.
-    """
 
-    async def _stub_open(self) -> None:
-        if self._http_client is not None:
+    Returns the per-test ``calls`` list the stub appends to on each
+    invocation. Tests assert it is non-empty so the seam stays load-bearing:
+    if the object-form patch ever stopped resolving (a silent no-op), the
+    real `open()` would run instead, ``calls`` would be empty, and the
+    assertion fails — the ADR-0007 Form-2 disable->red bite-check.
+    """
+    calls: list[object] = []
+
+    async def _stub_open(self, **_kwargs: object) -> None:
+        calls.append(self)
+        if self._kernel.http_client is not None:
             return
         # Lazy import keeps the test file dep-free at module load.
         import httpx
 
-        self._http_client = httpx.AsyncClient()
+        install_http_client_for_test(self._kernel, httpx.AsyncClient())
 
-    monkeypatch.setattr("notebooklm._core.ClientCore.open", _stub_open)
+    # Object-form patch against a locally-imported seam alias (ADR-0007 Form 2):
+    # patch the unbound `open` method on the `ClientLifecycle` class so the
+    # `client._collaborators.lifecycle.open(...)` instance call resolves to the
+    # stub. Avoids the import-string-target form that silently no-ops on relocation.
+    import notebooklm._runtime.lifecycle as _lifecycle
+
+    monkeypatch.setattr(_lifecycle.ClientLifecycle, "open", _stub_open)
+    return calls
 
 
 async def test_body_raises_and_close_raises_body_wins(
     auth_tokens,
     caplog: pytest.LogCaptureFixture,
+    _stub_open: list[object],
 ) -> None:
     """Body's ValueError must propagate; close's RuntimeError logged + suppressed.
 
@@ -60,28 +77,32 @@ async def test_body_raises_and_close_raises_body_wins(
     client = NotebookLMClient(auth_tokens)
 
     # Capture the http client reference BEFORE entering the cm — successful
-    # close sets `client._core._http_client = None`, so we need our own ref.
+    # close sets `client._collaborators.kernel.http_client = None`, so we need our own ref.
     async with client:
-        http_client_ref = client._core._http_client
+        # ADR-0007 Form-2 bite-check: the object-form `ClientLifecycle.open`
+        # patch must have resolved — the stub ran on context entry. If the
+        # seam ever stopped binding (silent no-op), `calls` is empty here.
+        assert _stub_open, "open() stub was not invoked — Form-2 patch did not resolve"
+        http_client_ref = client._collaborators.kernel.get_http_client()
         assert http_client_ref is not None
 
-        # Patch _core.close to raise after closing the transport, so we
+        # Patch client.close to raise after closing the transport, so we
         # exercise the exception-arbitration path. Forward to the original
         # close so the leak-shield path also runs.
-        original_close = client._core.close
+        original_close = client.close
 
         async def _close_then_raise() -> None:
             await original_close()
             raise RuntimeError("synthetic close failure")
 
         with (
-            patch.object(client._core, "close", _close_then_raise),
+            patch.object(client, "close", _close_then_raise),
             caplog.at_level(logging.WARNING),
             pytest.raises(ValueError, match="user error"),
         ):
             async with client:
                 # Sanity: client is open here.
-                assert client._core._http_client is not None
+                assert client._collaborators.kernel.http_client is not None
                 raise ValueError("user error")
 
     # 1. The body's ValueError propagated (verified by pytest.raises above).
@@ -101,6 +122,7 @@ async def test_body_raises_and_close_raises_body_wins(
 
 async def test_body_succeeds_and_close_raises_close_propagates(
     auth_tokens,
+    _stub_open: list[object],
 ) -> None:
     """No body exception → close() failure propagates as the cm exit exception."""
     client = NotebookLMClient(auth_tokens)
@@ -109,30 +131,38 @@ async def test_body_succeeds_and_close_raises_close_propagates(
         raise RuntimeError("close failed")
 
     with (
-        patch.object(client._core, "close", _bad_close),
+        patch.object(client, "close", _bad_close),
         pytest.raises(RuntimeError, match="close failed"),
     ):
         async with client:
             pass
 
+    # ADR-0007 Form-2 bite-check: the object-form `ClientLifecycle.open` patch
+    # resolved — the stub ran on context entry (empty => silent no-op).
+    assert _stub_open, "open() stub was not invoked — Form-2 patch did not resolve"
+
 
 async def test_cancel_mid_close_does_not_leak_transport(
     auth_tokens,
+    _stub_open: list[object],
 ) -> None:
-    """`asyncio.shield` in `_core.close()` keeps `aclose()` running through cancel.
+    """`asyncio.shield` in ``NotebookLMClient.close`` / ``ClientLifecycle.close`` keeps `aclose()` running through cancel.
 
     Strategy: open a client, capture the http_client ref, then call
-    `_core.close()` from within an outer task and cancel that outer task
+    `client.close()` from within an outer task and cancel that outer task
     immediately. Assert the underlying transport ends up closed despite
     the cancel.
     """
     client = NotebookLMClient(auth_tokens)
-    await client._core.open()
-    http_client_ref = client._core._http_client
+    await client.__aenter__()
+    # ADR-0007 Form-2 bite-check: the object-form `ClientLifecycle.open` patch
+    # resolved — the stub ran on __aenter__ (empty => silent no-op).
+    assert _stub_open, "open() stub was not invoked — Form-2 patch did not resolve"
+    http_client_ref = client._collaborators.kernel.get_http_client()
     assert http_client_ref is not None
 
     # Wrap close() in a task so we can cancel it.
-    close_task = asyncio.create_task(client._core.close())
+    close_task = asyncio.create_task(client.close())
     # Yield once so close() can start, then cancel.
     await asyncio.sleep(0)
     close_task.cancel()

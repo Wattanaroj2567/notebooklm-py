@@ -76,16 +76,26 @@ class TestDoctorCommand:
     @pytest.mark.parametrize("json_flag", [False, True])
     @notebooklm_vcr.use_cassette("cli_doctor.yaml")
     def test_doctor_happy_path(self, runner, isolated_home: Path, json_flag: bool) -> None:
-        """Doctor with a clean profile + SID cookie reports all checks pass.
+        """Doctor with a clean profile + Tier-1 cookies reports all checks pass.
 
         Asserts:
           * exit code 0
           * No HTTP traffic emitted (empty cassette would trip on a request).
           * ``--json`` output, when requested, is parseable and reports
             ``auth.status == "pass"``.
+
+        The fixture carries the full Tier-1 set (``SID`` + ``__Secure-1PSIDTS``):
+        a lone ``SID`` is only a warn (issue #1753), which would not satisfy the
+        all-pass contract this test pins.
         """
         profile_dir = _make_profile(isolated_home)
-        _write_storage(profile_dir, [{"name": "SID", "value": "fixture-sid"}])
+        _write_storage(
+            profile_dir,
+            [
+                {"name": "SID", "value": "fixture-sid"},
+                {"name": "__Secure-1PSIDTS", "value": "fixture-psidts"},
+            ],
+        )
         (isolated_home / "config.json").write_text(
             json.dumps({"default_profile": "default"}), encoding="utf-8"
         )
@@ -107,16 +117,16 @@ class TestDoctorCommand:
         """Doctor with no ``storage_state.json`` reports auth failure cleanly.
 
         The auth-failure path is the second axis the task acceptance asks
-        for. Even on the failure path the command still exits 0 (it's a
-        diagnostic — ``doctor`` reports failures rather than exiting
-        non-zero) and emits no HTTP requests.
+        for. On the failure path the command exits 1 (issue #1160 — a false
+        ``green`` health check is worse than no check) while still emitting no
+        HTTP requests.
         """
         _make_profile(isolated_home)
         # Deliberately no storage_state.json written.
 
         result = runner.invoke(cli, ["doctor", "--json"])
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         data = json.loads(result.output)
         assert data["checks"]["auth"]["status"] == "fail"
         assert data["checks"]["auth"]["detail"] == "not authenticated"

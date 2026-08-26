@@ -8,6 +8,7 @@ from .conftest import requires_auth
 @requires_auth
 class TestNotebookOperations:
     @pytest.mark.asyncio
+    @pytest.mark.impersonate_smoke
     async def test_list_notebooks(self, client):
         notebooks = await client.notebooks.list()
         assert isinstance(notebooks, list)
@@ -33,9 +34,9 @@ class TestNotebookOperations:
         # Rename
         await client.notebooks.rename(notebook.id, "E2E Test Renamed")
 
-        # Delete
+        # Delete (v0.7.0: returns None, idempotent — issue #1211)
         deleted = await client.notebooks.delete(notebook.id)
-        assert deleted is True
+        assert deleted is None
         created_notebooks.remove(notebook.id)
 
     @pytest.mark.asyncio
@@ -45,8 +46,10 @@ class TestNotebookOperations:
 
 
 @requires_auth
+@pytest.mark.live_chat_ask
 class TestNotebookAsk:
     @pytest.mark.asyncio
+    @pytest.mark.impersonate_smoke
     async def test_ask_notebook(self, client, read_only_notebook_id):
         result = await client.chat.ask(read_only_notebook_id, "What is this notebook about?")
         assert result.answer is not None
@@ -110,21 +113,18 @@ class TestNotebookSharing:
 
     @pytest.mark.asyncio
     async def test_share_notebook(self, client, temp_notebook):
-        """Test sharing a notebook."""
-        result = await client.notebooks.share(temp_notebook.id, public=True)
-        # Share returns {"public": bool, "url": str|None, "artifact_id": str|None}
-        assert isinstance(result, dict)
-        assert result["public"] is True
-        assert result["url"] is not None
-        assert temp_notebook.id in result["url"]
+        """Test sharing a notebook (NotebooksAPI.share removed in v0.8.0; #1363)."""
+        result = await client.sharing.set_public(temp_notebook.id, True)
+        assert result.is_public is True
+        assert result.share_url is not None
+        assert temp_notebook.id in result.share_url
 
     @pytest.mark.asyncio
     async def test_revoke_share_notebook(self, client, temp_notebook):
-        """Test revoking notebook sharing."""
-        result = await client.notebooks.share(temp_notebook.id, public=False)
-        assert isinstance(result, dict)
-        assert result["public"] is False
-        assert result["url"] is None
+        """Test revoking notebook sharing (use sharing.set_public; #1363)."""
+        result = await client.sharing.set_public(temp_notebook.id, False)
+        assert result.is_public is False
+        assert result.share_url is None
 
 
 @requires_auth

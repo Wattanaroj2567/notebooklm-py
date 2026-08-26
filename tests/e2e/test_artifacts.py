@@ -12,7 +12,7 @@ import asyncio
 import pytest
 
 from notebooklm import Artifact, ArtifactType, ReportSuggestion
-from notebooklm.exceptions import RPCTimeoutError
+from notebooklm.exceptions import ArtifactNotFoundError, RPCTimeoutError
 
 from .conftest import assert_generation_started, requires_auth
 
@@ -45,9 +45,10 @@ class TestArtifactRetrieval:
     @pytest.mark.asyncio
     @pytest.mark.readonly
     async def test_get_artifact_not_found(self, client, read_only_notebook_id):
-        """Test getting a non-existent artifact returns None."""
-        artifact = await client.artifacts.get(read_only_notebook_id, "nonexistent_artifact_id")
-        assert artifact is None
+        """Test getting a non-existent artifact raises ArtifactNotFoundError."""
+        # v0.8.0: a miss now raises ArtifactNotFoundError (issue #1247).
+        with pytest.raises(ArtifactNotFoundError):
+            await client.artifacts.get(read_only_notebook_id, "nonexistent_artifact_id")
 
 
 @requires_auth
@@ -249,9 +250,9 @@ class TestArtifactMutations:
 
         await asyncio.sleep(2)
 
-        # Delete it
+        # Delete it (v0.7.0: returns None, idempotent — issue #1211)
         deleted = await client.artifacts.delete(temp_notebook.id, artifact_id)
-        assert deleted is True
+        assert deleted is None
 
         # Verify it's gone
         artifacts = await client.artifacts.list(temp_notebook.id)

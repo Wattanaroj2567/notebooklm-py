@@ -100,29 +100,75 @@ def test_refresh_failure_message_shows_exit_code_and_basename(
     assert "/home/user/.secret-credentials-dir" not in message
 
 
-def test_refresh_failure_routes_full_output_to_debug_log(
+def test_refresh_failure_debug_line_is_metadata_only_by_default(
     refresh_env: None,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Full stdout/stderr is available at DEBUG level for diagnosis.
+    """By DEFAULT the DEBUG line carries basename + exit code + byte counts only.
 
-    The package logger has a redaction filter installed at import time, so
-    even when we capture the raw record here the user-facing handler scrubs
-    well-known token shapes. This test confirms the data path exists; the
-    redaction filter is unit-tested separately in ``test_logging.py``.
+    c-PR4 (audit refresh-8): raw ``stdout``/``stderr`` are NO LONGER dumped by
+    default, because the redaction filter only collapses KNOWN credential shapes
+    and the rung can now fire mid-session in a long-lived server whose DEBUG log
+    is retained. The default line proves the failure happened and how much output
+    was produced, without surfacing any of it. Full capture is opt-in (see
+    ``test_refresh_failure_full_output_behind_opt_in``).
     """
+    monkeypatch.delenv(auth_module.NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT_ENV, raising=False)
     _stub_subprocess_run_with_leaky_output(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger="notebooklm.auth"), pytest.raises(RuntimeError):
         asyncio.run(auth_module._run_refresh_cmd())
 
     debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
     debug_text = "\n".join(r.getMessage() for r in debug_records)
-    # The secret output should be present in the DEBUG-level data path so
-    # developers can diagnose subprocess failures with ``--verbose``.
-    assert _SECRET_STDOUT in debug_text or _SECRET_STDERR in debug_text, (
-        "Expected refresh-cmd stdout/stderr to be routed to DEBUG log"
+    # Metadata IS present: basename, exit code, and byte counts.
+    assert "refresh-cookies.sh" in debug_text
+    assert f"stdout={len(_SECRET_STDOUT.encode())} bytes" in debug_text
+    assert f"stderr={len(_SECRET_STDERR.encode())} bytes" in debug_text
+    # The captured output — raw OR redaction-filtered — is absent by default.
+    assert "stdout='" not in debug_text
+    assert "stderr='" not in debug_text
+    assert "Bearer" not in debug_text
+    assert "rotate-cookie" not in debug_text
+    assert _SECRET_STDOUT not in debug_text
+    assert _SECRET_STDERR not in debug_text
+
+
+def test_refresh_failure_full_output_behind_opt_in(
+    refresh_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With the opt-in env, full stdout/stderr routes to DEBUG, secrets scrubbed.
+
+    ``NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT=1`` re-enables the captured-output DEBUG
+    line for local diagnosis. It still flows through the package's redaction
+    filter (installed at import time), so credential SHAPES collapse to ``***``:
+    ``_SECRET_STDOUT`` (``"Bearer ya29.…"``) -> ``stdout='Bearer ***'`` and
+    ``_SECRET_STDERR`` (``"rotate-cookie failed: SID=…"``) ->
+    ``stderr='rotate-cookie failed: SID=***'`` (full filter unit-tested in
+    ``test_logging.py``).
+    """
+    monkeypatch.setenv(auth_module.NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT_ENV, "1")
+    _stub_subprocess_run_with_leaky_output(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="notebooklm.auth"), pytest.raises(RuntimeError):
+        asyncio.run(auth_module._run_refresh_cmd())
+
+    debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    debug_text = "\n".join(r.getMessage() for r in debug_records)
+    # The opt-in line carries SANITIZED content: non-secret context survives,
+    # credential collapsed to ``***``.
+    assert "stdout='Bearer ***'" in debug_text, (
+        f"Expected scrubbed-but-present stdout content in DEBUG log: {debug_text!r}"
     )
+    assert "stderr='rotate-cookie failed: SID=***'" in debug_text, (
+        f"Expected scrubbed-but-present stderr content in DEBUG log: {debug_text!r}"
+    )
+    # And the raw credential shapes never survive (#1517).
+    assert _SECRET_STDOUT not in debug_text
+    assert _SECRET_STDERR not in debug_text
+    assert "ya29.SECRET-TOKEN" not in debug_text
+    assert "SECRET-SID-VALUE" not in debug_text
 
 
 def test_error_handler_prints_only_exc_args_for_unexpected_exception(
@@ -166,6 +212,111 @@ def test_error_handler_handles_non_string_first_arg(
     assert exc_info.value.code == 2
     captured = capsys.readouterr()
     assert "Unexpected error: 42" in (captured.out + captured.err)
+
+
+def _capture_refresh_subprocess_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Stub ``subprocess.run`` to record (and return) the ``env`` kwarg it received.
+
+    Returns a dict that the caller can inspect after ``_run_refresh_cmd`` runs;
+    the stub itself returns a zero-exit result so the refresh call completes
+    normally. Mirrors ``_stub_subprocess_run_with_leaky_output`` above.
+    """
+    captured: dict[str, str] = {}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(*_args: Any, **kwargs: Any) -> _Result:
+        captured.update(kwargs.get("env") or {})
+        return _Result()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    return captured
+
+
+def test_refresh_cmd_env_does_not_inherit_auth_json(
+    refresh_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``NOTEBOOKLM_AUTH_JSON`` must be stripped from the refresh subprocess env.
+
+    The env var carries the full Playwright ``storage_state`` (credential-
+    equivalent) when callers route auth through environment instead of disk.
+    ``os.environ.copy()`` would forward it to the refresh subprocess and any
+    grandchildren it spawns, where it is visible via ``/proc/<pid>/environ``
+    to the same UID and inherited by every child.
+
+    Strip it before exec. The refresh command already receives the canonical
+    on-disk path via ``NOTEBOOKLM_REFRESH_STORAGE_PATH``.
+    """
+    monkeypatch.setenv("NOTEBOOKLM_AUTH_JSON", '{"cookies":[{"name":"SID","value":"X"}]}')
+    captured_env = _capture_refresh_subprocess_env(monkeypatch)
+
+    asyncio.run(auth_module._run_refresh_cmd())
+
+    assert captured_env, "subprocess.run was not invoked with an env kwarg"
+    assert "NOTEBOOKLM_AUTH_JSON" not in captured_env, (
+        f"NOTEBOOKLM_AUTH_JSON leaked into refresh subprocess env: keys={sorted(captured_env)}"
+    )
+    # The refresh-routing channel must still be set so the child can locate
+    # the on-disk storage (this is what replaces the env-borne JSON).
+    assert "NOTEBOOKLM_REFRESH_STORAGE_PATH" in captured_env
+    assert "NOTEBOOKLM_REFRESH_PROFILE" in captured_env
+    # Sanity: PATH (or some unrelated parent env var) still propagates so
+    # we are stripping selectively, not wholesale.
+    assert "PATH" in captured_env or "HOME" in captured_env, (
+        "expected unrelated parent env vars to still propagate"
+    )
+
+
+def test_refresh_cmd_env_scrubs_first_party_server_secrets(
+    refresh_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refresh subprocess env must not inherit first-party server secrets.
+
+    c-PR4 (audit refresh-6): promoting the rung into a long-lived REST/MCP
+    server means the server's own auth secrets are present in the launching
+    process env. ``NOTEBOOKLM_SERVER_TOKEN`` and the other first-party secret
+    vars must be stripped before exec so they do not leak into the refresh
+    command (and its grandchildren, visible via ``/proc/<pid>/environ``).
+    """
+    secrets = {
+        "NOTEBOOKLM_SERVER_TOKEN": "server-bearer-SECRET",
+        "NOTEBOOKLM_SERVER_TOKEN_FILE": "/run/secrets/server-token",
+        "NOTEBOOKLM_MCP_TOKEN": "mcp-bearer-SECRET",
+        "NOTEBOOKLM_MCP_OAUTH_PASSWORD": "oauth-pass-SECRET",
+        "NOTEBOOKLM_AUTH_JSON": '{"cookies":[{"name":"SID","value":"X"}]}',
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    # A non-secret first-party var must still propagate (selective scrub).
+    monkeypatch.setenv("NOTEBOOKLM_PROFILE", "work")
+    captured_env = _capture_refresh_subprocess_env(monkeypatch)
+
+    asyncio.run(auth_module._run_refresh_cmd())
+
+    assert captured_env, "subprocess.run was not invoked with an env kwarg"
+    for name in secrets:
+        assert name not in captured_env, (
+            f"{name} leaked into refresh subprocess env: keys={sorted(captured_env)}"
+        )
+    # Non-secret config still propagates, and the routing channel is set.
+    assert captured_env.get("NOTEBOOKLM_PROFILE") == "work"
+    assert "NOTEBOOKLM_REFRESH_STORAGE_PATH" in captured_env
+
+
+def test_refresh_cmd_env_unaffected_when_auth_json_unset(
+    refresh_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``NOTEBOOKLM_AUTH_JSON`` is not set, ``.pop(..., None)`` is a no-op
+    and the refresh subprocess still runs to completion (regression guard)."""
+    monkeypatch.delenv("NOTEBOOKLM_AUTH_JSON", raising=False)
+    captured_env = _capture_refresh_subprocess_env(monkeypatch)
+
+    asyncio.run(auth_module._run_refresh_cmd())
+    assert "NOTEBOOKLM_AUTH_JSON" not in captured_env
+    assert "NOTEBOOKLM_REFRESH_STORAGE_PATH" in captured_env
 
 
 def test_error_handler_routes_traceback_to_debug(

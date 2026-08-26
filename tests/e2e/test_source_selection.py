@@ -12,7 +12,7 @@ Notebook lifecycle:
 - Artifacts cleaned BEFORE tests to ensure clean state
 - Sources preserved (tests need them)
 - In CI (CI=true): notebook deleted after tests
-- Locally: notebook persists, ID stored in NOTEBOOKLM_HOME
+- Locally: notebook persists, ID stored in the active profile cache
 """
 
 import random
@@ -23,6 +23,7 @@ from .conftest import assert_generation_started, requires_auth
 
 
 @requires_auth
+@pytest.mark.live_chat_ask
 class TestChatWithSourceSelection:
     """Tests for chat.ask() with explicit source selection."""
 
@@ -237,6 +238,7 @@ class TestSourceListingAndSelection:
 
 
 @requires_auth
+@pytest.mark.live_chat_ask
 class TestEdgeCases:
     """Edge case tests for source selection."""
 

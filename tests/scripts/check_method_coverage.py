@@ -35,9 +35,8 @@ The allowlist is intended as a **one-way ratchet**:
 
 * It **must not grow** when a new ``RPCMethod`` member is added — new methods
   must ship with at least one test reference and at least one cassette.
-* It **may shrink** when a maintainer backfills coverage for a grandfathered
-  method; they should delete the entry from :data:`PREEXISTING_GAPS` in the
-  same PR.
+* It **must shrink** when a maintainer backfills coverage for a grandfathered
+  method; stale entries in :data:`PREEXISTING_GAPS` fail the gate.
 
 The script is intentionally a static check (pure text grep on the cassette
 files and on the contents of ``tests/``); it never runs pytest or imports
@@ -90,23 +89,13 @@ _TEST_REFERENCE_EXCLUDES: frozenset[Path] = frozenset(
 
 # Pre-existing gaps grandfathered in when this gate landed; new methods
 # must NOT be added here. See module docstring for the one-way-ratchet
-# policy. The script's bootstrap step (run once locally before commit)
-# populated this set. Each entry is the ``RPCMethod.<NAME>`` member name
-# (without the ``RPCMethod.`` prefix).
-PREEXISTING_GAPS: frozenset[str] = frozenset(
-    {
-        # Captured by the bootstrap run when this gate landed. See module docstring
-        # for the one-way-ratchet policy: shrink this set when you backfill
-        # coverage; never add new entries when introducing a new RPCMethod.
-        # ``frozenset`` (not ``set``) so the module-level constant cannot be
-        # mutated at runtime, matching ``_TEST_REFERENCE_EXCLUDES`` above and
-        # reinforcing the "only shrinks" contract structurally.
-        "GET_INTERACTIVE_HTML",  # no test imports the enum or its id 'v9rmvd'
-        "GET_SUGGESTED_REPORTS",  # no cassette body contains id 'ciyUvf'
-        "IMPORT_RESEARCH",  # no cassette body contains id 'LBwxtb'
-        "REFRESH_SOURCE",  # no cassette body contains id 'FLmJqe'
-    }
-)
+# policy. Each entry is the ``RPCMethod.<NAME>`` member name (without the
+# ``RPCMethod.`` prefix).
+# Intentionally empty: every RPCMethod has full coverage (a test reference +
+# a cassette). The source-label RPCs' cassettes were recorded in this change,
+# so the temporary grandfather entries were removed. Record a cassette for any
+# new method rather than re-adding it here.
+PREEXISTING_GAPS: frozenset[str] = frozenset()
 
 
 def _iter_test_files() -> list[Path]:
@@ -233,12 +222,9 @@ def main() -> int:
         print(line)
 
     if unused_allowlist:
-        # Not a hard failure — but call it out loudly so the next PR can
-        # shrink the ratchet. Printed to stderr to keep stdout clean for
-        # parseable failure lines.
         print(
-            "NOTICE: PREEXISTING_GAPS entries now have full coverage and "
-            "should be removed: " + ", ".join(sorted(unused_allowlist)),
+            "STALE: PREEXISTING_GAPS entries now have full coverage and "
+            "must be removed: " + ", ".join(sorted(unused_allowlist)),
             file=sys.stderr,
         )
 
@@ -252,7 +238,7 @@ def main() -> int:
         f"{len(misses)} missing coverage."
     )
 
-    return 1 if misses else 0
+    return 1 if misses or unused_allowlist else 0
 
 
 if __name__ == "__main__":

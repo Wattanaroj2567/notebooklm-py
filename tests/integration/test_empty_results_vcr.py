@@ -28,19 +28,11 @@ incidental to replay — the cassettes are matched by RPC method + body,
 not by notebook UUID.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 
-# tests/ is not a package (no __init__.py); insert both dirs onto sys.path so
-# the ``conftest`` and ``vcr_config`` siblings resolve in any invocation mode
-# (direct pytest, ``-k`` filter, IDE runner).
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-from conftest import get_vcr_auth, skip_no_cassettes  # noqa: E402
-from notebooklm import NotebookLMClient  # noqa: E402
-from vcr_config import notebooklm_vcr  # noqa: E402
+from notebooklm import NotebookLMClient
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # Skip all tests in this module if cassettes are not available (mirrors the
 # pattern in tests/integration/test_vcr_comprehensive.py).
@@ -91,8 +83,8 @@ class TestEmptyResults:
         Covers both wings of the unified ``list`` implementation: the studio
         ``LIST_ARTIFACTS`` RPC (audio/video/reports/quizzes/...) AND the
         mind-map sidecar via the injected
-        :class:`notebooklm._mind_map.MindMapService`. A brand-new notebook
-        has neither, so the merged return must be ``[]``.
+        :class:`notebooklm._mind_map.NoteBackedMindMapService`. A brand-new
+        notebook has neither, so the merged return must be ``[]``.
         """
         notebook_id = _get_scratch_notebook_id()
         auth = await get_vcr_auth()
@@ -119,10 +111,12 @@ class TestEmptyResults:
         async with NotebookLMClient(auth) as client:
             result = await client.research.poll(notebook_id)
 
-        # Empty-state sentinel, not None and not an exception.
-        assert isinstance(result, dict)
-        assert result["status"] == "no_research"
-        assert result["tasks"] == []
+        # Empty-state sentinel, not None and not an exception. The typed
+        # ResearchTask compares equal to the historical status string and its
+        # to_public_dict mirrors the old ``{"status": ..., "tasks": []}`` shape.
+        assert result.status == "no_research"
+        assert result.tasks == ()
+        assert result.to_public_dict() == {"status": "no_research", "tasks": []}
 
 
 # =============================================================================

@@ -13,17 +13,20 @@ import ast
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
-from conftest import install_post_as_stream
-from notebooklm._core import ClientCore
+from notebooklm import _env
 from notebooklm.auth import AuthTokens
+from notebooklm.client import NotebookLMClient
 from notebooklm.rpc import RPCMethod
 from notebooklm.rpc import overrides as rpc_overrides
 from notebooklm.rpc import types as rpc_types
 from notebooklm.rpc.overrides import _load_rpc_overrides, _parse_rpc_overrides, resolve_rpc_id
+from tests._helpers.client_factory import build_client_shell_for_tests
+from tests.unit.conftest import install_post_as_stream
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RPC_TYPES_PATH = PROJECT_ROOT / "src" / "notebooklm" / "rpc" / "types.py"
@@ -234,7 +237,10 @@ def test_resolve_rpc_id_host_not_allowlisted_ignores_override(monkeypatch):
     rpc_overrides._logged_override_hashes.clear()
     # The host gate uses ``_env.get_base_host`` — patch it inline so we don't
     # depend on a real off-allowlist URL (which the validator would reject).
-    monkeypatch.setattr("notebooklm._env.get_base_host", lambda: "evil.example.com")
+    # ``resolve_rpc_id`` re-imports the name from ``notebooklm._env`` at call
+    # time, so patching the attribute on the imported module object is the
+    # injection seam (ADR-0007).
+    monkeypatch.setattr(_env, "get_base_host", lambda: "evil.example.com")
     assert (
         resolve_rpc_id("LIST_NOTEBOOKS", RPCMethod.LIST_NOTEBOOKS.value)
         == RPCMethod.LIST_NOTEBOOKS.value
@@ -249,7 +255,7 @@ def test_resolve_rpc_id_host_resolver_raises_falls_back(monkeypatch):
     def _boom() -> str:
         raise ValueError("malformed NOTEBOOKLM_BASE_URL")
 
-    monkeypatch.setattr("notebooklm._env.get_base_host", _boom)
+    monkeypatch.setattr(_env, "get_base_host", _boom)
     assert (
         resolve_rpc_id("LIST_NOTEBOOKS", RPCMethod.LIST_NOTEBOOKS.value)
         == RPCMethod.LIST_NOTEBOOKS.value
@@ -260,8 +266,14 @@ def test_resolve_rpc_id_enterprise_host_allowed(monkeypatch):
     """The enterprise host (notebooklm.cloud.google.com) also passes the gate."""
     monkeypatch.setenv("NOTEBOOKLM_RPC_OVERRIDES", '{"LIST_NOTEBOOKS": "ENT_ID"}')
     rpc_overrides._logged_override_hashes.clear()
-    monkeypatch.setattr("notebooklm._env.get_base_host", lambda: "notebooklm.cloud.google.com")
+    # The personal default host is *also* allowlisted, so the override would
+    # apply regardless of which allowlisted host the gate sees; spying on the
+    # injected resolver proves the gate actually consulted the enterprise host
+    # we substituted (and that the seam was hit, not silently bypassed).
+    fake_get_base_host = Mock(return_value="notebooklm.cloud.google.com")
+    monkeypatch.setattr(_env, "get_base_host", fake_get_base_host)
     assert resolve_rpc_id("LIST_NOTEBOOKS", RPCMethod.LIST_NOTEBOOKS.value) == "ENT_ID"
+    fake_get_base_host.assert_called()
 
 
 def test_resolve_rpc_id_logs_once_per_unique_set(monkeypatch, caplog):
@@ -321,13 +333,13 @@ def test_encode_rpc_request_none_override_uses_canonical():
 # ---------------------------------------------------------------------------
 
 
-def _make_core() -> ClientCore:
+def _make_core() -> NotebookLMClient:
     auth = AuthTokens(
         csrf_token="CSRF_OLD",
         session_id="SID_OLD",
         cookies={"SID": "sid_cookie"},
     )
-    return ClientCore(
+    return build_client_shell_for_tests(
         auth=auth,
         refresh_callback=None,
         refresh_retry_delay=0.0,
@@ -379,7 +391,7 @@ async def test_rpc_call_resolved_id_at_both_sites(monkeypatch, env_value, expect
     rpc_overrides._logged_override_hashes.clear()
 
     core = _make_core()
-    await core.open()
+    await core.__aenter__()
     try:
         captured: dict[str, Any] = {}
 
@@ -391,9 +403,9 @@ async def test_rpc_call_resolved_id_at_both_sites(monkeypatch, env_value, expect
             # exercises the full encode → wire → decode round-trip.
             return _ok_response_for(expected_id)
 
-        install_post_as_stream(monkeypatch, core._http_client, fake_post)
+        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
 
-        await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+        await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         # URL site
         assert f"rpcids={expected_id}" in captured["url"]
@@ -412,11 +424,11 @@ async def test_rpc_call_host_off_allowlist_ignores_override(monkeypatch):
     monkeypatched env can't leak custom RPC ids to a hostile endpoint.
     """
     monkeypatch.setenv("NOTEBOOKLM_RPC_OVERRIDES", '{"LIST_NOTEBOOKS": "shouldNOTApply"}')
-    monkeypatch.setattr("notebooklm._env.get_base_host", lambda: "evil.example.com")
+    monkeypatch.setattr(_env, "get_base_host", lambda: "evil.example.com")
     rpc_overrides._logged_override_hashes.clear()
 
     core = _make_core()
-    await core.open()
+    await core.__aenter__()
     try:
         captured: dict[str, Any] = {}
 
@@ -425,13 +437,13 @@ async def test_rpc_call_host_off_allowlist_ignores_override(monkeypatch):
             captured["content"] = content
             return _ok_response_for(RPCMethod.LIST_NOTEBOOKS.value)
 
-        install_post_as_stream(monkeypatch, core._http_client, fake_post)
+        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
 
-        await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+        await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         assert f"rpcids={RPCMethod.LIST_NOTEBOOKS.value}" in captured["url"]
         assert "shouldNOTApply" not in captured["url"]
-        assert "shouldNOTApply" not in captured["content"]
+        assert b"shouldNOTApply" not in captured["content"]
     finally:
         await core.close()
 
@@ -443,7 +455,7 @@ async def test_rpc_call_invalid_json_falls_back_with_warning(monkeypatch, caplog
     rpc_overrides._logged_override_hashes.clear()
 
     core = _make_core()
-    await core.open()
+    await core.__aenter__()
     try:
         captured: dict[str, Any] = {}
 
@@ -452,10 +464,10 @@ async def test_rpc_call_invalid_json_falls_back_with_warning(monkeypatch, caplog
             captured["content"] = content
             return _ok_response_for(RPCMethod.LIST_NOTEBOOKS.value)
 
-        install_post_as_stream(monkeypatch, core._http_client, fake_post)
+        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
 
         with caplog.at_level("WARNING", logger="notebooklm.rpc.overrides"):
-            await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+            await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         assert any("not valid JSON" in r.message for r in caplog.records)
         assert f"rpcids={RPCMethod.LIST_NOTEBOOKS.value}" in captured["url"]
@@ -470,7 +482,7 @@ async def test_rpc_call_non_dict_json_falls_back_with_warning(monkeypatch, caplo
     rpc_overrides._logged_override_hashes.clear()
 
     core = _make_core()
-    await core.open()
+    await core.__aenter__()
     try:
         captured: dict[str, Any] = {}
 
@@ -479,10 +491,10 @@ async def test_rpc_call_non_dict_json_falls_back_with_warning(monkeypatch, caplo
             captured["content"] = content
             return _ok_response_for(RPCMethod.LIST_NOTEBOOKS.value)
 
-        install_post_as_stream(monkeypatch, core._http_client, fake_post)
+        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
 
         with caplog.at_level("WARNING", logger="notebooklm.rpc.overrides"):
-            await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+            await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         assert any("must be a JSON object" in r.message for r in caplog.records)
         assert f"rpcids={RPCMethod.LIST_NOTEBOOKS.value}" in captured["url"]

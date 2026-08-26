@@ -13,8 +13,8 @@ complementary halves:
    match membership in ``SCRUB_PLACEHOLDERS`` (closing a previous
    "starts with S" character-class hole). Before this consolidation the
    same patterns lived as an inline ``SENSITIVE_PATTERNS`` list in
-   :mod:`tests.vcr_config` and were duplicated piecemeal in
-   ``tests/check_cassettes_clean.sh`` — that drift risk is what motivated
+   :mod:`tests.vcr_config` and were duplicated piecemeal in the former
+   ``tests/check_cassettes_clean.sh`` shell guard — that drift risk is what motivated
    the consolidation.
 
 2. **Chunked-response byte-count re-derivation.** The
@@ -53,7 +53,20 @@ Exports
 - :data:`SENSITIVE_PATTERNS`  ordered (regex, replacement) registry
 - :func:`scrub_string`        single sanitization entry point
 - :func:`is_clean`            validator returning ``(ok, leaks)``
+- :func:`find_credential_leaks`   high-severity-shape-only subset (fixture-safe)
+- :func:`find_high_entropy_leaks` field-agnostic novel-token entropy backstop
 - :func:`recompute_chunk_prefix`  XSSI byte-count re-derivation
+
+Necessary-not-sufficient boundary (issue #1382)
+-----------------------------------------------
+The name-anchored / known-shape detectors below are NECESSARY but not
+SUFFICIENT: a novel credential prefix, or a known secret in an un-targeted
+field, passes them silently (this has bitten the guard twice — ``LSID`` and
+``JrWMbf``). :func:`find_high_entropy_leaks` is the deliberate field-agnostic
+complement that catches a long high-entropy base64/hex token in ANY quoted
+JSON scalar. See its KNOWN-SHAPE BOUNDARY block for the residual-risk decision
+this draws (it is scoped to quoted scalars on purpose; non-quoted high-entropy
+text remains GitHub-secret-scanning's job). Relates to ADR-0006.
 
 Upload + Drive token coverage
 -----------------------------
@@ -95,11 +108,26 @@ WRB-payload JSON string:
   path forms carry per-user avatar tokens. The pattern collapses the whole
   URL (host + path + token, including any trailing ``=s512``-style sizing
   suffix) to ``SCRUBBED_AVATAR_URL``.
+
+Google API-key coverage
+-----------------------
+The NotebookLM web page embeds a Google API key in ``WIZ_global_data``. It
+surfaces across several field names (``B8SWKb``, ``VqImj``, and ``JrWMbf``);
+each is scrubbed by a name-anchored pattern. ``JrWMbf`` was originally missing,
+so its value round-tripped unscrubbed into the interactive mind-map cassettes —
+the API-key analog of the ``LSID`` cookie leak. To close that class of gap for
+good, the registry also carries a field-name-agnostic catch-all
+(:data:`_GOOGLE_API_KEY_PATTERN`) that collapses the canonical ``AIza`` +
+35-char Google API-key shape to ``SCRUBBED_API_KEY`` wherever it appears, with a
+matching ``is_clean`` detector so any unredacted key is flagged regardless of
+which field carried it.
 """
 
 from __future__ import annotations
 
+import math
 import re
+from collections import Counter
 
 # =============================================================================
 # Chunked-response byte-count re-derivation
@@ -127,10 +155,10 @@ def recompute_chunk_prefix(body: str) -> str:
     the 17-char ``SCRUBBED_USER_ID`` placeholder), the advertised byte-count no
     longer matches the actual payload length, which causes:
 
-    1. ``test_cassette_shapes.py`` byte-count assertion failures.
+    1. ``tests/_guardrails/test_cassette_shapes.py`` byte-count assertion failures.
     2. ``decoder.py`` to emit ``Chunk at line N declares X bytes but payload is
-       Y bytes`` DEBUG logs during replay (the JSON is still parsed — see the
-       tolerance block at decoder.py:217-237 — but well-formed cassettes
+       Y bytes`` DEBUG logs during replay (the JSON is still parsed — see
+       ``notebooklm.rpc.decoder.parse_chunked_response`` — but well-formed cassettes
        shouldn't trip the log at all).
 
     This helper walks the body, identifies every digit-only "header" line that
@@ -235,6 +263,14 @@ SESSION_COOKIES: list[str] = [
     "SIDCC",
     "OSID",
     "NID",
+    # ``LSID`` is the Google **login** SID cookie. Its value embeds a raw
+    # ``g.a000-...`` SID token — the same credential family as ``SID`` — yet it
+    # was historically MISSING from this list, so its value round-tripped into
+    # committed cassettes unscrubbed (the ``notebooks_share.yaml`` leak that
+    # motivated this hardening). ``LSOLH`` is the sibling login cookie that
+    # carries the same token shape; both are added so neither can leak again.
+    "LSID",
+    "LSOLH",
 ]
 
 # ``__Secure-*`` cookies are caught by the umbrella ``__Secure-[^=]+`` pattern;
@@ -306,6 +342,10 @@ SCRUB_PLACEHOLDERS: frozenset[str] = frozenset(
         # agnostic URL detector would otherwise re-flag the canonical
         # placeholder as a leak (idempotency).
         "authuser=SCRUBBED_EMAIL%40example.com",
+        # Double-encoded form for ``%3Fauthuser%3D…`` redirect-param URLs
+        # (issue #1368). Same idempotency rationale as the single-encoded
+        # placeholder above.
+        "authuser%3DSCRUBBED_EMAIL%40example.com",
         # upload + Drive token placeholders.
         "SCRUBBED_UPLOAD_ID",
         "SCRUBBED_UPLOAD_URL",
@@ -331,7 +371,7 @@ SCRUB_PLACEHOLDERS: frozenset[str] = frozenset(
 # being corrupted during replay.
 #
 # This list intentionally mirrors ``DISPLAY_NAME_FALSE_POSITIVES`` in
-# ``tests/unit/test_cassette_shapes.py``. The two lists are NOT
+# ``tests/_guardrails/test_cassette_shapes.py``. The two lists are NOT
 # imported from each other to keep ``cassette_patterns.py`` a leaf module —
 # the shape-lint module already depends on this registry, and a back-edge
 # would create a cycle. New entries must be added to BOTH lists. The unit
@@ -342,15 +382,21 @@ DISPLAY_NAME_FALSE_POSITIVES: frozenset[str] = frozenset(
         # Google Sans family (font-family CSS in HTML responses).
         "Google Sans",
         "Google Sans Text",
+        "Google Sans Flex",
         "Google Sans Arabic",
         "Google Sans Japanese",
         "Google Sans Korean",
         "Google Sans Simplified Chinese",
         "Google Sans Traditional Chinese",
+        # Icon font-family CSS in HTML responses (mat-icon.luminous-icon rule) —
+        # not a notebook title despite the two-Capitalized-word shape.
+        "Luminous Symbols",
         # Browser user-agent brand surfaced in Sec-CH-UA HTML responses.
         "Microsoft Edge",
         # Account UI page title (not a person's name).
         "Account Information",
+        # Product branding in the page shell (post-rebrand; see ADR/#1973 notes).
+        "Gemini Notebook",
         # Artifact / notebook titles produced by the test corpus.
         "Agent Development Tutorials",
         "Agent Flashcards",
@@ -368,6 +414,30 @@ DISPLAY_NAME_FALSE_POSITIVES: frozenset[str] = frozenset(
 
 _EMAIL_PATTERN_BASE = r"[A-Za-z0-9._%+\-]+@(?:" + "|".join(EMAIL_PROVIDERS) + r")\.com"
 
+# Single-encoded ``authuser=<local>%40<provider>`` query-param shape and its
+# double-encoded ``authuser%3D<local>%40<provider>`` sibling. The double-encoded
+# form arises when the email-bearing inner URL is itself the *value* of a
+# ``continue=`` redirect param, so its ``?authuser=`` gets percent-encoded one
+# extra level (``?``→``%3F``, ``=``→``%3D``, ``@``→``%40``) — issue #1368. Both
+# anchor on the ``authuser`` separator (literal ``=`` vs encoded ``%3D``) rather
+# than on the email's domain, so Workspace / corporate addresses the
+# provider-list pattern misses are still caught. The shared email tail uses the
+# wire-form local part (``%`` is legal because ``%2B`` etc. arrive encoded)
+# followed by the encoded ``%40`` separator and a domain. Neither shape has a
+# legitimate non-secret occurrence in a cassette, so collapsing to the canonical
+# placeholder is safe and the detectors below treat a match as a leak by
+# definition.
+#
+# ``AUTHUSER_EMAIL_DOUBLE_ENCODED_PATTERN`` is public (no leading underscore)
+# because ``scripts/rescrub-cassettes.py`` imports it across the module boundary
+# — matching the convention every other cross-imported name in this module
+# (``SENSITIVE_PATTERNS``, ``SCRUB_PLACEHOLDERS``, ``find_credential_leaks`` …)
+# follows. The ``_AUTHUSER_EMAIL_TAIL`` / ``_AUTHUSER_EMAIL_PATTERN`` helpers
+# stay private; they are only consumed within this module.
+_AUTHUSER_EMAIL_TAIL = r"[A-Za-z0-9._%+\-]+%40[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+_AUTHUSER_EMAIL_PATTERN = r"authuser=" + _AUTHUSER_EMAIL_TAIL
+AUTHUSER_EMAIL_DOUBLE_ENCODED_PATTERN = r"authuser%3D" + _AUTHUSER_EMAIL_TAIL
+
 # Negative-lookahead alternation built from the false-positive allowlist.
 # Each entry is regex-escaped because some legitimate UI titles could in
 # theory contain regex metacharacters (none do today, but future additions
@@ -378,6 +448,58 @@ _EMAIL_PATTERN_BASE = r"[A-Za-z0-9._%+\-]+@(?:" + "|".join(EMAIL_PROVIDERS) + r"
 _DISPLAY_NAME_ALLOWLIST_ALT = "|".join(
     re.escape(name) for name in sorted(DISPLAY_NAME_FALSE_POSITIVES, key=len, reverse=True)
 )
+
+
+# Catch-all Google auth-token shapes, applied as a defense-in-depth first pass
+# over EVERY scrubbed string (bodies + headers + cookie values). These are the
+# raw credential prefixes that ride inside session cookies, OAuth flows, and
+# SIDTS rotation tokens — the ``LSID`` leak proved that a cookie-name allowlist
+# alone is insufficient, so we also scrub the token shapes directly wherever
+# they appear. ``is_clean`` carries the matching detector
+# (``_DETECT_AUTH_TOKEN``) so the cassette guard flags any of these shapes that
+# survive.
+#
+# Anchoring strategy per shape:
+#
+#   * ``g\.a000-`` — anchored on the literal ``g.a000-`` prefix (note the
+#     REQUIRED trailing ``-``). That prefix is itself distinctive enough that
+#     no length floor is needed: ``g.a000-<anything>`` in a cassette is a SID
+#     token by construction and is never legitimate fixture content, so we
+#     scrub even a one-char tail. The hyphen requirement keeps the bare
+#     account-prefix ``g.a000`` (no token tail) from matching.
+#   * ``sidts-`` / ``ya29\.`` — less distinctive prefixes, so each carries a
+#     length floor (``{10,}`` / ``{20,}``) to avoid firing on an incidental
+#     short literal such as a bare ``ya29`` mention in a comment.
+#
+# Anything matched collapses to ``SCRUBBED`` (which contains none of the
+# prefixes), so repeated passes are idempotent.
+_AUTH_TOKEN_PATTERNS: list[str] = [
+    r"g\.a000-[A-Za-z0-9_\-]+",
+    r"sidts-[A-Za-z0-9_\-]{10,}",
+    r"ya29\.[A-Za-z0-9_\-]{20,}",
+]
+
+# Google API-key shape (``AIza`` + 35 ``[A-Za-z0-9_-]`` chars), applied as a
+# defense-in-depth catch-all alongside the name-anchored WIZ_global_data
+# ``B8SWKb`` / ``VqImj`` / ``JrWMbf`` scrubbers below. The name-anchored
+# patterns scrub whatever a *known* API-key field carries; this shape pattern
+# scrubs the key wherever it appears regardless of the surrounding field name.
+# The ``JrWMbf`` leak (the NotebookLM web API key round-tripping into the
+# ``generate_mind_map_interactive`` / ``mind_maps_interactive`` cassettes) is
+# the API-key analog of the ``LSID`` cookie leak: a credential rode in a field
+# that was not on the allowlist, so a name-anchored guard alone missed it. The
+# ``AIza`` prefix + a 35-char tail is the canonical Google API-key shape and
+# never occurs as legitimate fixture content, so collapsing it to the
+# ``SCRUBBED_API_KEY`` sentinel is safe. ``is_clean`` carries the matching
+# detector (``_DETECT_GOOGLE_API_KEY``) so any surviving raw key is flagged.
+#
+# The tail uses ``{35,}`` (35-OR-MORE), not an exact ``{35}``: a greedy
+# open-ended quantifier consumes the WHOLE contiguous key-char run. With an
+# exact ``{35}`` a longer-than-canonical key (e.g. ``AIza`` + 36 chars) would be
+# scrubbed only up to its first 39 chars, leaving a trailing fragment that the
+# ``SCRUBBED_API_KEY`` replacement no longer re-matches — a silent partial leak
+# in an unknown field with no name-anchored backstop (gemini review on #1266).
+_GOOGLE_API_KEY_PATTERN = r"AIza[0-9A-Za-z_\-]{35,}"
 
 
 def _cookie_header_replacer(name: str) -> tuple[str, str]:
@@ -394,6 +516,209 @@ def _cookie_header_replacer(name: str) -> tuple[str, str]:
 
 
 # =============================================================================
+# Name-AGNOSTIC cookie-header scrubbing + detection
+# =============================================================================
+# The name-anchored ``_cookie_header_replacer`` patterns above scrub only the
+# cookie NAMES they enumerate (``SESSION_COOKIES`` + the ``__Secure-*`` /
+# ``__Host-*`` umbrellas). Any cookie OUTSIDE those lists kept its real value in
+# the committed cassette — confirmed for Google Analytics cookies (``_ga``,
+# ``_ga_<id>``, ``_gcl_au``) and one-off cookies like ``AEC`` /
+# ``SEARCH_SAMESITE``. Analytics client-ids and timestamps are low-blast-radius
+# but they ARE real per-user values, so the bar is: NO cookie value anywhere in
+# a committed cassette retains a real value, name-agnostically.
+#
+# The functions below operate on a single LOGICAL cookie-header value (the
+# folded YAML scalar already joined into one string — the recorder hands
+# :func:`scrub_request` / :func:`scrub_response` exactly this form, and the gate
+# parses the YAML to recover it). They never run over the raw wrapped YAML text,
+# so a cookie pair split across a YAML line-wrap boundary can't corrupt anything.
+#
+# Cookie-header value shape (request ``Cookie:``):  ``name=value; name=value; …``
+#   — every ``;``-separated segment is a ``name=value`` cookie pair.
+# Set-Cookie value shape (response ``Set-Cookie:``): ``name=value; Attr=x; Attr; …``
+#   — ONLY the first segment is the cookie pair; the rest are attributes
+#     (``Path`` / ``Domain`` / ``Expires`` / ``Secure`` / ``HttpOnly`` /
+#     ``SameSite`` / ``Priority`` / ``Max-Age`` / ``SameParty``) and must be
+#     preserved verbatim.
+
+# Reserved Set-Cookie attribute names (lowercased). A segment after the first
+# whose key is in this set is an attribute, not a cookie pair, and is left
+# untouched. ``Secure`` / ``HttpOnly`` are valueless flags; the rest carry a
+# value we must NOT scrub (``Path=/``, ``Domain=.google.com``, ...).
+_SET_COOKIE_ATTR_NAMES: frozenset[str] = frozenset(
+    {
+        "path",
+        "domain",
+        "expires",
+        "max-age",
+        "secure",
+        "httponly",
+        "samesite",
+        "priority",
+        "sameparty",
+        "partitioned",
+    }
+)
+
+# Canonical placeholder a scrubbed cookie value collapses to. Reuses the bare
+# ``SCRUBBED`` sentinel the name-anchored patterns already emit so a cassette
+# carries one canonical cookie-value placeholder regardless of how the value was
+# scrubbed.
+_COOKIE_VALUE_PLACEHOLDER = "SCRUBBED"
+
+
+def _scrub_cookie_pairs(header_value: str, *, first_pair_only: bool) -> str:
+    """Replace cookie-pair VALUES in a logical cookie-header value, name-agnostic.
+
+    Every ``name=value`` pair has its value replaced with the canonical
+    :data:`_COOKIE_VALUE_PLACEHOLDER`, preserving the name and the surrounding
+    ``; `` separators verbatim. Already-scrubbed values (the placeholder) pass
+    through unchanged, so the function is idempotent.
+
+    Args:
+        header_value: One logical cookie-header value, e.g.
+            ``"SID=abc; _ga=GA1.1.x; NID=def"``.
+        first_pair_only: When ``True`` (the Set-Cookie case) only the FIRST
+            ``name=value`` segment is treated as a cookie pair; every later
+            ``;``-delimited segment is a cookie ATTRIBUTE (``Path`` / ``Domain``
+            / ``Expires`` / ``Secure`` / ...) and is preserved verbatim. When
+            ``False`` (the request ``Cookie:`` case) every segment is a pair.
+
+    Returns:
+        The header value with cookie values cleared. Whitespace and ``;``
+        layout are preserved exactly.
+    """
+    # Split on ";" but keep the separators so the original spacing round-trips.
+    segments = re.split(r"(;)", header_value)
+    out: list[str] = []
+    pair_index = 0
+    for segment in segments:
+        if segment == ";":
+            out.append(segment)
+            continue
+        # ``leading``/``core``/``trailing`` preserve surrounding whitespace so
+        # ``" _ga=x"`` stays ``" _ga=SCRUBBED"`` rather than losing its space.
+        stripped = segment.strip()
+        if not stripped:
+            out.append(segment)
+            continue
+        leading_len = len(segment) - len(segment.lstrip())
+        trailing_len = len(segment) - len(segment.rstrip())
+        leading = segment[:leading_len]
+        trailing = segment[len(segment) - trailing_len :] if trailing_len else ""
+        core = stripped
+
+        is_pair_position = (not first_pair_only) or pair_index == 0
+        if "=" in core:
+            name, _, value = core.partition("=")
+            key_lower = name.strip().lower()
+            if first_pair_only and pair_index > 0 and key_lower in _SET_COOKIE_ATTR_NAMES:
+                # Set-Cookie attribute carrying a value (Path=/, Domain=...): keep.
+                out.append(segment)
+                continue
+            if is_pair_position:
+                if value == _COOKIE_VALUE_PLACEHOLDER:
+                    out.append(segment)  # idempotent: already scrubbed.
+                else:
+                    out.append(f"{leading}{name}={_COOKIE_VALUE_PLACEHOLDER}{trailing}")
+                pair_index += 1
+                continue
+            # first_pair_only and we've passed the cookie pair: a non-reserved
+            # ``k=v`` attribute (rare). Leave it alone — it's not the cookie.
+            out.append(segment)
+            continue
+        # Valueless segment (a flag like ``Secure`` / ``HttpOnly``, or a bare
+        # cookie name with no value). Preserve verbatim; nothing to scrub.
+        out.append(segment)
+        if is_pair_position:
+            pair_index += 1
+    return "".join(out)
+
+
+def scrub_cookie_header(header_value: str) -> str:
+    """Scrub EVERY cookie value in a request ``Cookie:`` header, name-agnostic.
+
+    Each ``name=value`` pair's value is replaced with ``SCRUBBED`` while the
+    name and ``; `` layout are preserved. Idempotent on already-scrubbed input.
+    This is the name-agnostic complement to the name-anchored
+    ``_cookie_header_replacer`` patterns — it catches cookies (``_ga``,
+    ``_gcl_au``, ``AEC``, …) that are NOT on :data:`SESSION_COOKIES` and would
+    otherwise keep their real values in committed cassettes.
+    """
+    return _scrub_cookie_pairs(header_value, first_pair_only=False)
+
+
+def scrub_set_cookie(header_value: str) -> str:
+    """Scrub the cookie value in a response ``Set-Cookie:`` header, name-agnostic.
+
+    Only the leading ``name=value`` cookie pair is scrubbed; trailing attributes
+    (``Path`` / ``Domain`` / ``Expires`` / ``Secure`` / ``HttpOnly`` /
+    ``SameSite`` / ``Priority`` / ``Max-Age``) are preserved verbatim.
+    Idempotent on already-scrubbed input.
+    """
+    return _scrub_cookie_pairs(header_value, first_pair_only=True)
+
+
+def find_cookie_leaks(header_value: str, *, set_cookie: bool = False) -> list[str]:
+    """Return name-agnostic cookie-value leaks in a logical cookie-header value.
+
+    Flags any ``name=value`` cookie pair whose value is not the canonical
+    placeholder. For a ``Set-Cookie`` value (``set_cookie=True``) only the first
+    pair is a cookie; trailing attributes (``Path``/``Domain``/...) are skipped.
+    Each returned string is a human-readable ``"Leak (...): ..."`` description.
+
+    This is the field-agnostic detector that catches the ``_ga`` class going
+    forward — it does NOT depend on a cookie name being on any allowlist.
+    """
+    leaks: list[str] = []
+    shape = "Set-Cookie header" if set_cookie else "Cookie header"
+    segments = header_value.split(";")
+    pair_index = 0
+    for segment in segments:
+        core = segment.strip()
+        if not core or "=" not in core:
+            # Valueless flag (Secure/HttpOnly) or empty segment.
+            if core:
+                pair_index += 1
+            continue
+        name, _, value = core.partition("=")
+        name = name.strip()
+        key_lower = name.lower()
+        # Reserved Set-Cookie attribute names (``path`` / ``domain`` / ``expires``
+        # / ...) are NEVER real cookie names, so skip them unconditionally after
+        # the first pair. This keeps the detector correct even when the caller
+        # cannot tell a request ``Cookie:`` line from a ``Set-Cookie:`` line
+        # (the line-based ``is_clean`` path, where the header label is on a
+        # different physical line) — a Set-Cookie ``expires=...; path=/`` run is
+        # not mistaken for leaking cookies.
+        if pair_index > 0 and key_lower in _SET_COOKIE_ATTR_NAMES:
+            continue
+        is_pair_position = (not set_cookie) or pair_index == 0
+        if is_pair_position and value not in SCRUB_PLACEHOLDERS:
+            leaks.append(
+                f"Leak ({shape}): cookie {name!r} value {value!r} is not a known scrub placeholder"
+            )
+        if is_pair_position:
+            pair_index += 1
+    return leaks
+
+
+# Single cookie-name alternation reused by EVERY JSON-shape cookie scrubber
+# (storage_state name-first / value-first / bare-key forms). Derived from
+# :data:`SESSION_COOKIES` plus the ``__Secure-*`` / ``__Host-*`` umbrellas so a
+# name added to the registry (the ``LSID`` / ``LSOLH`` additions that motivated
+# this hardening) is picked up by the header form AND the JSON forms in one
+# place. Previously these alternations were hand-duplicated per pattern, so
+# ``LSID`` would have been scrubbed in the header but only partially scrubbed in
+# storage_state JSON — and ``is_clean`` (whose detector IS registry-derived via
+# ``_COOKIE_NAMES_GROUP``) would then flag the residual value as a leak. Keeping
+# scrubber and detector both registry-derived closes that drift.
+_COOKIE_JSON_NAMES_GROUP = (
+    "|".join(re.escape(name) for name in SESSION_COOKIES) + r'|__Secure-[^"]+|__Host-[^"]+'
+)
+
+
+# =============================================================================
 # Sensitive patterns
 # =============================================================================
 # The list is order-sensitive: earlier patterns run first. Each entry is a
@@ -402,6 +727,33 @@ def _cookie_header_replacer(name: str) -> tuple[str, str]:
 # scrubbers use context-aware (callable) replacements where exact-match
 # allowlists or surrounding context need to be consulted.
 SENSITIVE_PATTERNS: list[tuple[str, str]] = [
+    # -------------------------------------------------------------------------
+    # 0. Catch-all Google auth-token shapes (defense in depth)
+    # -------------------------------------------------------------------------
+    # These run FIRST, before any cookie-name-anchored pattern, so a session
+    # token leaks NOTHING even when it rides inside a cookie whose name is not
+    # on the allowlist (the ``LSID`` leak class), inside a response/request
+    # BODY, or inside any header value. Each shape is a distinctive,
+    # high-entropy Google credential prefix with no legitimate non-secret
+    # occurrence in a cassette:
+    #
+    #   * ``g.a000-...``  — the raw SID token embedded in SID/LSID cookie
+    #                       values and OAuth flows.
+    #   * ``sidts-...``   — the ``__Secure-*PSIDTS`` rotation-timestamp token.
+    #   * ``ya29....``    — Google OAuth2 access tokens.
+    #
+    # See :data:`_AUTH_TOKEN_PATTERNS` for the per-shape anchoring strategy
+    # (``g.a000-`` is distinctive enough to need no length floor; ``sidts-`` /
+    # ``ya29.`` carry floors to avoid incidental short-literal matches).
+    # Anything matched collapses to ``SCRUBBED`` so no fragment of the original
+    # token survives, and the replacement does not itself re-match (idempotent).
+    *((p, "SCRUBBED") for p in _AUTH_TOKEN_PATTERNS),
+    # Google API-key shape catch-all (defense in depth). Runs before the
+    # name-anchored WIZ_global_data API-key scrubbers in section 4 so a key
+    # leaks NOTHING even when it rides in a WIZ field that is not on the
+    # allowlist (the ``JrWMbf`` leak class). Collapses to ``SCRUBBED_API_KEY``,
+    # which does not itself re-match (idempotent).
+    (_GOOGLE_API_KEY_PATTERN, "SCRUBBED_API_KEY"),
     # -------------------------------------------------------------------------
     # 1. Cookie-header form: "Name=Value; ..."
     # -------------------------------------------------------------------------
@@ -439,6 +791,11 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     (r'"qDCSke"\s*:\s*"(?:[^"\\]|\\.)*"', '"qDCSke":"SCRUBBED_USER_ID"'),
     (r'"B8SWKb"\s*:\s*"(?:[^"\\]|\\.)*"', '"B8SWKb":"SCRUBBED_API_KEY"'),
     (r'"VqImj"\s*:\s*"(?:[^"\\]|\\.)*"', '"VqImj":"SCRUBBED_API_KEY"'),
+    # ``JrWMbf`` is the NotebookLM web API key embedded in WIZ_global_data. It
+    # was missing from this list, so its value round-tripped unscrubbed into the
+    # interactive mind-map cassettes (the leak this scrubber closes). Sibling of
+    # the ``B8SWKb`` / ``VqImj`` API-key fields above.
+    (r'"JrWMbf"\s*:\s*"(?:[^"\\]|\\.)*"', '"JrWMbf":"SCRUBBED_API_KEY"'),
     (r'"QGcrse"\s*:\s*"(?:[^"\\]|\\.)*"', '"QGcrse":"SCRUBBED_CLIENT_ID"'),
     (r'"iQJtYd"\s*:\s*"(?:[^"\\]|\\.)*"', '"iQJtYd":"SCRUBBED_PROJECT_ID"'),
     # -------------------------------------------------------------------------
@@ -454,9 +811,17 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     # addresses the provider-list pattern misses, with no false-positive
     # risk elsewhere. The replacement keeps the ``%40`` shape so VCR
     # matchers still see a well-formed value on replay.
+    (_AUTHUSER_EMAIL_PATTERN, "authuser=SCRUBBED_EMAIL%40example.com"),
+    # Double-encoded ``authuser%3D<email>`` form (issue #1368). When the
+    # email-bearing inner URL is the *value* of a ``continue=`` redirect param
+    # (Google account-menu ``SignOutOptions`` / ``brandaccounts`` links), its
+    # ``?authuser=`` is percent-encoded one extra level, so the literal-``=``
+    # pattern above never fires. Mirrors the single-encoded rule with the
+    # canonical ``authuser%3DSCRUBBED_EMAIL%40example.com`` placeholder, which
+    # does not itself re-match (idempotent).
     (
-        r"authuser=[A-Za-z0-9._%+\-]+%40[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
-        "authuser=SCRUBBED_EMAIL%40example.com",
+        AUTHUSER_EMAIL_DOUBLE_ENCODED_PATTERN,
+        "authuser%3DSCRUBBED_EMAIL%40example.com",
     ),
     # Unquoted-context fallback (mailto: hrefs, raw HTML/JS chunks).
     (_EMAIL_PATTERN_BASE, "SCRUBBED_EMAIL@example.com"),
@@ -485,14 +850,13 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     # ``"`` even when JSON-escaped (``\"``), which would silently leak the
     # tail of a value containing a literal quote.
     (
-        r'("name":\s*"(?:SID|HSID|SSID|APISID|SAPISID|SIDCC|OSID|NID|'
-        r'__Secure-[^"]+|__Host-[^"]+)"\s*,\s*"value":\s*")[^"\\]*(?:\\.[^"\\]*)*(")',
+        rf'("name":\s*"(?:{_COOKIE_JSON_NAMES_GROUP})"\s*,\s*"value":\s*")'
+        r'[^"\\]*(?:\\.[^"\\]*)*(")',
         r"\1SCRUBBED\2",
     ),
     (
         r'("value":\s*")[^"\\]*(?:\\.[^"\\]*)*'
-        r'("\s*,\s*"name":\s*"(?:SID|HSID|SSID|APISID|SAPISID|'
-        r'SIDCC|OSID|NID|__Secure-[^"]+|__Host-[^"]+)")',
+        rf'("\s*,\s*"name":\s*"(?:{_COOKIE_JSON_NAMES_GROUP})")',
         r"\1SCRUBBED\2",
     ),
     # -------------------------------------------------------------------------
@@ -504,8 +868,7 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     # never clean it). The value match uses the escape-aware idiom to match
     # the other JSON-shape patterns above.
     (
-        r'("(?:SID|HSID|SSID|APISID|SAPISID|SIDCC|OSID|NID|'
-        r'__Secure-[^"]+|__Host-[^"]+)"\s*:\s*")[^"\\]*(?:\\.[^"\\]*)*(")',
+        rf'("(?:{_COOKIE_JSON_NAMES_GROUP})"\s*:\s*")[^"\\]*(?:\\.[^"\\]*)*(")',
         r"\1SCRUBBED\2",
     ),
     # -------------------------------------------------------------------------
@@ -519,13 +882,11 @@ SENSITIVE_PATTERNS: list[tuple[str, str]] = [
     ),
     # Full upload URL that embeds the upload_id token in its query string.
     # Match the whole URL (up to the next quote or whitespace) and collapse
-    # to a stable canonical form so the token never round-trips through a
-    # cassette body. The whole URL — including the ``upload_id=`` substring
-    # — is replaced so the subsequent standalone ``upload_id=`` pattern
-    # cannot re-match this placeholder and produce a non-idempotent rewrite.
+    # to a stable canonical form on NotebookLM's trusted upload endpoint so
+    # cassette replay still passes runtime upload-URL validation.
     (
         r"https://notebooklm\.google\.com/upload/_/\?[^\"\s]*upload_id=[A-Za-z0-9_\-]+",
-        "SCRUBBED_UPLOAD_URL",
+        "https://notebooklm.google.com/upload/_/?upload_id=SCRUBBED_UPLOAD_ID",
     ),
     # Standalone upload_id query parameter (anywhere it appears outside the
     # full upload URL above).
@@ -624,6 +985,74 @@ _COOKIE_NAMES_GROUP = (
 _DETECT_COOKIE_HEADER = re.compile(
     rf"(?<![A-Za-z0-9_-])(?P<name>{_COOKIE_NAMES_GROUP})=(?P<value>[^;\s]+)"
 )
+
+# Anchor used by :func:`find_cookie_header_leaks` to identify a cookie-header
+# RUN inside arbitrary text. A cookie header is a ``;``-delimited run of
+# ``name=value`` pairs; we recognize one as a *cookie header* (rather than an
+# incidental ``k=v; k=v`` body fragment) when it contains at least one KNOWN
+# session-cookie pair. That keeps the name-agnostic value check from firing on
+# unrelated ``k=v`` content in response bodies while still catching every
+# off-allowlist cookie (``_ga`` / ``_gcl_au`` / ``AEC`` …) riding in the same
+# run. The recorder's :func:`scrub_request` / gate's YAML-aware pass operate on
+# the isolated logical value via :func:`find_cookie_leaks`; this string-level
+# helper is the in-text complement for :func:`is_clean`.
+_COOKIE_RUN_ANCHOR = re.compile(rf"(?<![A-Za-z0-9_-])(?:{_COOKIE_NAMES_GROUP})=")
+
+# Matches one cookie run on a SINGLE LINE: a chain of ``name=value`` pairs
+# joined by ``;`` (with optional spaces). Crucially the value class is
+# ``[^;\n]*`` — it must NOT cross a newline, or a greedy match would swallow the
+# entire YAML body (every ``k: v`` header line that happens to follow) and the
+# ``;``-split would then mis-read non-cookie header content (``ma=2592000``,
+# ``charset=utf-8``, ``Priority=HIGH`` …) as leaking cookies. Cookie runs are
+# line-local: a folded YAML cookie scalar that wraps a run across a physical
+# newline is still caught by the gate's authoritative YAML-aware pass
+# (:func:`tests.scripts.check_cassettes_clean._scan_cookie_headers_yaml`), which
+# stitches the logical value back together before calling :func:`find_cookie_leaks`.
+_COOKIE_RUN_RE = re.compile(r"[^=;\s]+=[^;\n]*(?:;[ \t]*[^=;\s]+=[^;\n]*)*")
+
+
+def find_cookie_header_leaks(text: str) -> list[str]:
+    """Name-agnostic cookie-value leak scan over ARBITRARY text (for is_clean).
+
+    Locates every single-line ``;``-delimited cookie RUN that contains at least
+    one known session-cookie pair (the :data:`_COOKIE_RUN_ANCHOR` discriminator
+    that keeps this from firing on incidental ``k=v; k=v`` body content), then
+    checks EVERY pair in that run — name-agnostically — via
+    :func:`find_cookie_leaks`. This is what makes :func:`is_clean` catch the
+    ``_ga`` class: a Google-Analytics cookie sharing a line with ``SID=`` /
+    ``__Secure-1PSID=`` is flagged even though its name is on no allowlist.
+
+    The run is line-local (the value class does not cross ``\\n``) so feeding
+    this whole-file text never over-matches across YAML header lines; a cookie
+    run a folded scalar split across physical lines is recovered by the gate's
+    YAML-aware pass instead. Returns human-readable
+    ``"Leak (Cookie header): ..."`` strings.
+    """
+    leaks: list[str] = []
+    seen: set[str] = set()
+    # Scan line-by-line and run the (backtracking-prone) cookie-run regex ONLY on
+    # physical lines that already carry a known session cookie. The cheap,
+    # non-backtracking ``_COOKIE_RUN_ANCHOR`` pre-filter keeps the expensive
+    # pair-extraction off large response-body lines — without it, ``finditer``
+    # over a multi-MB cassette body backtracks catastrophically (37s -> 0.05s on
+    # the 1.8MB flashcards cassette; identical results). Runs are line-local, so
+    # restricting to anchored lines finds exactly the same cookie pairs.
+    for line in text.splitlines():
+        if not _COOKIE_RUN_ANCHOR.search(line):
+            continue
+        for run_match in _COOKIE_RUN_RE.finditer(line):
+            run = run_match.group(0)
+            # Only treat this run as a cookie header if it carries a known session
+            # cookie — otherwise it's incidental ``k=v`` content, not a cookie line.
+            if not _COOKIE_RUN_ANCHOR.search(run):
+                continue
+            if run in seen:
+                continue
+            seen.add(run)
+            leaks.extend(find_cookie_leaks(run))
+    return leaks
+
+
 _DETECT_COOKIE_JSON_NAME_FIRST = re.compile(
     rf'"name"\s*:\s*"(?P<name>{_COOKIE_NAMES_GROUP})"\s*,\s*"value"\s*:\s*"'
     r'(?P<value>(?:[^"\\]|\\.)*)"'
@@ -651,19 +1080,24 @@ _DETECT_TOKEN_FIELDS: list[tuple[str, re.Pattern[str]]] = [
     ("qDCSke (user_id)", re.compile(r'"qDCSke"\s*:\s*"((?:[^"\\]|\\.)*)"')),
     ("B8SWKb (api_key)", re.compile(r'"B8SWKb"\s*:\s*"((?:[^"\\]|\\.)*)"')),
     ("VqImj (api_key)", re.compile(r'"VqImj"\s*:\s*"((?:[^"\\]|\\.)*)"')),
+    ("JrWMbf (api_key)", re.compile(r'"JrWMbf"\s*:\s*"((?:[^"\\]|\\.)*)"')),
     ("QGcrse (client_id)", re.compile(r'"QGcrse"\s*:\s*"((?:[^"\\]|\\.)*)"')),
     ("iQJtYd (project_id)", re.compile(r'"iQJtYd"\s*:\s*"((?:[^"\\]|\\.)*)"')),
 ]
 
 # Compiled detection-only pattern for emails (no replacement string baked in).
-# Two-shape detector — mirrors the two scrubber patterns in section 5 above:
+# Three-shape detector — mirrors the scrubber patterns in section 5 above:
 #   1. Literal ``@`` form on the provider allowlist (JSON, mailto: hrefs).
 #   2. URL-encoded ``authuser=<email>`` query-param form for *any* domain.
+#   3. Double-encoded ``authuser%3D<email>`` redirect-param form (issue #1368).
 _DETECT_EMAIL = re.compile(
     r"[A-Za-z0-9._%+\-]+@(?:"
     + "|".join(EMAIL_PROVIDERS)
     + r")\.com"
-    + r"|authuser=[A-Za-z0-9._%+\-]+%40[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+    + r"|"
+    + _AUTHUSER_EMAIL_PATTERN
+    + r"|"
+    + AUTHUSER_EMAIL_DOUBLE_ENCODED_PATTERN
 )
 
 # upload + Drive token detectors.
@@ -690,12 +1124,12 @@ _DETECT_UPLOAD_DRIVE_FIELDS: list[tuple[str, re.Pattern[str]]] = [
     ("Drive file_id (URL)", re.compile(r"/drive/v3/files/([A-Za-z0-9_\-]+)")),
 ]
 
-# Full upload URL is replaced wholesale with ``SCRUBBED_UPLOAD_URL`` rather
-# than per-field, so the detector matches the whole URL form and the leak
-# check is "does it appear at all" (the only legitimate appearance of an
-# upload URL in a cassette is the placeholder itself, which this regex does
-# NOT match — so any match here is a leak).
-_DETECT_UPLOAD_URL = re.compile(r"https://notebooklm\.google\.com/upload/_/\?[^\"\s]*upload_id=")
+# Full upload URL is rewritten to a trusted-host placeholder with a scrubbed
+# upload_id. Any NotebookLM upload URL carrying a non-placeholder upload_id is
+# a leak.
+_DETECT_UPLOAD_URL = re.compile(
+    r"https://notebooklm\.google\.com/upload/_/\?[^\"\s]*upload_id=(?!SCRUBBED_UPLOAD_ID\b)"
+)
 
 # escaped JSON display-name literal detector.
 #
@@ -712,6 +1146,251 @@ _DETECT_DISPLAY_NAME_ESCAPED = re.compile(r'\\"([A-Z][a-z]+(?: [A-Z][a-z]+)+)\\"
 # URL to ``SCRUBBED_AVATAR_URL``, so any match here is by definition a
 # leak (the placeholder string doesn't itself contain ``lh3.``).
 _DETECT_AVATAR_URL = re.compile(r"https?://lh3\.googleusercontent\.com/(?:a|ogw)/[A-Za-z0-9_=\-]+")
+
+# Catch-all auth-token detector — the validator twin of
+# :data:`_AUTH_TOKEN_PATTERNS`. The scrubber collapses every ``g.a000-...`` /
+# ``sidts-...`` / ``ya29....`` token to ``SCRUBBED`` (which contains none of
+# these prefixes), so ANY match here is by definition an unredacted leak —
+# regardless of which cookie name or body field carried it. This is the guard
+# rail that would have caught the ``LSID`` leak: it never depended on ``LSID``
+# being on the cookie allowlist.
+_DETECT_AUTH_TOKEN = re.compile("|".join(_AUTH_TOKEN_PATTERNS))
+
+# Google API-key shape detector — the validator twin of
+# :data:`_GOOGLE_API_KEY_PATTERN`. The scrubber collapses every ``AIza...`` key
+# to the ``SCRUBBED_API_KEY`` sentinel (which does not contain the ``AIza``
+# prefix), so ANY match here is by definition an unredacted leak regardless of
+# which WIZ field carried it. This is the field-name-agnostic backstop that
+# closes the ``JrWMbf`` gap.
+_DETECT_GOOGLE_API_KEY = re.compile(_GOOGLE_API_KEY_PATTERN)
+
+# Double-encoded ``authuser%3D<email>`` shape detector (issue #1368). Unlike the
+# single-encoded ``authuser=<email>`` form — which only ``is_clean`` runs,
+# because the literal-``@`` provider branch of ``_DETECT_EMAIL`` also fires on
+# legitimate placeholder content like ``alice@gmail.com`` — the double-encoded
+# ``authuser%3D…%40…`` shape has NO legitimate occurrence anywhere in the repo,
+# so it is safe to run over arbitrary fixture directories via
+# :data:`_CREDENTIAL_DETECTORS`. The negative lookahead excludes the canonical
+# ``authuser%3DSCRUBBED_EMAIL%40example.com`` placeholder so an already-scrubbed
+# cassette validates cleanly (idempotent).
+_DETECT_AUTHUSER_EMAIL_DOUBLE_ENCODED = re.compile(
+    r"authuser%3D(?!SCRUBBED_EMAIL%40example\.com)" + _AUTHUSER_EMAIL_TAIL
+)
+
+
+# Detectors with ZERO legitimate-occurrence risk anywhere in the repository:
+# raw Google auth-token shapes (``g.a000-`` / ``sidts-`` / ``ya29.``), the
+# canonical Google API-key shape (``AIza`` + 35 chars), and the double-encoded
+# ``authuser%3D<email>`` redirect-param shape (issue #1368). Unlike the
+# cookie-value / display-name / email heuristics that :func:`is_clean` also runs
+# — which intentionally fire on placeholder fixture content such as ``"Scrubbed
+# Note Title"`` or ``alice@gmail.com`` — these shapes never match legitimate
+# test data, so they are safe to run over arbitrary files (golden JSON/HTML
+# fixtures, docs, source) with no per-file allowlist. This is what the
+# ``--secrets-only`` mode of ``check_cassettes_clean.py`` uses to extend leak
+# detection beyond ``tests/cassettes/`` without drowning in false positives.
+# Signed blob-capability URLs (#2120). A live source-fulltext capture embeds a
+# download URL whose query parameter carries an opaque capability addressing a
+# NotebookLM blob, plus a Drive viewer wrapper around the same blob:
+#
+#     https://contribution.usercontent.google.com/download?c=<capability>&filename=…
+#     https://drive.google.com/viewer/upload?ck=…&ds=…&dsmi=…&p=…
+#
+# These are NAME-ANCHORED on the host + path, deliberately, rather than on the
+# capability's shape. The capability is an opaque base64 blob with no prefix to
+# key on, and the existing high-entropy scan only catches it when it happens to
+# be long enough: a 117-char capability trips it, a short one does NOT (measured
+# on #2215 — a synthetic ``?c=AIP70Bshortcap123`` URL scanned clean). Anchoring
+# on the endpoint makes detection independent of capability length.
+#
+# Scoped to the two hosts actually observed carrying capabilities, so an
+# ordinary ``drive.google.com/file/d/<id>`` reference in a fixture (a public
+# document id, not a credential) does not trip the guard.
+# The parameter alternatives anchor on a real query delimiter — ``?``, ``&`` or
+# an HTML/JSON-escaped ``&amp;`` — rather than ``\b``. A word boundary is not a
+# key boundary: ``...download?redirect=-c=1`` has no ``c`` parameter at all, yet
+# ``\bc=`` matches inside the *value*, so the strict fixture hook would reject
+# valid content. Keyed delimiters make the match mean what the name says.
+_DETECT_BLOB_CAPABILITY_URL = re.compile(
+    r"https?://contribution\.usercontent\.google\.com/download"
+    r"[^\s\"'<>]*(?:\?|&|&amp;)c="
+    r"|https?://drive\.google\.com/viewer/upload"
+    r"[^\s\"'<>]*(?:\?|&|&amp;)(?:ck|ds|dsmi|p)="
+    r"|/blobstore/[^\s\"'<>]*/blobrefs/"
+)
+
+_CREDENTIAL_DETECTORS: list[tuple[str, re.Pattern[str]]] = [
+    ("auth token", _DETECT_AUTH_TOKEN),
+    ("Google API key", _DETECT_GOOGLE_API_KEY),
+    ("double-encoded authuser email", _DETECT_AUTHUSER_EMAIL_DOUBLE_ENCODED),
+    ("signed blob-capability URL", _DETECT_BLOB_CAPABILITY_URL),
+]
+
+
+# =============================================================================
+# Generic high-entropy / unknown-field credential scan
+# =============================================================================
+#
+# THE KNOWN-SHAPE BOUNDARY (residual-risk decision; ADR-0006, issue #1382).
+# ---------------------------------------------------------------------------
+# Everything ABOVE this point is *name-anchored* (cookie names, WIZ field IDs)
+# or *known-shape* (``g.a000-`` / ``sidts-`` / ``ya29.`` / ``AIza`` prefixes).
+# That makes the guard NECESSARY-but-not-SUFFICIENT: a credential family the
+# registry does not yet know about — a NOVEL token prefix, or a known secret
+# riding in an un-targeted JSON field — passes the targeted detectors silently.
+# This is not hypothetical: the guard has missed two such shapes historically
+# (the ``LSID`` cookie whose name was off the allowlist, and the ``JrWMbf`` WIZ
+# field whose API key the name-anchored scrubbers skipped), and #1372 fixed a
+# double-encoded-email shape that leaked the maintainer's address. Each fix
+# extended the known-shape set by ONE entry — reactive, after-the-leak.
+#
+# This scanner is the deliberate, field-agnostic complement: it flags a quoted
+# JSON string scalar whose ENTIRE value is one long, high-entropy
+# base64url/hex run, regardless of the field name carrying it. It is the
+# "would have caught it generically" backstop the targeted detectors lack.
+#
+# Why it is SCOPED to a *quoted scalar value* rather than scanning every token:
+# committed cassettes are dense with legitimate high-entropy text — minified
+# CSS class names, ``fonts.gstatic.com`` / ``googleusercontent.com`` URLs,
+# 1.5 KB hex mind-map blobs, and 600-char ``context=eJw…`` zlib-base64 query
+# params. A raw per-token entropy scan would drown in thousands of those false
+# positives. But NONE of that legitimate content appears as a *clean quoted
+# JSON scalar* (``"field":"<one-pure-token>"``) — which is exactly the shape a
+# leaked credential takes when it rides in an unknown field. Anchoring on that
+# shape is what makes ZERO false positives across every committed cassette
+# achievable while still catching a planted novel token. This residual-risk
+# property is therefore a DECISION, not an accident: anything that is NOT a
+# quoted high-entropy scalar (a credential split across structural punctuation,
+# a token in a non-JSON encoding) remains the backstop's blind spot, covered by
+# GitHub secret-scanning and the name-anchored detectors above.
+#
+# Thresholds (calibrated against every committed cassette — see the unit tests
+# ``test_entropy_scan_*`` and ``test_all_committed_cassettes_pass_entropy_scan``):
+#
+#   * base64url / mixed-alphabet tokens: length >= 40 AND Shannon entropy
+#     >= 4.0 bits/char. A 40+ char run drawn from a ~64-symbol alphabet with
+#     >=4.0 entropy is a random secret by construction; legitimate quoted
+#     scalars in cassettes (UUIDs, opaque IDs) never reach both bars at once.
+#   * pure-hex tokens (``[0-9a-fA-F]`` only): a separate length floor of 64,
+#     because a 16-symbol alphabet CAPS Shannon entropy at log2(16) = 4.0
+#     bits/char — a hex secret can never reliably clear the 4.0 bar, so length
+#     alone gates it. 64 hex chars = 256 bits, comfortably above any incidental
+#     hex literal (a 32-hex MD5 or a 36-char UUID stays well under the floor).
+#
+# Allowlist (known-benign long tokens that must NOT be flagged):
+#
+#   * the canonical ``SCRUB_PLACEHOLDERS`` sentinels (idempotent validation);
+#   * the canonical UUID shape (``8-4-4-4-12`` hex-with-dashes) — these are
+#     NotebookLM-internal artifact / source / conversation IDs that the
+#     surrounding scrubbers deliberately preserve. The base64 length+entropy
+#     gate already excludes them (36 chars < 40, dashes depress entropy), but
+#     the explicit shape skip documents the intent and guards against a future
+#     threshold change re-flagging them.
+_ENTROPY_MIN_LEN_BASE64 = 40
+_ENTROPY_MIN_BITS = 4.0
+_ENTROPY_MIN_LEN_HEX = 64
+
+# Cap the substring fed to the entropy computation. A cassette can carry a
+# multi-megabyte base64-encoded asset as one quoted scalar (an inline image /
+# PDF / audio blob), and computing Shannon entropy over the whole run would be a
+# needless O(n) hot loop per scanned line. A random credential is high-entropy
+# throughout, so a 512-char prefix is a faithful representative — the entropy of
+# the prefix and the whole token converge well before this bound (gemini review
+# on #1387). Length gating still uses the FULL token length, not the cap.
+_ENTROPY_SAMPLE_CHARS = 512
+
+# A quoted JSON string scalar whose entire content is a single base64url / hex
+# token. ``\A``/``\Z`` inside the captured group are unnecessary because the
+# surrounding quotes already anchor the run to the FULL value — a token split
+# by any non-``[A-Za-z0-9_\-+/=]`` byte simply won't match.
+_DETECT_QUOTED_TOKEN = re.compile(r'"([A-Za-z0-9_\-+/=]+)"')
+
+# Canonical UUID shape (``8-4-4-4-12``). Internal NotebookLM IDs, never secrets.
+_UUID_SHAPE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+
+# Pure-hex run (no base64-only symbols). Used to route a token onto the hex
+# length floor instead of the entropy bar (hex entropy caps at 4.0).
+_HEX_ONLY = re.compile(r"\A[0-9a-fA-F]+\Z")
+
+
+def _shannon_entropy(token: str) -> float:
+    """Shannon entropy of ``token`` in bits per character.
+
+    A measure of per-character randomness: a token drawn uniformly from an
+    ``N``-symbol alphabet approaches ``log2(N)`` bits/char, while repetitive or
+    small-alphabet content scores lower. Returns ``0.0`` for the empty string.
+
+    Only the first :data:`_ENTROPY_SAMPLE_CHARS` characters are analyzed so a
+    multi-megabyte base64 asset scalar does not turn this into a per-line hot
+    loop; a random credential is high-entropy throughout, so the prefix is
+    representative.
+    """
+    if not token:
+        return 0.0
+    sample = token[:_ENTROPY_SAMPLE_CHARS]
+    length = len(sample)
+    return -sum((count / length) * math.log2(count / length) for count in Counter(sample).values())
+
+
+def _is_high_entropy_token(token: str) -> bool:
+    """Return ``True`` if ``token`` looks like a novel high-entropy credential.
+
+    See the KNOWN-SHAPE BOUNDARY block above for the full rationale and the
+    threshold calibration. In brief: a pure base64url/hex run that is long
+    AND random enough that no legitimate quoted-scalar cassette value reaches
+    both bars, with the placeholder + UUID allowlist applied first.
+    """
+    if token in SCRUB_PLACEHOLDERS:
+        return False
+    if _UUID_SHAPE.match(token):
+        return False
+    if _HEX_ONLY.match(token):
+        # Hex entropy caps at log2(16) == 4.0 bits/char, so length alone gates
+        # a hex secret; the entropy bar below would never reliably fire on it.
+        return len(token) >= _ENTROPY_MIN_LEN_HEX
+    if len(token) < _ENTROPY_MIN_LEN_BASE64:
+        return False
+    return _shannon_entropy(token) >= _ENTROPY_MIN_BITS
+
+
+def find_high_entropy_leaks(text: str) -> list[str]:
+    """Flag quoted high-entropy base64/hex scalars in ANY field (issue #1382).
+
+    The field-agnostic complement to the name-anchored / known-shape detectors:
+    catches a novel credential shape — or a known secret riding in an
+    un-targeted JSON field — that the targeted scrubbers miss. Scoped to a
+    *quoted JSON string scalar* so it never fires on the legitimate high-entropy
+    text (CSS, URLs, compressed-query blobs) that pervades real cassettes. See
+    the KNOWN-SHAPE BOUNDARY block above for the boundary this deliberately
+    draws. Each returned string is a human-readable ``"Leak (...): '...'"``.
+    """
+    leaks: list[str] = []
+    for match in _DETECT_QUOTED_TOKEN.finditer(text):
+        token = match.group(1)
+        if _is_high_entropy_token(token):
+            leaks.append(f"Leak (high-entropy token): {token!r}")
+    return leaks
+
+
+def find_credential_leaks(text: str) -> list[str]:
+    """Return high-severity credential leaks (auth tokens + Google API keys).
+
+    A focused subset of :func:`is_clean` that runs ONLY the credential-shape
+    detectors in :data:`_CREDENTIAL_DETECTORS` PLUS the field-agnostic
+    high-entropy scan (:func:`find_high_entropy_leaks`). These shapes have no
+    legitimate occurrence anywhere in the repo, so unlike :func:`is_clean` this
+    is safe to point at fixture directories full of intentional placeholder
+    content. Each returned string is a human-readable ``"Leak (...): '...'"``
+    description.
+    """
+    leaks: list[str] = []
+    for label, regex in _CREDENTIAL_DETECTORS:
+        for match in regex.finditer(text):
+            leaks.append(f"Leak ({label}): {match.group(0)!r}")
+    leaks.extend(find_high_entropy_leaks(text))
+    return leaks
 
 
 def is_clean(text: str) -> tuple[bool, list[str]]:
@@ -769,6 +1448,16 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
                     f" a known scrub placeholder"
                 )
 
+    # --- 1b. Name-AGNOSTIC cookie-value scan -------------------------------
+    # The name-anchored shapes above only flag cookies on the allowlist. This
+    # pass flags ANY cookie pair (``_ga`` / ``_gcl_au`` / ``AEC`` / an unknown
+    # ``foo``) whose value is not a placeholder, scoped to a ``;``-delimited run
+    # that carries a known session cookie so it never fires on incidental
+    # ``k=v`` body content. This is the check that catches the ``_ga`` class
+    # going forward (the recorder + gate clear it via the name-agnostic
+    # scrubber). See :func:`find_cookie_header_leaks`.
+    leaks.extend(find_cookie_header_leaks(text))
+
     # --- 2. Real email addresses (any provider we redact) -------------------
     # Skip canonical placeholders so the provider-agnostic ``authuser=``
     # branch of ``_DETECT_EMAIL`` (which matches any TLD) doesn't re-flag
@@ -794,8 +1483,8 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
                 leaks.append(f"Leak ({label}): {value!r}")
 
     # --- 5. Full upload URL -----------------------------------------------
-    # The scrubber collapses the entire URL to ``SCRUBBED_UPLOAD_URL``, so any
-    # match of the raw URL form here is by definition a leak.
+    # The scrubber preserves the trusted host/path but rewrites upload_id to
+    # SCRUBBED_UPLOAD_ID, so any match here is by definition a leak.
     for match in _DETECT_UPLOAD_URL.finditer(text):
         leaks.append(f"Leak (upload URL): {match.group(0)!r}")
 
@@ -815,6 +1504,42 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
     for match in _DETECT_AVATAR_URL.finditer(text):
         leaks.append(f"Leak (avatar URL): {match.group(0)!r}")
 
+    # --- 7b. Signed blob-capability URLs ----------------------------------
+    # Must run in BOTH modes. ``find_credential_leaks`` (``--secrets-only``)
+    # reaches this detector via :data:`_CREDENTIAL_DETECTORS`, but the full
+    # cassette scan routes through this function instead — so registering it
+    # only there would leave ``check_cassettes_clean.py --strict --recursive``,
+    # the gate CI runs over ``tests/cassettes/``, blind to a capability URL in
+    # a recorded cassette. Same detector, both paths.
+    for match in _DETECT_BLOB_CAPABILITY_URL.finditer(text):
+        leaks.append(f"Leak (signed blob-capability URL): {match.group(0)!r}")
+
+    # --- 8. Catch-all Google auth-token shapes -----------------------------
+    # ``g.a000-...`` / ``sidts-...`` / ``ya29....`` tokens are scrubbed to
+    # ``SCRUBBED`` wherever they appear (cookie values on or off the allowlist,
+    # response bodies, headers). Any surviving raw token is a leak by
+    # definition — this is the cookie-name-agnostic backstop that closes the
+    # ``LSID`` gap.
+    for match in _DETECT_AUTH_TOKEN.finditer(text):
+        leaks.append(f"Leak (auth token): {match.group(0)!r}")
+
+    # --- 9. Google API-key shape (field-name-agnostic) ---------------------
+    # ``AIza...`` keys are scrubbed to ``SCRUBBED_API_KEY`` wherever they
+    # appear, regardless of the WIZ field name carrying them. Any surviving raw
+    # key is a leak by definition — this is the backstop that closes the
+    # ``JrWMbf`` gap the name-anchored field detectors missed.
+    for match in _DETECT_GOOGLE_API_KEY.finditer(text):
+        leaks.append(f"Leak (Google API key): {match.group(0)!r}")
+
+    # --- 10. Generic high-entropy / unknown-field credential scan ----------
+    # Field-agnostic backstop for a NOVEL credential shape — or a known secret
+    # in an un-targeted JSON field — that the name-anchored / known-shape
+    # detectors above miss (issue #1382). Scoped to a quoted high-entropy
+    # base64/hex scalar so it never fires on the legitimate high-entropy text
+    # (CSS, URLs, compressed-query blobs) that pervades real cassettes. See the
+    # KNOWN-SHAPE BOUNDARY block near :func:`find_high_entropy_leaks`.
+    leaks.extend(find_high_entropy_leaks(text))
+
     return (not leaks, leaks)
 
 
@@ -823,11 +1548,12 @@ def is_clean(text: str) -> tuple[bool, list[str]]:
 # =============================================================================
 #
 # These helpers exist so error-shape cassettes can be generated whose
-# responses match the shapes our client's exception mapping in
-# ``src/notebooklm/_core.py`` keys on:
+# responses match the shapes our client's exception mapping (see
+# :mod:`notebooklm._runtime.helpers` for ``is_auth_error`` and the retry
+# middleware for 429/5xx) keys on:
 #
-#   - HTTP 429  -> ``_TransportRateLimited`` -> ``RateLimitError``
-#   - HTTP 5xx  -> ``_TransportServerError`` -> ``ServerError``
+#   - HTTP 429  -> ``TransportRateLimited`` -> ``RateLimitError``
+#   - HTTP 5xx  -> ``TransportServerError`` -> ``ServerError``
 #   - HTTP 400  -> ``is_auth_error()``       -> refresh path + ``AuthError`` on
 #                                               second failure
 #
@@ -873,15 +1599,15 @@ def build_synthetic_error_response(
     """Return a ``(status_code, body, headers)`` triple for a synthetic error.
 
     The shape is intentionally minimal; the client's exception mapping keys on
-    the HTTP status code (see ``_core.py:is_auth_error`` and the 429 / 5xx
-    branches in ``_perform_authed_post``), so a syntactically-valid Google
-    error-shaped body is sufficient.
+    the HTTP status code (see :func:`notebooklm._runtime.helpers.is_auth_error`
+    and the 429 / 5xx branches in the retry middleware), so a
+    syntactically-valid Google error-shaped body is sufficient.
 
     For the ``expired_csrf`` mode we return HTTP 400 — not 401 — because that
     matches the documented Google contract: NotebookLM returns 400 (not 401/403)
     when the embedded CSRF token has expired, which is why ``is_auth_error``
-    treats 400 as an auth-refresh trigger. See ``is_auth_error`` in
-    ``src/notebooklm/_core.py``.
+    treats 400 as an auth-refresh trigger. See
+    :func:`notebooklm._runtime.helpers.is_auth_error`.
 
     Args:
         mode: One of ``VALID_ERROR_MODES``.
@@ -897,7 +1623,8 @@ def build_synthetic_error_response(
         body = (
             b'{"error": {"code": 429, "message": "Rate limited", "status": "RESOURCE_EXHAUSTED"}}'
         )
-        # Retry-After is honored by the 429 retry loop in ``_perform_authed_post``.
+        # Retry-After is honored by the 429 retry middleware in the shared
+        # authed transport.
         # Setting a small value keeps the recording-time loop short.
         headers = {
             "Content-Type": "application/json; charset=UTF-8",

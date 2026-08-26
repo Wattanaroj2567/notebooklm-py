@@ -1,13 +1,14 @@
 """Tests for ``notebooklm.rpc._safe_index.safe_index``.
 
-Covers happy descent, soft-mode warn-and-fallback, strict-mode raise, and
+Covers happy descent, strict-mode raise (the only mode since the
+``NOTEBOOKLM_STRICT_DECODE=0`` soft-mode opt-out was retired in v0.7.0), and
 backward-compat exception hierarchy (``except RPCError`` catches strict-mode
 errors).
 """
 
 from __future__ import annotations
 
-import logging
+import warnings
 
 import pytest
 
@@ -39,26 +40,6 @@ def test_descent_with_no_path_returns_root():
     data = ["root"]
     result = safe_index(data, method_id="abc", source="test")
     assert result == ["root"]
-
-
-def test_drift_outer_index_soft_mode_returns_none_with_warning(monkeypatch, caplog):
-    monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
-    data = ["only-one"]
-    with caplog.at_level(logging.WARNING, logger="notebooklm.rpc._safe_index"):
-        result = safe_index(data, 5, method_id="abc", source="test.outer")
-    assert result is None
-    assert any(
-        "safe_index drift" in record.message and record.levelno == logging.WARNING
-        for record in caplog.records
-    )
-
-
-def test_drift_inner_index_soft_mode_returns_none(monkeypatch):
-    monkeypatch.delenv("NOTEBOOKLM_STRICT_DECODE", raising=False)
-    data = [[["leaf"]]]
-    # Outer ok, inner index out of range.
-    result = safe_index(data, 0, 0, 9, method_id="abc", source="test.inner")
-    assert result is None
 
 
 def test_drift_outer_strict_mode_raises_with_attributes(monkeypatch):
@@ -102,6 +83,45 @@ def test_descending_into_int_is_caught_and_rerouted(monkeypatch):
     assert isinstance(exc_info.value.__cause__, TypeError)
 
 
+def test_descending_into_str_raises_drift():
+    """A str at an intermediate hop is drift, NOT a silent char index.
+
+    ``"abc"[0] == "a"`` — a string is indexable but is never a valid container
+    at an intermediate descent hop in a decoded RPC payload. Descending it would
+    smuggle a bogus 1-char "value" past drift detection. safe_index must reject
+    it as drift instead (regression for #1485 codex review).
+    """
+    with pytest.raises(UnknownRPCMethodError) as exc_info:
+        safe_index(["abc"], 0, 0, method_id="abc", source="test.str")
+    err = exc_info.value
+    # hop 0 descends ["abc"][0] -> "abc" (a str); hop 1 ([0]) is rejected, so
+    # the truncated path stops at (0,).
+    assert err.path == (0,)
+    assert err.source == "test.str"
+    assert err.data_at_failure is not None
+    assert "abc" in err.data_at_failure
+
+
+def test_descending_into_top_level_str_raises_drift():
+    """A str passed directly as ``data`` (descended at hop 0) is drift."""
+    with pytest.raises(UnknownRPCMethodError) as exc_info:
+        safe_index("abc", 0, method_id="abc", source="test.top_str")
+    assert exc_info.value.path == ()
+
+
+def test_descending_into_bytes_raises_drift():
+    """bytes is also indexable-but-not-a-container; reject it as drift too."""
+    with pytest.raises(UnknownRPCMethodError):
+        safe_index([b"abc"], 0, 0, method_id="abc", source="test.bytes")
+
+
+def test_str_leaf_value_is_returned_not_rejected():
+    """A str as the *final* leaf is fine — only intermediate hops are checked."""
+    assert safe_index([["leaf"]], 0, 0, method_id="abc", source="test.leaf") == "leaf"
+    # And a bare string with no descent is returned untouched.
+    assert safe_index("leaf", method_id="abc", source="test.no_descent") == "leaf"
+
+
 def test_strict_mode_exception_is_catchable_as_rpc_error(monkeypatch):
     """Backward compat: ``except RPCError`` still catches strict-mode raise."""
     monkeypatch.setenv("NOTEBOOKLM_STRICT_DECODE", "1")
@@ -123,13 +143,19 @@ def test_strict_mode_truthy_values(monkeypatch):
             safe_index([], 0, method_id="abc", source="test")
 
 
-def test_strict_mode_falsy_values(monkeypatch, caplog):
-    """``0``, unset, and arbitrary strings should keep soft mode."""
+def test_legacy_falsy_env_values_are_a_no_op(monkeypatch):
+    """The retired ``NOTEBOOKLM_STRICT_DECODE`` opt-out no longer softens decoding.
+
+    Formerly ``"0"`` / ``"no"`` / ``"false"`` / ``""`` restored
+    warn-and-return-``None``; that soft-mode path was removed in v0.7.0, so
+    every value now still raises on drift.
+    """
     for value in ("0", "no", "false", ""):
         monkeypatch.setenv("NOTEBOOKLM_STRICT_DECODE", value)
-        with caplog.at_level(logging.WARNING, logger="notebooklm.rpc._safe_index"):
-            result = safe_index([], 0, method_id="abc", source="test")
-        assert result is None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            with pytest.raises(UnknownRPCMethodError):
+                safe_index([], 0, method_id="abc", source="test")
 
 
 def test_data_at_failure_is_truncated(monkeypatch):

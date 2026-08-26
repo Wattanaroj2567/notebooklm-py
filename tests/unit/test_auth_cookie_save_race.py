@@ -1,7 +1,7 @@
 """Tests for the open-time snapshot + dirty-flag merge in
 ``save_cookies_to_storage`` — the fix for issue #361 (stale in-memory
 cookies clobbering fresh disk state) and the side-effect closure of
-``docs/auth-keepalive.md`` §3.4.2 (path collapse).
+``docs/auth-cookie-lifecycle.md`` Appendix A2 (path collapse).
 
 The canonical race that motivated this code (#361):
 
@@ -12,7 +12,7 @@ The canonical race that motivated this code (#361):
     differs from disk's ``NEW``, and "merges" by writing ``OLD`` —
     silently undoing B's rotation.
 
-The fix is an open-time snapshot per ``ClientCore`` instance, plus a
+The fix is an open-time snapshot per client runtime, plus a
 ``save_cookies_to_storage`` mode that writes only the deltas relative to
 that snapshot. Cookies the in-process code never touched are left to
 disk; sibling-process writes survive.
@@ -22,20 +22,33 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
-from notebooklm.auth import (
-    AuthTokens,
-    CookieSaveResult,
+import notebooklm._atomic_io as _atomic_io
+import notebooklm._auth.refresh as _auth_refresh
+import notebooklm._auth.storage as _auth_storage
+import notebooklm._runtime.lifecycle as _lifecycle
+from notebooklm._auth.cookie_types import CookieJar
+from notebooklm._auth.profile_store import (
+    CookieMergeDisposition,
+    CookieMergeResult,
+    ProfileStore,
+)
+from notebooklm._auth.storage import (
     CookieSnapshotKey,
     CookieSnapshotValue,
     advance_cookie_snapshot_after_save,
-    build_httpx_cookies_from_storage,
     save_cookies_to_storage,
     snapshot_cookie_jar,
 )
+from notebooklm.auth import (
+    AuthTokens,
+    build_httpx_cookies_from_storage,
+)
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 def _read_cookies(storage_path: Path) -> list[dict]:
@@ -144,14 +157,11 @@ class TestSnapshotCookieJar:
     def test_facade_monkeypatches_propagate_to_storage_helpers(self, monkeypatch):
         """Facade patches still affect helpers moved behind ``_auth.storage``."""
         import notebooklm.auth as auth_mod
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
 
         def fake_cookie_is_http_only(cookie) -> bool:
             return True
 
-        patch_auth_seam(monkeypatch, "_cookie_is_http_only", fake_cookie_is_http_only)
+        monkeypatch.setattr(_auth_storage, "_cookie_is_http_only", fake_cookie_is_http_only)
 
         jar = httpx.Cookies()
         jar.set("SID", "abc", domain=".google.com", path="/")
@@ -165,7 +175,7 @@ class TestSnapshotCookieJar:
 # delta math is sound under each timeline, not that the implementation
 # handles real interleavings under flock — the latter is covered by the
 # ``subprocess.Popen`` test in test_client_keepalive.py
-# (test_save_cookies_to_storage_acquires_file_lock).
+# (the ProfileStore blocking-lock tests below).
 
 
 class TestStaleOverwriteFreshRace:
@@ -385,10 +395,12 @@ class TestSiblingWrittenCookieSurvives:
 
 class TestLegacyCallerCompatibility:
     """External callers that don't pass ``original_snapshot`` still get the
-    legacy full-merge behavior — but emit a ``DeprecationWarning`` so the
+    legacy full-merge behavior — but emit a ``RuntimeWarning`` so the
     silent legacy-fallback hazard surfaces in caller logs. The kwarg is
-    optional purely as a public-API back-compat shim; every in-tree caller
-    passes it.
+    optional purely as a *permanent* public-API back-compat shim (not a
+    scheduled deprecation); every in-tree caller passes it. The warning is a
+    runtime safety advisory about the stale-overwrite-fresh race, hence
+    ``RuntimeWarning`` rather than ``DeprecationWarning`` (#1369).
     """
 
     def test_legacy_call_writes_in_memory_value_and_warns(self, tmp_path):
@@ -399,9 +411,9 @@ class TestLegacyCallerCompatibility:
         jar.set("SID", "new", domain=".google.com", path="/")
 
         # No original_snapshot → legacy mode → in-memory wins on differing
-        # values, AND a DeprecationWarning is emitted to surface the unsafe
+        # values, AND a RuntimeWarning is emitted to surface the unsafe
         # path in caller logs.
-        with pytest.warns(DeprecationWarning, match="original_snapshot"):
+        with pytest.warns(RuntimeWarning, match="original_snapshot"):
             save_cookies_to_storage(jar, storage)
 
         assert _cookie_value(storage, "SID", ".google.com") == "new"
@@ -410,7 +422,7 @@ class TestLegacyCallerCompatibility:
 class TestRefreshAuthOnBoundSessionIsNoOp:
     """``NotebookLMClient.refresh_auth`` does only a homepage GET. For a
     bound (Playwright-minted) session, that GET does NOT rotate
-    ``*PSIDTS`` (per docs/auth-keepalive.md §5.4). With snapshot
+    ``*PSIDTS`` (per docs/auth-cookie-lifecycle.md §5.4). With snapshot
     semantics the resulting save must be a no-op — closing the
     "bound-session refresh broadcasts stale state" reachability path
     listed in #361.
@@ -444,7 +456,7 @@ class TestRefreshAuthOnBoundSessionIsNoOp:
 
         # Bound-session homepage GET: no Set-Cookie header, so no rotation.
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/",
+            url="https://notebook.google.com/",
             content=(
                 b"<html><script>window.WIZ_global_data="
                 b'{"SNlM0e":"new_csrf","FdrFJe":"new_sid"};</script></html>'
@@ -531,7 +543,7 @@ class TestAttributeOnlyRefresh:
 
 
 class TestSnapshotRefreshedAfterSave:
-    """``ClientCore._loaded_cookie_snapshot`` is refreshed after every
+    """``CookiePersistence.loaded_cookie_snapshot`` is refreshed after every
     successful save. Without this, the open-time snapshot stays frozen
     and a second save from the same client re-applies the first save's
     delta — silently clobbering any sibling-process write that landed
@@ -565,7 +577,7 @@ class TestSnapshotRefreshedAfterSave:
         # Two homepage responses — refresh_auth is called twice.
         for _ in range(2):
             httpx_mock.add_response(
-                url="https://notebooklm.google.com/",
+                url="https://notebook.google.com/",
                 content=(
                     b"<html><script>window.WIZ_global_data="
                     b'{"SNlM0e":"csrf","FdrFJe":"sid"};</script></html>'
@@ -575,7 +587,9 @@ class TestSnapshotRefreshedAfterSave:
         client = NotebookLMClient(auth)
         async with client:
             # First save: rotates *PSIDTS in-process to A1, then save propagates.
-            _set_cookie_value(client._core._http_client.cookies, "__Secure-1PSIDTS", "A1")
+            _set_cookie_value(
+                client._collaborators.kernel.get_http_client().cookies, "__Secure-1PSIDTS", "A1"
+            )
             await client.refresh_auth()
             assert _cookie_value(storage, "__Secure-1PSIDTS", ".google.com") == "A1"
 
@@ -690,8 +704,8 @@ class TestSnapshotValueIncludesAttributes:
 class TestSaveReturnsBoolSuccess:
     """``save_cookies_to_storage`` returns ``True`` when the disk now
     reflects the in-memory state (successful write or no-op-because-equal)
-    and ``False`` when an I/O error prevented the write. ``ClientCore``
-    uses this signal to decide whether to advance ``_loaded_cookie_snapshot``;
+    and ``False`` when an I/O error prevented the write. The client runtime
+    uses this signal to decide whether to advance the loaded cookie snapshot;
     a silent disk-write failure must NOT advance the baseline, otherwise
     the failed delta is permanently lost on the next save.
     """
@@ -727,18 +741,21 @@ class TestSaveReturnsBoolSuccess:
         snapshot = snapshot_cookie_jar(jar)
         _set_cookie_value(jar, "SID", "new")
 
-        # Simulate ENOSPC at the temp-file write step.
-        import tempfile
-
-        real_namedtemp = tempfile.NamedTemporaryFile
+        # Simulate ENOSPC at the temp-file write step. Replace the atomic-writer
+        # module's ``tempfile`` binding (``_atomic_io.tempfile``) with a mock that
+        # wraps the real module and overrides only ``NamedTemporaryFile``, so the
+        # patch lands on the exact reference the production code resolves at call
+        # time without mutating the shared stdlib ``tempfile`` module object.
+        real_namedtemp = _atomic_io.tempfile.NamedTemporaryFile
 
         def boom_namedtemp(*args, **kwargs):
             handle = real_namedtemp(*args, **kwargs)
             handle.write = lambda *a, **k: (_ for _ in ()).throw(OSError("simulated ENOSPC"))
             return handle
 
-        monkeypatch.setattr(tempfile, "NamedTemporaryFile", boom_namedtemp)
-        monkeypatch.setattr("notebooklm._atomic_io.tempfile.NamedTemporaryFile", boom_namedtemp)
+        fake_tempfile = MagicMock(wraps=_atomic_io.tempfile)
+        fake_tempfile.NamedTemporaryFile = boom_namedtemp
+        monkeypatch.setattr(_atomic_io, "tempfile", fake_tempfile)
 
         assert save_cookies_to_storage(jar, storage, original_snapshot=snapshot) is False
         # And the original on-disk value must still be intact.
@@ -756,22 +773,22 @@ class TestSaveReturnsBoolSuccess:
         assert save_cookies_to_storage(jar, storage, original_snapshot=snapshot) is False
 
     @pytest.mark.parametrize(
-        "storage_state",
+        ("storage_state", "expected"),
         [
-            pytest.param({"origins": []}, id="missing-cookies"),
-            pytest.param({"cookies": "not-a-list"}, id="cookies-not-list"),
-            pytest.param({"cookies": ["not-a-dict"]}, id="cookie-row-not-dict"),
+            pytest.param({"origins": []}, False, id="missing-cookies"),
+            pytest.param({"cookies": "not-a-list"}, False, id="cookies-not-list"),
+            pytest.param({"cookies": ["not-a-dict"]}, True, id="cookie-row-not-dict"),
         ],
     )
-    def test_returns_false_when_cookies_payload_is_malformed(self, tmp_path, storage_state):
-        """Malformed cookie payloads must fail gracefully before merge logic."""
+    def test_handles_malformed_cookies_payload(self, tmp_path, storage_state, expected):
+        """Invalid schema fails; non-dict rows are retained while merging."""
         storage = tmp_path / "storage_state.json"
         storage.write_text(json.dumps(storage_state), encoding="utf-8")
         jar = httpx.Cookies()
         jar.set("SID", "new", domain=".google.com", path="/")
         snapshot: dict = {}
 
-        assert save_cookies_to_storage(jar, storage, original_snapshot=snapshot) is False
+        assert save_cookies_to_storage(jar, storage, original_snapshot=snapshot) is expected
 
     def test_returns_false_when_file_missing(self, tmp_path):
         """Storage file vanished between snapshot capture and save (e.g. an
@@ -869,23 +886,18 @@ class TestValueUpdateCASGuard:
         assert _cookie_value(storage, "__Secure-1PSIDTS", ".google.com") == "SIBLING"
 
 
-class TestRefreshCmdResnapshot:
+class TestRefreshCmdReplacementBaseline:
     """When ``NOTEBOOKLM_REFRESH_CMD`` runs and wholesale-replaces the
     cookie jar, the pre-fetch snapshot no longer describes the baseline.
-    ``AuthTokens.from_storage`` and ``fetch_tokens_with_domains`` must
-    re-snapshot the jar so the subsequent save computes deltas against the
-    refreshed state, not the stale pre-refresh state. Without this, every
-    rotated cookie would look like a process-local delta and clobber any
-    sibling-process write that landed in the refresh window.
+    ``AuthTokens.from_storage`` and ``fetch_tokens_with_domains`` must retain
+    the paired typed baseline selected by the refresh ladder. Retry rotations
+    remain live-observation deltas instead of being absorbed into that baseline.
     """
 
     @pytest.mark.asyncio
-    async def test_fetch_tokens_with_domains_re_snapshots_after_refresh(
+    async def test_fetch_tokens_with_domains_uses_exact_replacement_baseline(
         self, tmp_path, monkeypatch
     ):
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
         from notebooklm import auth as auth_mod
 
         storage = tmp_path / "storage_state.json"
@@ -897,47 +909,60 @@ class TestRefreshCmdResnapshot:
             ],
         )
 
-        # Stub the token fetch to return refreshed=True and mutate the jar
-        # in place (mirroring _replace_cookie_jar after NOTEBOOKLM_REFRESH_CMD).
-        async def fake_fetch_with_refresh(cookie_jar, storage_path, profile, *, authuser=0):
+        replacement_baseline = None
+
+        async def fake_fetch_with_exact_baseline(cookie_jar, storage_path, profile, **kwargs):
+            nonlocal replacement_baseline
             # Simulate the wholesale jar swap: clear & repopulate with new values.
             cookie_jar.jar.clear()
             cookie_jar.set("SID", "post", domain=".google.com", path="/")
             cookie_jar.set("__Secure-1PSIDTS", "post_refresh", domain=".google.com", path="/")
-            # Return the post-replace snapshot as the 4th element, matching
-            # the real function's contract.
-            return ("csrf", "sid", True, snapshot_cookie_jar(cookie_jar))
+            _write_storage(
+                storage,
+                [
+                    _stored_cookie("SID", "post"),
+                    _stored_cookie("__Secure-1PSIDTS", "post_refresh"),
+                ],
+            )
+            replacement_baseline = CookieJar.from_httpx(cookie_jar)
+            _set_cookie_value(cookie_jar, "__Secure-1PSIDTS", "post_retry_rotation")
+            return "csrf", "sid", replacement_baseline
 
-        patch_auth_seam(monkeypatch, "_fetch_tokens_with_refresh", fake_fetch_with_refresh)
+        monkeypatch.setattr(
+            _auth_refresh,
+            "_fetch_tokens_with_exact_baseline",
+            fake_fetch_with_exact_baseline,
+        )
 
-        captured_snapshots: list = []
-        real_save = auth_mod.save_cookies_to_storage
+        captured: list[tuple[CookieJar, CookieJar]] = []
+        real_merge = ProfileStore.merge_cookie_observation
 
-        def capture_save(jar, path, *, original_snapshot=None, **kwargs):
-            captured_snapshots.append(original_snapshot)
-            return real_save(jar, path, original_snapshot=original_snapshot, **kwargs)
+        def capture_merge(self, observation, *, baseline, recovery_observation=None):
+            captured.append((observation, baseline))
+            return real_merge(
+                self,
+                observation,
+                baseline=baseline,
+                recovery_observation=recovery_observation,
+            )
 
-        patch_auth_seam(monkeypatch, "save_cookies_to_storage", capture_save)
+        monkeypatch.setattr(ProfileStore, "merge_cookie_observation", capture_merge)
 
         await auth_mod.fetch_tokens_with_domains(path=storage)
 
-        assert len(captured_snapshots) == 1
-        snapshot = captured_snapshots[0]
-        # The snapshot passed to save must describe the POST-refresh jar
-        # state (so deltas come out empty/minimal). If the re-snapshot line
-        # is missing, the snapshot would still hold the pre-refresh ``pre``
-        # values and the resulting delta would mass-rewrite disk.
-        key = CookieSnapshotKey("__Secure-1PSIDTS", ".google.com", "/")
-        assert key in snapshot, "snapshot must include the post-refresh PSIDTS key"
-        assert snapshot[key].value == "post_refresh", (
-            f"snapshot must reflect the post-refresh jar state, got {snapshot[key].value!r}"
+        assert len(captured) == 1
+        observation, baseline = captured[0]
+        assert baseline is replacement_baseline
+        assert next(cookie.value for cookie in baseline if cookie.name == "__Secure-1PSIDTS") == (
+            "post_refresh"
         )
+        assert next(
+            cookie.value for cookie in observation if cookie.name == "__Secure-1PSIDTS"
+        ) == ("post_retry_rotation")
+        assert _cookie_value(storage, "__Secure-1PSIDTS", ".google.com") == ("post_retry_rotation")
 
     @pytest.mark.asyncio
     async def test_auth_tokens_from_storage_re_snapshots_after_refresh(self, tmp_path, monkeypatch):
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
         from notebooklm import auth as auth_mod
 
         storage = tmp_path / "storage_state.json"
@@ -949,27 +974,24 @@ class TestRefreshCmdResnapshot:
             ],
         )
 
-        async def fake_fetch_with_refresh(cookie_jar, storage_path, profile, *, authuser=0):
+        async def fake_fetch_with_exact_baseline(
+            cookie_jar, storage_path, profile, *, initial_baseline, **kwargs
+        ):
             cookie_jar.jar.clear()
             cookie_jar.set("SID", "post", domain=".google.com", path="/")
             cookie_jar.set("__Secure-1PSIDTS", "post_refresh", domain=".google.com", path="/")
-            return ("csrf", "sid", True, snapshot_cookie_jar(cookie_jar))
+            return ("csrf", "sid", CookieJar.from_httpx(cookie_jar))
 
-        patch_auth_seam(monkeypatch, "_fetch_tokens_with_refresh", fake_fetch_with_refresh)
+        # ``AuthTokens.from_storage`` lives in ``_auth.tokens`` and resolves the
+        # token fetch through the private owner module.
+        monkeypatch.setattr(
+            _auth_refresh, "_fetch_tokens_with_exact_baseline", fake_fetch_with_exact_baseline
+        )
 
-        captured_snapshots: list = []
-        real_save = auth_mod.save_cookies_to_storage
+        auth = await auth_mod.AuthTokens.from_storage(path=storage)
 
-        def capture_save(jar, path, *, original_snapshot=None, **kwargs):
-            captured_snapshots.append(original_snapshot)
-            return real_save(jar, path, original_snapshot=original_snapshot, **kwargs)
-
-        patch_auth_seam(monkeypatch, "save_cookies_to_storage", capture_save)
-
-        await auth_mod.AuthTokens.from_storage(path=storage)
-
-        assert len(captured_snapshots) == 1
-        snapshot = captured_snapshots[0]
+        assert auth.cookie_snapshot is not None
+        snapshot = auth.cookie_snapshot
         key = CookieSnapshotKey("__Secure-1PSIDTS", ".google.com", "/")
         assert key in snapshot
         assert snapshot[key].value == "post_refresh", (
@@ -1046,18 +1068,15 @@ class TestFlockUnavailableWarning:
         import contextlib as _contextlib
         import logging as _logging
 
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
+        from notebooklm._auth import profile_store as _profile_store
+        from notebooklm._auth.storage_lock import LockState, StorageLockManager
 
-        # Reset the one-shot guard so this test isn't dependent on test order.
-        patch_auth_seam(monkeypatch, "_FLOCK_UNAVAILABLE_WARNED", False)
+        class UnavailableLocks(StorageLockManager):
+            @_contextlib.contextmanager
+            def acquire(self, request):
+                yield LockState.UNAVAILABLE
 
-        @_contextlib.contextmanager
-        def unavailable_lock(lock_path, *, blocking, log_prefix):
-            yield "unavailable"
-
-        patch_auth_seam(monkeypatch, "_file_lock", unavailable_lock)
+        monkeypatch.setattr(_profile_store, "_STORAGE_LOCKS", UnavailableLocks())
 
         storage = tmp_path / "storage_state.json"
         _write_storage(storage, [_stored_cookie("SID", "v", http_only=False)])
@@ -1082,17 +1101,15 @@ class TestFlockUnavailableWarning:
         import contextlib as _contextlib
         import logging as _logging
 
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
+        from notebooklm._auth import profile_store as _profile_store
+        from notebooklm._auth.storage_lock import LockState, StorageLockManager
 
-        patch_auth_seam(monkeypatch, "_FLOCK_UNAVAILABLE_WARNED", False)
+        class UnavailableLocks(StorageLockManager):
+            @_contextlib.contextmanager
+            def acquire(self, request):
+                yield LockState.UNAVAILABLE
 
-        @_contextlib.contextmanager
-        def unavailable_lock(lock_path, *, blocking, log_prefix):
-            yield "unavailable"
-
-        patch_auth_seam(monkeypatch, "_file_lock", unavailable_lock)
+        monkeypatch.setattr(_profile_store, "_STORAGE_LOCKS", UnavailableLocks())
 
         storage = tmp_path / "storage_state.json"
         _write_storage(storage, [_stored_cookie("SID", "v", http_only=False)])
@@ -1114,14 +1131,14 @@ class TestFlockUnavailableWarning:
 
 
 class TestBaselineNotAdvancedOnSaveFailure:
-    """``ClientCore.save_cookies`` only advances ``_loaded_cookie_snapshot``
+    """The lifecycle save path only advances ``loaded_cookie_snapshot``
     when the underlying ``save_cookies_to_storage`` call succeeded. This
     is the load-bearing invariant: on save failure the next save must
     retry the same delta against the original baseline.
     """
 
     @pytest.mark.asyncio
-    async def test_baseline_unchanged_when_save_returns_false(self, tmp_path, monkeypatch):
+    async def test_baseline_unchanged_when_save_returns_false(self, tmp_path):
         from notebooklm.client import NotebookLMClient
 
         storage = tmp_path / "storage_state.json"
@@ -1143,19 +1160,23 @@ class TestBaselineNotAdvancedOnSaveFailure:
             storage_path=storage,
         )
 
-        client = NotebookLMClient(auth)
-
         # Make every save_cookies_to_storage call return False (silent failure).
+        # Phase 2 PR 4: inject the cookie-saver seam directly via
+        # ``NotebookLMClient(..., cookie_saver=…)`` rather than monkeypatching
+        # the legacy ``notebooklm._core.save_cookies_to_storage`` indirection.
         def silent_fail(jar, path, **kwargs):
             return False
 
-        monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", silent_fail)
+        client = NotebookLMClient(auth, cookie_saver=silent_fail)
 
         async with client:
-            baseline_before = client._core._loaded_cookie_snapshot
-            assert client._core._http_client is not None
-            await client._core.save_cookies(client._core._http_client.cookies)
-            baseline_after = client._core._loaded_cookie_snapshot
+            baseline_before = client._collaborators.cookie_persistence.loaded_cookie_snapshot
+            assert client._collaborators.kernel.http_client is not None
+            await client._collaborators.lifecycle.save_cookies(
+                client._collaborators.cookie_persistence,
+                client._collaborators.kernel.get_http_client().cookies,
+            )
+            baseline_after = client._collaborators.cookie_persistence.loaded_cookie_snapshot
 
         assert baseline_after is baseline_before, (
             "save_cookies must NOT advance _loaded_cookie_snapshot when the "
@@ -1167,11 +1188,7 @@ class TestBaselineNotAdvancedOnSaveFailure:
         self, tmp_path, monkeypatch
     ):
         """Pre-client fetch rotations must be retried if their save fails."""
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
         from notebooklm import auth as auth_mod
-        from notebooklm._core import ClientCore
 
         storage = tmp_path / "storage_state.json"
         _write_storage(
@@ -1182,27 +1199,37 @@ class TestBaselineNotAdvancedOnSaveFailure:
             ],
         )
 
-        async def fake_fetch_with_refresh(cookie_jar, storage_path, profile, *, authuser=0):
+        async def fake_fetch_with_exact_baseline(
+            cookie_jar, storage_path, profile, *, initial_baseline, **kwargs
+        ):
             _set_cookie_value(cookie_jar, "__Secure-1PSIDTS", "mutated")
-            return ("csrf", "session", False, None)
+            return ("csrf", "session", initial_baseline)
 
-        def failed_save(jar, path, *, original_snapshot=None, return_result=False):
-            result = CookieSaveResult(False)
-            return result if return_result else result.ok
+        def failed_merge(self, observation, *, baseline, recovery_observation=None):
+            return CookieMergeResult(
+                CookieMergeDisposition.HARD_FAILURE,
+                advances_ordering=False,
+                committed=None,
+            )
 
-        patch_auth_seam(monkeypatch, "_fetch_tokens_with_refresh", fake_fetch_with_refresh)
-        patch_auth_seam(monkeypatch, "save_cookies_to_storage", failed_save)
+        # ``AuthTokens.from_storage`` resolves through the private owner modules.
+        monkeypatch.setattr(
+            _auth_refresh, "_fetch_tokens_with_exact_baseline", fake_fetch_with_exact_baseline
+        )
+        monkeypatch.setattr(ProfileStore, "merge_cookie_observation", failed_merge)
 
         auth = await auth_mod.AuthTokens.from_storage(path=storage)
-        core = ClientCore(auth)
-        await core.open()
+        core = build_client_shell_for_tests(auth)
+        await core.__aenter__()
         try:
             key = CookieSnapshotKey("__Secure-1PSIDTS", ".google.com", "/")
             assert auth.cookie_snapshot is not None
             assert auth.cookie_snapshot[key].value == "old"
-            assert core._loaded_cookie_snapshot is not None
-            assert core._loaded_cookie_snapshot[key].value == "old", (
-                "ClientCore must inherit the pre-fetch baseline so the mutated "
+            assert core._collaborators.cookie_persistence.loaded_cookie_snapshot is not None
+            assert (
+                core._collaborators.cookie_persistence.loaded_cookie_snapshot[key].value == "old"
+            ), (
+                "Client runtime must inherit the pre-fetch baseline so the mutated "
                 "cookie remains a delta after the failed pre-client save"
             )
         finally:
@@ -1244,8 +1271,6 @@ class TestNoTempFileLeakOnWriteFailure:
     """
 
     def test_temp_file_unlinked_when_write_raises(self, tmp_path, monkeypatch):
-        import tempfile
-
         storage = tmp_path / "storage_state.json"
         _write_storage(storage, [_stored_cookie("SID", "old", http_only=False)])
         jar = httpx.Cookies()
@@ -1253,16 +1278,27 @@ class TestNoTempFileLeakOnWriteFailure:
         snapshot = snapshot_cookie_jar(jar)
         _set_cookie_value(jar, "SID", "new")
 
-        real_namedtemp = tempfile.NamedTemporaryFile
+        real_namedtemp = _atomic_io.tempfile.NamedTemporaryFile
 
         def boom_namedtemp(*args, **kwargs):
             handle = real_namedtemp(*args, **kwargs)
             handle.write = lambda *a, **k: (_ for _ in ()).throw(OSError("simulated ENOSPC"))
             return handle
 
-        monkeypatch.setattr("notebooklm._atomic_io.tempfile.NamedTemporaryFile", boom_namedtemp)
+        # Replace the atomic-writer module's ``tempfile`` binding with a mock that
+        # wraps the real module and overrides only ``NamedTemporaryFile`` (object
+        # form), so the failing handle is what the production write path resolves
+        # at call time without mutating the shared stdlib ``tempfile`` module.
+        fake_tempfile = MagicMock(wraps=_atomic_io.tempfile)
+        fake_tempfile.NamedTemporaryFile = boom_namedtemp
+        monkeypatch.setattr(_atomic_io, "tempfile", fake_tempfile)
 
-        save_cookies_to_storage(jar, storage, original_snapshot=snapshot)
+        # The injected write failure must actually fire (returns False); this
+        # guards that the object-form patch lands on the production write path —
+        # without it the write would succeed and silently exercise the no-leak
+        # assertion on a happy path that never created the temp file.
+        result = save_cookies_to_storage(jar, storage, original_snapshot=snapshot)
+        assert result is False
 
         leftover = list(tmp_path.glob(".storage_state.json.*.tmp"))
         assert leftover == [], (
@@ -1331,7 +1367,6 @@ class TestCASRejectReturnsFalse:
     @pytest.mark.asyncio
     async def test_partial_cas_advances_successful_keys_for_next_save(self, tmp_path):
         """A mixed save should not replay successful deltas on later saves."""
-        from notebooklm._core import ClientCore
 
         storage = tmp_path / "storage_state.json"
         _write_storage(
@@ -1350,8 +1385,8 @@ class TestCASRejectReturnsFalse:
             session_id="s",
             storage_path=storage,
         )
-        core = ClientCore(auth)
-        await core.open()
+        core = build_client_shell_for_tests(auth)
+        await core.__aenter__()
 
         def jar_with(sid_value: str) -> httpx.Cookies:
             jar = httpx.Cookies()
@@ -1366,11 +1401,15 @@ class TestCASRejectReturnsFalse:
                     cookie["value"] = "sibling"
             _write_storage(storage, cookies)
 
-            await core.save_cookies(jar_with("sid1"))
+            await core._collaborators.lifecycle.save_cookies(
+                core._collaborators.cookie_persistence, jar_with("sid1")
+            )
             assert _cookie_value(storage, "SID", ".google.com") == "sid1"
             assert _cookie_value(storage, "__Secure-1PSIDTS", ".google.com") == "sibling"
 
-            await core.save_cookies(jar_with("sid2"))
+            await core._collaborators.lifecycle.save_cookies(
+                core._collaborators.cookie_persistence, jar_with("sid2")
+            )
             assert _cookie_value(storage, "SID", ".google.com") == "sid2", (
                 "The successful SID delta from the partial save must advance "
                 "baseline; otherwise the next SID rotation CAS-rejects against "
@@ -1462,8 +1501,8 @@ class TestCASVariantAware:
     ):
         """Composition of variant-aware CAS + variant-aware baseline through real plumbing.
 
-        Wires the full ``AuthTokens.from_storage`` -> ``ClientCore`` ->
-        ``save_cookies`` plumbing rather than driving the helpers directly,
+        Wires the full ``AuthTokens.from_storage`` -> client shell ->
+        lifecycle ``save_cookies`` plumbing rather than driving the helpers directly,
         so this complements the unit-level coverage in
         ``test_rejected_variant_preserves_original_baseline_variant`` and
         ``test_cas_protects_across_leading_dot_variant``.
@@ -1483,17 +1522,12 @@ class TestCASVariantAware:
            dotted delta. ``from_storage`` then runs the real
            ``advance_cookie_snapshot_after_save``, which must preserve the
            bare-host baseline rather than dropping the key.
-        4. A Set-Cookie aligns the in-memory jar to disk (``OSID`` reset to
-           the sibling's value) and a second ``ClientCore.save_cookies``
-           runs. With the variant-aware baseline preserved by step 3, the
-           second save recognizes convergence, advances cleanly, and a later
-           rotation can persist without re-clobbering the sibling write.
+        4. Client open preserves the load-time comparison point (OLD), because
+           the live jar was derived from that state. A Set-Cookie aligns the
+           live dotted variant to disk; convergence and a later rotation then
+           retain the authoritative bare-row identity without re-clobbering.
         """
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
         from notebooklm import auth as auth_mod
-        from notebooklm._core import ClientCore
 
         storage = tmp_path / "storage_state.json"
         _write_storage(
@@ -1505,7 +1539,9 @@ class TestCASVariantAware:
             ],
         )
 
-        async def fake_fetch_with_refresh(cookie_jar, storage_path, profile, *, authuser=0):
+        async def fake_fetch_with_exact_baseline(
+            cookie_jar, storage_path, profile, *, initial_baseline, **kwargs
+        ):
             # Drop the bare-host OSID from the jar and re-key it on the
             # leading-dot variant so the in-memory jar diverges from disk on
             # domain shape — the exact variance the variant-aware CAS lookup
@@ -1518,9 +1554,12 @@ class TestCASVariantAware:
                 if cookie["name"] == "OSID":
                     cookie["value"] = "SIBLING"
             _write_storage(storage_path, cookies)
-            return ("csrf", "session", False, None)
+            return ("csrf", "session", initial_baseline)
 
-        patch_auth_seam(monkeypatch, "_fetch_tokens_with_refresh", fake_fetch_with_refresh)
+        # ``AuthTokens.from_storage`` resolves through the private refresh owner.
+        monkeypatch.setattr(
+            _auth_refresh, "_fetch_tokens_with_exact_baseline", fake_fetch_with_exact_baseline
+        )
 
         # Pre-client save runs through the real save_cookies_to_storage; the
         # CAS rejection must keep SIBLING on disk and the variant-aware
@@ -1547,56 +1586,73 @@ class TestCASVariantAware:
             "absorbed into the new baseline"
         )
 
-        # Stand up the real ClientCore so the second save flows through
-        # ClientCore.save_cookies (lock + to_thread + baseline advance), not
-        # straight into save_cookies_to_storage.
-        core = ClientCore(auth)
-        await core.open()
+        # Stand up the real client runtime so the second save flows through
+        # ClientLifecycle.save_cookies (lock + to_thread + baseline advance),
+        # not straight into save_cookies_to_storage.
+        core = build_client_shell_for_tests(auth)
+        await core.__aenter__()
         try:
-            assert core._loaded_cookie_snapshot is not None
-            assert core._loaded_cookie_snapshot[bare_key].value == "OLD", (
-                "ClientCore.open must inherit the variant-aware preserved "
-                "baseline from AuthTokens.cookie_snapshot"
+            assert core._collaborators.cookie_persistence.loaded_cookie_snapshot is not None
+            assert (
+                core._collaborators.cookie_persistence.loaded_cookie_snapshot[bare_key].value
+                == "OLD"
+            ), (
+                "Direct client open must preserve the load-time baseline from "
+                "which its live jar was derived"
             )
+            assert dotted_key not in (core._collaborators.cookie_persistence.loaded_cookie_snapshot)
 
             # Set-Cookie aligns the in-memory dotted OSID with what disk now
-            # holds. Run the second save through the real ClientCore plumbing.
-            assert core._http_client is not None
-            _set_cookie_value(core._http_client.cookies, "OSID", "SIBLING")
-            await core.save_cookies(core._http_client.cookies)
+            # holds. Run the second save through the real lifecycle plumbing.
+            assert core._collaborators.kernel.http_client is not None
+            _set_cookie_value(
+                core._collaborators.kernel.get_http_client().cookies, "OSID", "SIBLING"
+            )
+            await core._collaborators.lifecycle.save_cookies(
+                core._collaborators.cookie_persistence,
+                core._collaborators.kernel.get_http_client().cookies,
+            )
 
             assert _cookie_value(storage, "OSID", "accounts.google.com") == "SIBLING", (
                 "Second save must not re-clobber the sibling write — the "
                 "variant-aware CAS lookup must still see the disk/baseline "
                 "divergence through the leading-dot variant"
             )
-            assert core._loaded_cookie_snapshot is not None
-            assert core._loaded_cookie_snapshot.get(dotted_key) is not None
-            assert core._loaded_cookie_snapshot[dotted_key].value == "SIBLING", (
+            assert core._collaborators.cookie_persistence.loaded_cookie_snapshot is not None
+            assert (
+                core._collaborators.cookie_persistence.loaded_cookie_snapshot[dotted_key].value
+                == "SIBLING"
+            ), (
                 "After the second save, disk already matches the current "
-                "dotted-variant jar value, so the save must recover from the "
-                "prior CAS rejection and advance baseline to the converged "
-                "value instead of keeping the stale OLD baseline forever"
+                "dotted-variant jar value, so the accepted final live row "
+                "must become the next typed baseline"
             )
+            assert bare_key not in core._collaborators.cookie_persistence.loaded_cookie_snapshot
 
-            _set_cookie_value(core._http_client.cookies, "OSID", "NEXT")
-            await core.save_cookies(core._http_client.cookies)
+            _set_cookie_value(core._collaborators.kernel.get_http_client().cookies, "OSID", "NEXT")
+            await core._collaborators.lifecycle.save_cookies(
+                core._collaborators.cookie_persistence,
+                core._collaborators.kernel.get_http_client().cookies,
+            )
 
             assert _cookie_value(storage, "OSID", "accounts.google.com") == "NEXT", (
                 "After convergence advances the baseline, a later OSID "
                 "rotation must persist through the variant-aware lookup"
             )
-            assert core._loaded_cookie_snapshot is not None
-            assert core._loaded_cookie_snapshot[dotted_key].value == "NEXT", (
-                "The successful follow-up rotation should advance the dotted "
-                "baseline to the value now reflected on disk"
+            assert core._collaborators.cookie_persistence.loaded_cookie_snapshot is not None
+            assert (
+                core._collaborators.cookie_persistence.loaded_cookie_snapshot[dotted_key].value
+                == "NEXT"
+            ), (
+                "The successful follow-up rotation should advance the "
+                "accepted final live-row baseline now reflected on disk"
             )
         finally:
             await core.close()
 
 
 class TestSaveCookiesSeesLatestBaselineUnderContention:
-    """``ClientCore.save_cookies`` captures ``original_snapshot`` on the
+    """``ClientLifecycle.save_cookies`` captures ``original_snapshot`` on the
     loop thread BEFORE the worker thread acquires ``_save_lock``. If two
     saves are issued in rapid succession, the second can capture a stale
     baseline (the first hasn't completed its baseline-advance yet) — and
@@ -1622,7 +1678,6 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
         import asyncio
 
         from notebooklm import auth as auth_mod
-        from notebooklm._core import ClientCore
 
         storage = tmp_path / "storage_state.json"
         _write_storage(
@@ -1642,8 +1697,6 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
             session_id="s",
             storage_path=storage,
         )
-        core = ClientCore(auth)
-        await core.open()
 
         captured_calls: list[tuple[str, dict | None]] = []
         real_save = auth_mod.save_cookies_to_storage
@@ -1660,7 +1713,10 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
             )
             return real_save(jar, path, original_snapshot=original_snapshot, **kwargs)
 
-        monkeypatch.setattr("notebooklm._core.save_cookies_to_storage", capture_save)
+        # Phase 2 PR 4: inject the cookie-saver seam via the constructor
+        # rather than monkeypatching ``notebooklm._core.save_cookies_to_storage``.
+        core = build_client_shell_for_tests(auth, cookie_saver=capture_save)
+        await core.__aenter__()
 
         # Explicit barrier: each coroutine records its submission and the
         # second arrival sets ``both_submitted``; both then ``await`` the
@@ -1683,7 +1739,10 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
             await both_submitted.wait()
             return func(*args, **kwargs)
 
-        monkeypatch.setattr("notebooklm._core.asyncio.to_thread", fake_to_thread)
+        # Patch ``asyncio.to_thread`` as the lifecycle module resolves it
+        # (object form against ``_lifecycle.asyncio``), so the barrier-instrumented
+        # ``fake_to_thread`` is what ``save_cookies`` dispatches the worker through.
+        monkeypatch.setattr(_lifecycle.asyncio, "to_thread", fake_to_thread)
 
         # Two jars representing distinct post-rotation states. The save that
         # acquires ``_save_lock`` first rotates *PSIDTS away from v0; the
@@ -1701,7 +1760,7 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
         # test to depend on. The assertion below uses positional names
         # (first/second by worker execution order, not by gather argument
         # order) to stay robust across schedulers.
-        assert core._http_client is not None
+        assert core._collaborators.kernel.http_client is not None
 
         def _fresh_jar(psidts_value: str) -> httpx.Cookies:
             j = httpx.Cookies()
@@ -1714,11 +1773,22 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
 
         try:
             await asyncio.gather(
-                core.save_cookies(jar_a),
-                core.save_cookies(jar_b),
+                core._collaborators.lifecycle.save_cookies(
+                    core._collaborators.cookie_persistence, jar_a
+                ),
+                core._collaborators.lifecycle.save_cookies(
+                    core._collaborators.cookie_persistence, jar_b
+                ),
             )
         finally:
             await core.close()
+
+        # The barrier-instrumented ``fake_to_thread`` must have dispatched the
+        # two concurrent saves (a third dispatch may follow from close()'s own
+        # save). This proves the object-form patch landed on the lifecycle
+        # module's ``asyncio.to_thread`` seam — otherwise the deterministic
+        # overlap the assertion below relies on never happens.
+        assert len(submitted) >= 2
 
         psidts_key = CookieSnapshotKey("__Secure-1PSIDTS", ".google.com", "/")
         captured_pairs = [
@@ -1738,7 +1808,7 @@ class TestSaveCookiesSeesLatestBaselineUnderContention:
         )
 
 
-class TestRefreshCmdSnapshotCapturedBeforeRetryFetch:
+class TestRefreshCmdBaselineCapturedBeforeRetryFetch:
     """When ``NOTEBOOKLM_REFRESH_CMD`` runs, the post-replace jar is the
     new baseline — NOT the post-retry-fetch jar. The retry call to
     ``_fetch_tokens_with_jar`` can mutate the jar with redirect Set-Cookies,
@@ -1748,9 +1818,6 @@ class TestRefreshCmdSnapshotCapturedBeforeRetryFetch:
 
     @pytest.mark.asyncio
     async def test_retry_fetch_rotations_persist_to_disk(self, tmp_path, monkeypatch):
-        from _fixtures import (
-            patch_auth_seam,  # noqa: PLC0415 — co-local with auth_mod facade migration
-        )
         from notebooklm import auth as auth_mod
 
         storage = tmp_path / "storage_state.json"
@@ -1763,7 +1830,9 @@ class TestRefreshCmdSnapshotCapturedBeforeRetryFetch:
         )
 
         monkeypatch.setenv(auth_mod.NOTEBOOKLM_REFRESH_CMD_ENV, "dummy-refresh")
-        auth_mod._REFRESH_GENERATIONS.clear()
+        # c-PR2: the refresh success epoch relocated from ``_REFRESH_GENERATIONS``
+        # into the single_flight core; reset it for hermetic setup.
+        _auth_refresh._single_flight._reset_for_tests()
 
         async def fake_run_refresh_cmd(storage_path, profile):
             _write_storage(
@@ -1784,14 +1853,14 @@ class TestRefreshCmdSnapshotCapturedBeforeRetryFetch:
             _set_cookie_value(cookie_jar, "__Secure-1PSIDTS", "post_retry_rotation")
             return ("csrf", "sid")
 
-        patch_auth_seam(monkeypatch, "_run_refresh_cmd", fake_run_refresh_cmd)
-        patch_auth_seam(monkeypatch, "_fetch_tokens_with_jar", fake_fetch_tokens_with_jar)
+        monkeypatch.setattr(_auth_refresh, "_run_refresh_cmd", fake_run_refresh_cmd)
+        monkeypatch.setattr(_auth_refresh, "_fetch_tokens_with_jar", fake_fetch_tokens_with_jar)
 
         await auth_mod.fetch_tokens_with_domains(path=storage)
 
         assert fetch_calls == 2
         assert _cookie_value(storage, "__Secure-1PSIDTS", ".google.com") == "post_retry_rotation", (
             "Rotations the retry fetch added to the jar must reach disk — they "
-            "would be dropped if the baseline snapshot is captured after the "
+            "would be dropped if the typed baseline is captured after the "
             "retry instead of after _replace_cookie_jar"
         )

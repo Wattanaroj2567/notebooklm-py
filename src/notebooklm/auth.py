@@ -12,28 +12,23 @@ This module provides authentication utilities for the NotebookLM client:
    authenticated downloads from Google content servers.
 
 Usage:
-    # Recommended: Use AuthTokens.from_storage() for full initialization
-    auth = await AuthTokens.from_storage()
-    async with NotebookLMClient(auth) as client:
+    # Recommended: use the managed storage-backed client lifecycle
+    async with NotebookLMClient.from_storage() as client:
         ...
 
-    # For authenticated downloads
-    cookies = load_httpx_cookies()
-    async with httpx.AsyncClient(cookies=cookies) as client:
-        response = await client.get(url)
+    # For authenticated artifact downloads, use the client's download methods
+    # (e.g. ``await client.artifacts.download_audio(...)``) rather than building
+    # an httpx client by hand.
 
 Security Notes:
     - Storage state files contain sensitive session cookies
-    - Path traversal protection is enforced on all file operations
+    - Profile names are constrained by ``notebooklm.paths`` to prevent
+      profile-directory traversal; explicit storage paths are used as provided
 """
 
-import asyncio
 import logging
-import os
 import subprocess  # noqa: F401  # re-exported for tests that patch ``auth.subprocess.run``
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, TypeAlias
+from typing import TypeAlias
 
 import httpx
 
@@ -41,12 +36,73 @@ from ._auth import account as _auth_account
 from ._auth import cookie_policy as _cookie_policy
 from ._auth import cookies as _auth_cookies
 from ._auth import extraction as _auth_extraction
-from ._auth import headers as _auth_headers
 from ._auth import keepalive as _auth_keepalive
 from ._auth import paths as _auth_paths
+from ._auth import psidts_recovery as _auth_psidts_recovery
 from ._auth import refresh as _auth_refresh
 from ._auth import storage as _auth_storage
-from .paths import get_storage_path
+from ._auth import tokens as _auth_tokens
+
+# Master-token (headless) auth. Re-exported here as the public boundary the CLI
+# consumes (cli/ may not import private ``_auth.*`` modules — see
+# tests/_guardrails/test_cli_boundary.py) and as the documented programmatic
+# headless-auth surface (docs/python-api.md). Blessed in ``__all__`` below.
+#
+# #2103 PR-2 structural follow-up: the CLI invokes whole audited TRANSACTIONS
+# (``master_token_bootstrap`` / ``master_token_remint`` /
+# ``bootstrap_missing_storage_from_master_token`` / ``assert_account_writable``)
+# rather than assembling them from primitives itself. ADR-0034 Phase 11D keeps
+# these v0.x adapters in ``_auth.master_token`` while the concrete transaction
+# owner is ``_auth.master_token_bootstrap.MasterTokenBootstrapper``.
+# ``exchange_master_token`` /
+# ``mint_cookies`` / ``persist_minted_jar`` / ``write_master_token`` /
+# ``generate_android_id`` are de-blessed accordingly (kept importable —
+# ``_AUTH_DEBLESSED_KEEP_IMPORTABLE`` — for the documented low-level recipe and
+# any existing external caller, but no first-party importer remains). Import
+# them from ``notebooklm._auth.master_token`` below for that reason: they stay
+# reachable via ``notebooklm.auth.<name>`` (attribute access, unaffected by
+# ``__all__``) without being re-blessed as this facade's primary surface.
+#
+# ``BootstrapOutcome`` is deliberately NOT re-exported here (auth
+# cross-boundary ledger shrink): its only real first-party importer collapsed
+# it to a bool immediately, so ``bootstrap_missing_storage_from_master_token``
+# below does that collapse inside ``_auth`` instead of publishing the enum
+# across the boundary for one caller that never needed the fine-grained type.
+from ._auth.master_token import (  # noqa: F401
+    MasterTokenError,
+    assert_account_writable,  # noqa: F401
+    bootstrap_missing_storage_from_master_token,
+    exchange_master_token,
+    generate_android_id,
+    mint_cookies,
+    persist_minted_jar,
+    read_master_token,
+    write_master_token,
+)
+from ._auth.master_token import bootstrap_from_oauth_token as master_token_bootstrap  # noqa: F401
+from ._auth.master_token import remint_from_stored_token as master_token_remint  # noqa: F401
+from ._auth.profile_migration import replace_profile_from_login  # noqa: F401
+from ._auth.profile_store import ReplaceResult  # noqa: F401
+
+# v0.x login/import compatibility values remain importable through this facade.
+# First-party app/CLI callers use the native ``replace_profile_from_login`` and
+# ``ReplaceResult`` aliases above; neither alias is part of ``__all__``.
+from ._auth.storage import (  # noqa: F401
+    CLEAR_ACCOUNT,
+    KEEP_ACCOUNT,
+    AccountRecord,
+    LoginWriteOutcome,
+    replace_from_login,
+)
+from ._auth.tokens import AuthTokens
+
+# Public re-export: the fail-closed storage writers (persist_minted_jar /
+# write_account_metadata, reached via this facade) raise LockUnavailableError on
+# a bounded-lock timeout. Canonical home is notebooklm.exceptions; re-exported
+# here so CLI/facade callers can catch it without importing exceptions directly
+# (it is also an OSError via TimeoutError — see ADR-0029).
+from .exceptions import LockUnavailableError  # noqa: F401
+from .paths import get_storage_path  # noqa: F401  # kept as a module-level compat alias
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +145,6 @@ _cookie_snapshot_key_variants = _auth_storage._cookie_snapshot_key_variants
 _stored_cookie_snapshot_key = _auth_storage._stored_cookie_snapshot_key
 _file_lock = _auth_storage._file_lock
 _file_lock_exclusive = _auth_storage._file_lock_exclusive
-_FLOCK_UNAVAILABLE_WARNED = _auth_storage._FLOCK_UNAVAILABLE_WARNED
 
 REQUIRED_COOKIE_DOMAINS = _cookie_policy.REQUIRED_COOKIE_DOMAINS
 OPTIONAL_COOKIE_DOMAINS_BY_LABEL = _cookie_policy.OPTIONAL_COOKIE_DOMAINS_BY_LABEL
@@ -107,326 +162,145 @@ _is_allowed_cookie_domain = _cookie_policy._is_allowed_cookie_domain
 
 
 # Public surface for ``from notebooklm.auth import *`` and for downstream
-# static-analysis tools (mypy, ruff F401 checks). This is the audited set of
-# names externally imported by the package, tests, docs, and the CLI as of
-# 2026-05-17. Underscore-prefixed names remain accessible on the module — some
-# tests reach for them as whitebox affordances — but are intentionally NOT
-# blessed here. See ``tests/unit/test_public_surface.py``: two complementary
-# tests pin this list — ``test_auth_module_has_expected_all`` snapshot-checks
-# the exact ordering, and ``test_auth_all_matches_external_imports_audit``
-# AST-scans ``src/``, ``tests/``, ``docs/`` to fail if a new public name is
-# imported externally without being added here.
+# static-analysis tools (mypy, ruff F401 checks). This list is EXACTLY the
+# ``notebooklm.auth`` surface documented in docs/stability.md — nothing else.
+# Everything else in this module is internal (docs/stability.md: "notebooklm.auth.*
+# — Auth internals").
+#
+# ``__all__`` used to double as the CLI/_app cross-boundary import allowlist: the
+# CLI boundary lint (tests/_guardrails/test_cli_boundary.py) forbids ``cli/`` from
+# importing ``notebooklm._*``, so every helper the CLI needed was reached through
+# this facade — and the external-imports audit then FORCED that name into
+# ``__all__``. "The CLI needs it" silently became "it is public API", and the list
+# grew to 38 names, 32 of which docs/stability.md never promised. Those 32 are
+# de-blessed here (the #1592 mechanism: dropped from ``__all__``, still importable
+# as module attributes, one ``removed-export`` allowance each in
+# scripts/api-compat-allowlist.json) and are now tracked by their own
+# first-party-only list, ``AUTH_CROSS_BOUNDARY_NAMES`` in
+# ``tests/_guardrails/test_public_surface.py``. Adding a name there does NOT
+# publish it. Underscore-prefixed names remain accessible on the module as whitebox
+# test affordances but are intentionally NOT blessed here.
+#
+# See ``tests/_guardrails/test_public_surface.py``:
+# ``test_auth_module_has_expected_all`` snapshot-checks the exact ordering,
+# ``test_auth_all_matches_documented_public_surface`` pins this list to
+# docs/stability.md and the manifest in ``test_public_surface_manifest.py``, and
+# ``test_auth_all_matches_external_imports_audit`` AST-scans ``src/``/``tests/``/
+# ``docs/`` to fail if a name is imported externally from ``notebooklm.auth``
+# without being in ``__all__`` OR ``AUTH_CROSS_BOUNDARY_NAMES``.
 __all__ = [
-    "Account",
-    "advance_cookie_snapshot_after_save",
-    "ALLOWED_COOKIE_DOMAINS",
     "AuthTokens",
-    "authuser_query",
-    "build_cookie_jar",
-    "build_httpx_cookies_from_storage",
-    "clear_account_metadata",
     "convert_rookiepy_cookies_to_storage_state",
-    "CookieSaveResult",
-    "CookieSnapshot",
-    "CookieSnapshotKey",
-    "CookieSnapshotValue",
-    "enumerate_accounts",
-    "extract_cookies_from_storage",
-    "extract_cookies_with_domains",
-    "extract_csrf_from_html",
-    "extract_email_from_html",
-    "extract_session_id_from_html",
-    "extract_wiz_field",
-    "fetch_tokens",
-    "fetch_tokens_with_domains",
-    "format_authuser_value",
-    "get_account_email_for_storage",
-    "get_authuser_for_storage",
-    "GOOGLE_REGIONAL_CCTLDS",
-    "KEEPALIVE_ROTATE_URL",
-    "load_auth_from_storage",
-    "load_httpx_cookies",
-    "MINIMUM_REQUIRED_COOKIES",
-    "normalize_cookie_map",
-    "NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV",
-    "NOTEBOOKLM_REFRESH_CMD_ENV",
-    "NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV",
+    "LockUnavailableError",
     "OPTIONAL_COOKIE_DOMAINS",
     "OPTIONAL_COOKIE_DOMAINS_BY_LABEL",
-    "read_account_metadata",
     "REQUIRED_COOKIE_DOMAINS",
-    "save_cookies_to_storage",
-    "snapshot_cookie_jar",
-    "write_account_metadata",
 ]
 
 
-def _validate_required_cookies(
-    cookie_names: set[str],
-    *,
-    context: str = "",
-    extra_diagnostics: list[str] | None = None,
-) -> None:
-    """Copy-forward shim into ``_cookie_policy`` for legacy patch sites.
-
-    Propagates test-patched policy names (``MINIMUM_REQUIRED_COOKIES``,
-    ``_EXTRACTION_HINT``, ``_has_valid_secondary_binding``) bound on
-    ``auth.py`` into ``_cookie_policy`` before delegating, then mirrors
-    ``_SECONDARY_BINDING_WARNED`` back in the ``finally`` block. Tests that
-    patch ``auth.MINIMUM_REQUIRED_COOKIES`` (or sibling names) continue to
-    work without going through ``patch_auth_seam``; modern tests should
-    prefer the seam helper. The ``_AuthFacadeModule`` write-through was
-    retired in D1 PR-2 (ADR-003).
-    """
-    global _SECONDARY_BINDING_WARNED
-    _cookie_policy.MINIMUM_REQUIRED_COOKIES = MINIMUM_REQUIRED_COOKIES
-    _cookie_policy._EXTRACTION_HINT = _EXTRACTION_HINT
-    _cookie_policy._has_valid_secondary_binding = _has_valid_secondary_binding
-    try:
-        _cookie_policy._validate_required_cookies(
-            cookie_names,
-            context=context,
-            extra_diagnostics=extra_diagnostics,
-        )
-    finally:
-        _SECONDARY_BINDING_WARNED = _cookie_policy._SECONDARY_BINDING_WARNED
-
-
-_auth_cookies._validate_required_cookies = _validate_required_cookies
-
-
-@dataclass
-class AuthTokens:
-    """Authentication tokens for NotebookLM API.
-
-    Attributes:
-        cookies: Required Google auth cookies keyed by ``(name, domain, path)``
-            per RFC 6265 §5.3 (issue #369). Legacy 2-tuple ``(name, domain)``
-            and flat ``name -> value`` shapes are still accepted on
-            construction and widened to the path-aware shape by
-            :func:`normalize_cookie_map` during ``__post_init__``.
-        csrf_token: CSRF token (SNlM0e) extracted from page
-        session_id: Session ID (FdrFJe) extracted from page
-        storage_path: Path to the storage_state.json file, if file-based auth was used
-        cookie_jar: Domain-preserving httpx.Cookies jar. Preferred over flat cookies dict
-            for HTTP operations as it retains original cookie domains (e.g.,
-            .googleusercontent.com vs .google.com).
-        authuser: Google ``authuser`` index this profile authenticates as.
-            ``0`` (the default account) is used when no account metadata is
-            present in ``context.json`` — matching pre-multi-account behavior.
-        account_email: Stable Google account identity for routing. When set,
-            NotebookLM requests use it as the ``authuser`` value instead of the
-            integer index, because Google account indices can change when other
-            accounts sign out.
-        cookie_snapshot: Internal save baseline used when a pre-client token
-            fetch mutates cookies but persistence fails or CAS-rejects. This
-            lets the eventual ClientCore retry the unpersisted delta instead
-            of snapshotting the already-mutated jar as clean state.
-    """
-
-    # Secret fields are excluded from the dataclass-generated ``__repr__`` via
-    # ``field(repr=False)`` and re-surfaced as redacted placeholders by the
-    # custom ``__repr__`` below (P1-1). This prevents accidental secret
-    # leakage through ``logger.debug("%r", auth)``, ``pytest -vv`` failure
-    # diffs, and any third-party tooling that calls ``repr()`` on the dataclass.
-    cookies: DomainCookieMap = field(repr=False)
-    csrf_token: str = field(repr=False)
-    session_id: str = field(repr=False)
-    storage_path: Path | None = None
-    cookie_jar: httpx.Cookies | None = field(default=None, repr=False)
-    authuser: int = 0
-    cookie_snapshot: CookieSnapshot | None = field(default=None, repr=False)
-    account_email: str | None = None
-
-    def __post_init__(self) -> None:
-        """Normalize legacy flat cookie mappings into domain-keyed mappings."""
-        self.cookies = normalize_cookie_map(self.cookies)
-        if self.cookie_jar is None:
-            self.cookie_jar = build_cookie_jar(cookies=self.cookies, storage_path=self.storage_path)
-
-    def __repr__(self) -> str:
-        """Return a redacted representation safe for logs and pytest diffs.
-
-        Cookie values, CSRF + session tokens, the live ``cookie_jar``, and the
-        ``cookie_snapshot`` are all credential-equivalent and never appear
-        verbatim. The cookie count is preserved so reprs remain useful for
-        debugging (e.g. "expected 4 cookies, got 2"). Non-secret identity
-        fields (``authuser``, ``account_email``, ``storage_path``) are kept
-        for the same reason — they help identify *which* profile is involved
-        without leaking *how to impersonate it*.
-        """
-        jar_summary = "<redacted>" if self.cookie_jar is not None else "None"
-        snapshot_summary = "<redacted>" if self.cookie_snapshot is not None else "None"
-        return (
-            "AuthTokens("
-            f"cookies=<{len(self.cookies)} redacted>, "
-            "csrf_token=<redacted>, "
-            "session_id=<redacted>, "
-            f"storage_path={self.storage_path!r}, "
-            f"cookie_jar={jar_summary}, "
-            f"authuser={self.authuser!r}, "
-            f"cookie_snapshot={snapshot_summary}, "
-            f"account_email={self.account_email!r}"
-            ")"
-        )
-
-    @property
-    def cookie_header(self) -> str:
-        """Generate Cookie header value for HTTP requests.
-
-        Returns:
-            Semicolon-separated cookie string (e.g., "SID=abc; HSID=def")
-        """
-        return "; ".join(f"{k}={v}" for k, v in self.flat_cookies.items())
-
-    @property
-    def account_route(self) -> str:
-        """Return the value to send in NotebookLM ``authuser`` routing fields."""
-        return format_authuser_value(self.authuser, self.account_email)
-
-    @property
-    def flat_cookies(self) -> FlatCookieMap:
-        """Return a legacy name→value cookie mapping.
-
-        Duplicate-name resolution follows :func:`_auth_domain_priority` so the
-        result matches what :func:`load_auth_from_storage` produces for the same
-        storage state (see issue #375). Domain-aware HTTP operations should use
-        ``cookie_jar`` or ``cookies`` directly instead.
-        """
-        return flatten_cookie_map(self.cookies)
-
-    @classmethod
-    async def from_storage(
-        cls, path: Path | None = None, profile: str | None = None
-    ) -> "AuthTokens":
-        """Create AuthTokens from Playwright storage state file.
-
-        This is the recommended way to create AuthTokens for programmatic use.
-        It loads cookies from storage and fetches CSRF/session tokens automatically.
-
-        Args:
-            path: Path to storage_state.json. If provided, takes precedence over profile.
-            profile: Profile name to load auth from (e.g., "work", "personal").
-                If None, uses the active profile (from CLI flag, env var, or config).
-
-        Returns:
-            Fully initialized AuthTokens ready for API calls.
-
-        Raises:
-            FileNotFoundError: If storage file doesn't exist
-            ValueError: If required cookies are missing or tokens can't be extracted
-            httpx.HTTPError: If token fetch request fails
-
-        Example:
-            auth = await AuthTokens.from_storage()
-            async with NotebookLMClient(auth) as client:
-                notebooks = await client.list_notebooks()
-
-            # Load from a specific profile
-            auth = await AuthTokens.from_storage(profile="work")
-        """
-        if path is None and (profile is not None or "NOTEBOOKLM_AUTH_JSON" not in os.environ):
-            path = get_storage_path(profile=profile)
-
-        authuser = get_authuser_for_storage(path)
-        account_email = get_account_email_for_storage(path)
-        # Build the cookie jar via the lossless loader so path/secure/httpOnly
-        # survive into the live jar. The earlier
-        # extract_cookies_with_domains -> build_cookie_jar pipeline only carried
-        # (name, domain) -> value and dropped the same attributes the load
-        # paths in #365 fixed.
-        jar = build_httpx_cookies_from_storage(path)
-        # Snapshot before token fetch can rotate cookies; the snapshot/delta
-        # merge in save_cookies_to_storage will then write only what this
-        # process actually rotated, preserving sibling-process state.
-        snapshot = snapshot_cookie_jar(jar)
-        route_kwargs: dict[str, Any] = {"authuser": authuser}
-        if account_email is not None:
-            route_kwargs["account_email"] = account_email
-        csrf_token, session_id, refreshed, post_refresh_snapshot = await _fetch_tokens_with_refresh(
-            jar, path, profile, **route_kwargs
-        )
-
-        # If NOTEBOOKLM_REFRESH_CMD ran, ``_fetch_tokens_with_refresh`` captured
-        # a snapshot immediately after the jar was wholesale-replaced from
-        # disk — before the retry fetch could mutate it with redirect
-        # Set-Cookies. Use that snapshot so the retry's rotations land on
-        # disk as deltas instead of being silently absorbed into the baseline.
-        if refreshed and post_refresh_snapshot is not None:
-            snapshot = post_refresh_snapshot
-
-        # Persist any refreshed cookies from the token fetch. If the save
-        # fails, carry the old baseline into the returned AuthTokens so a
-        # later ClientCore can retry the delta instead of treating the mutated
-        # jar as clean state.
-        # ``save_cookies_to_storage`` performs atomic-replace + fsync + flock
-        # under a synchronous file lock; offload to a worker thread so a
-        # slow filesystem (network FS, encrypted home, fcntl contention)
-        # can't freeze the event loop.
-        post_save_snapshot = snapshot_cookie_jar(jar)
-        save_result = await asyncio.to_thread(
-            save_cookies_to_storage,
-            jar,
-            path,
-            original_snapshot=snapshot,
-            return_result=True,
-        )
-        if isinstance(save_result, CookieSaveResult):
-            if save_result.ok:
-                cookie_snapshot = None
-            elif save_result.cas_rejected_keys:
-                cookie_snapshot = advance_cookie_snapshot_after_save(
-                    snapshot, post_save_snapshot, save_result.cas_rejected_keys
-                )
-            else:
-                cookie_snapshot = snapshot
-        else:
-            cookie_snapshot = None if save_result else snapshot
-        cookies = _cookie_map_from_jar(jar)
-
-        return cls(
-            cookies=cookies,
-            csrf_token=csrf_token,
-            session_id=session_id,
-            storage_path=path,
-            cookie_jar=jar,
-            authuser=authuser,
-            cookie_snapshot=cookie_snapshot,
-            account_email=account_email,
-        )
+# Per ADR-0014, ``_validate_required_cookies`` is a direct re-export of
+# ``_auth.cookie_policy._validate_required_cookies``.
+# The prior write-through that copy-forwarded facade-level rebindings of
+# ``MINIMUM_REQUIRED_COOKIES`` / ``_EXTRACTION_HINT`` /
+# ``_has_valid_secondary_binding`` into ``_cookie_policy`` (and mirrored
+# ``_SECONDARY_BINDING_WARNED`` back) was removed as a behaviour-change
+# masquerading as a refactor. Tests that need to rebind policy names now
+# patch the canonical home in ``_auth.cookie_policy`` directly — see
+# ``tests/unit/test_public_shims.py::test_auth_validation_uses_cookie_policy_rebindings_directly``.
+#
+# There is no reverse-assignment back onto ``_auth.cookies``: that module
+# already imports the canonical validator from ``_cookie_policy`` (see
+# ``_auth/cookies.py:40``), and ``auth._validate_required_cookies`` IS that
+# same object — so any reverse-assignment would be a no-op.
+_validate_required_cookies = _cookie_policy._validate_required_cookies
+_RequiredCookieValidationError = _cookie_policy.RequiredCookieValidationError
+_validate_cookie_shape = _auth_cookies._validate_cookie_shape
+_sanitize_cookie_entry = _auth_cookies._sanitize_cookie_entry
+_sanitized_auth_entries = _auth_cookies._sanitized_auth_entries
+_validate_routable_entries = _auth_cookies._validate_routable_entries
 
 
 # WIZ field token extraction (CSRF, session ID, generic WIZ data) lives in
-# ``notebooklm._auth.extraction``. Re-exported here so the public surface
-# (``notebooklm.auth.extract_csrf_from_html`` etc., listed in ``__all__``) and
-# white-box test affordances (``_safe_url``, ``_build_wiz_field_patterns``)
-# keep resolving against ``notebooklm.auth``.
+# ``notebooklm._auth.extraction``. Re-exported here so ``extract_csrf_from_html``
+# / ``extract_session_id_from_html`` / ``extract_wiz_field`` (de-blessed from
+# ``__all__`` in #1592 but kept importable) and white-box test affordances
+# (``_safe_url``, ``_build_wiz_field_patterns``) keep resolving against
+# ``notebooklm.auth``.
 _build_wiz_field_patterns = _auth_extraction._build_wiz_field_patterns
 _safe_url = _auth_extraction._safe_url
 extract_csrf_from_html = _auth_extraction.extract_csrf_from_html
 extract_session_id_from_html = _auth_extraction.extract_session_id_from_html
 extract_wiz_field = _auth_extraction.extract_wiz_field
 
-# Token-route resolver lives in ``notebooklm._auth.headers``; re-exported so
-# internal callers (``fetch_tokens``, ``fetch_tokens_with_domains`` — now in
-# ``_auth.refresh``) and white-box tests keep resolving the helper against
-# ``notebooklm.auth``.
-_resolve_token_route_kwargs = _auth_headers._resolve_token_route_kwargs
+# Token-route resolver. It used to live in ``notebooklm._auth.headers``; that
+# module was folded into ``_auth.refresh`` (ADR-0033 sanctioned merge) because
+# its sole function's only call sites are the token-fetch entry points there.
+# Still re-exported here so internal callers (``fetch_tokens``,
+# ``fetch_tokens_with_domains``) and white-box tests keep resolving the helper
+# against ``notebooklm.auth``.
+_resolve_token_route_kwargs = _auth_refresh._resolve_token_route_kwargs
 
 
+# ADR-0033 PR 5.2 split ``_auth.account`` along its real seam: the NETWORK
+# identity half (probing ``?authuser=N``, parsing the page email, formatting the
+# wire routing value) stayed in ``_auth.account``; the account RECORD half
+# (reading/writing/promoting/scrubbing the persisted ``{authuser, email}``
+# binding) moved next to the other ``storage_state.json`` readers and writers in
+# ``_auth.storage``. Every facade NAME below is unchanged and every one still
+# resolves to the very same function object — only the module the alias reads it
+# from moved, which is exactly what ``test_public_surface_manifest`` asserts
+# identity on.
 Account = _auth_account.Account
 MAX_AUTHUSER_PROBE = _auth_account.MAX_AUTHUSER_PROBE
-_ACCOUNT_CONTEXT_KEY = _auth_account._ACCOUNT_CONTEXT_KEY
-_account_context_path = _auth_account._account_context_path
+_ACCOUNT_CONTEXT_KEY = _auth_storage._ACCOUNT_CONTEXT_KEY
+# ``_account_context_path`` is no longer aliased here: it survives in
+# ``_auth.storage`` solely as the private site of the legacy-key scrub and the
+# one-shot promotion (whitebox tests patch the canonical home directly).
 extract_email_from_html = _auth_account.extract_email_from_html
+repair_account_metadata_from_playwright_storage = (
+    _auth_account.repair_account_metadata_from_playwright_storage
+)
 _probe_authuser = _auth_account._probe_authuser
-read_account_metadata = _auth_account.read_account_metadata
-get_authuser_for_storage = _auth_account.get_authuser_for_storage
-get_account_email_for_storage = _auth_account.get_account_email_for_storage
+read_account_metadata = _auth_storage.read_account_metadata
+# ``read_account_metadata_from_storage_state``'s only facade importers
+# (cli/auth_runtime.py, _app/auth_check.py) now call ``resolve_account_identity``
+# instead (auth cross-boundary ledger shrink, follow-up to #2103), so it drops
+# out of ``AUTH_CROSS_BOUNDARY_NAMES`` — but the alias below stays: unlike the
+# other names this PR moved to ``_AUTH_DEBLESSED_KEEP_IMPORTABLE``,
+# ``scripts/api-compat-allowlist.json`` explicitly records this one as
+# retained/importable, a promise dropping the alias would silently break
+# (caught in review — PR #2139).
+read_account_metadata_from_storage_state = _auth_storage.read_account_metadata_from_storage_state
+get_authuser_for_storage = _auth_storage.get_authuser_for_storage
+get_account_email_for_storage = _auth_storage.get_account_email_for_storage
+# Both kept importable here for the frozen first-party compatibility manifest
+# (tests/_guardrails/test_public_surface_manifest.py::_AUTH_FIRST_PARTY_COMPATIBILITY_NAMES)
+# even though no cli/_app caller reaches them through the facade anymore — see
+# ``resolve_account_identity`` below and ``_AUTH_DEBLESSED_KEEP_IMPORTABLE`` in
+# test_public_surface.py.
+resolve_account_identity = _auth_storage.resolve_account_identity
 format_authuser_value = _auth_account.format_authuser_value
 authuser_query = _auth_account.authuser_query
-write_account_metadata = _auth_account.write_account_metadata
-clear_account_metadata = _auth_account.clear_account_metadata
+write_account_metadata = _auth_storage.write_account_metadata
+clear_account_metadata = _auth_storage.clear_account_metadata
+# ``write_account_metadata`` / ``clear_account_metadata`` / ``extract_email_from_html``
+# above: their last cli/_app facade importer
+# (``cli/services/playwright_login.py::repair_playwright_account_metadata``)
+# switched to ``repair_account_metadata_from_playwright_storage`` (auth
+# cross-boundary ledger shrink, follow-up to #2103); all three stay importable
+# here for the frozen first-party compatibility manifest
+# (``_AUTH_FIRST_PARTY_COMPATIBILITY_NAMES``) and existing test callers.
+# The legacy sibling ``context.json[account]`` READ path was removed (the reader
+# derives an in-band-shaped record instead of passing the sibling through);
+# ``promote_legacy_account`` in ``_auth.storage`` owns the durable one-shot
+# in-band migration, run off the read path by a detached worker (ADR-0033
+# PR 5.1) and also by the startup layout migration. The legacy-key scrub
+# survives INSIDE ``write_account_metadata`` / ``clear_account_metadata``
+# (privacy: a stale key must not leave the account email at rest), so the CLI
+# login writers no longer call a facade helper after their writes —
+# ``drop_legacy_account_key`` remains importable here for back-compat only
+# (de-blessed; no first-party importer).
+drop_legacy_account_key = _auth_storage._drop_legacy_account_key
 
 
 async def enumerate_accounts(
@@ -440,63 +314,36 @@ async def enumerate_accounts(
     )
 
 
-def load_auth_from_storage(path: Path | None = None) -> dict[str, str]:
-    """Load Google cookies from storage as a flat name→value dict.
-
-    Loads authentication cookies with the following precedence:
-    1. Explicit path argument (from --storage CLI flag)
-    2. NOTEBOOKLM_AUTH_JSON environment variable (inline JSON, no file needed)
-    3. File at $NOTEBOOKLM_HOME/storage_state.json (or ~/.notebooklm/storage_state.json)
-
-    Duplicate-name resolution follows :func:`_auth_domain_priority`, matching
-    :attr:`AuthTokens.flat_cookies` for the same storage state — previously the
-    two paths disagreed on names that live only on non-base hosts (e.g.
-    ``OSID`` on ``myaccount.google.com`` vs ``notebooklm.google.com``). See
-    issue #375.
-
-    Args:
-        path: Path to storage_state.json. If provided, takes precedence over env vars.
-
-    Returns:
-        Dict mapping cookie names to values (e.g., {"SID": "...", "HSID": "..."}).
-
-    Raises:
-        FileNotFoundError: If storage file doesn't exist (when using file-based auth).
-        ValueError: If required cookies (SID) are missing or JSON is malformed.
-
-    Example:
-        # CLI flag takes precedence
-        cookies = load_auth_from_storage(Path("/custom/path.json"))
-
-        # Or use NOTEBOOKLM_AUTH_JSON for CI/CD (no file writes needed)
-        # export NOTEBOOKLM_AUTH_JSON='{"cookies":[...]}'
-        cookies = load_auth_from_storage()
-    """
-    storage_state = _load_storage_state(path)
-    return extract_cookies_from_storage(storage_state)
+# ``load_auth_from_storage`` lives in ``_auth/tokens.py`` (see ADR-0014).
+# Re-exported so ``notebooklm.auth.load_auth_from_storage`` stays importable
+# (de-blessed from ``__all__`` in #1592; first-party callers use ``_auth.tokens``).
+load_auth_from_storage = _auth_tokens.load_auth_from_storage
 
 
-# Env-var name constants live in ``notebooklm._auth.paths``. Re-exported so
-# both the public surface (``NOTEBOOKLM_REFRESH_CMD_ENV``,
-# ``NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV`` — listed in ``__all__``) and the
-# white-box surface (``_REFRESH_ATTEMPTED_ENV``, used by tests) keep resolving
-# against ``notebooklm.auth``.
+# Env-var name constants live in ``notebooklm._auth.paths``. Re-exported so both
+# ``NOTEBOOKLM_REFRESH_CMD_ENV`` / ``NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV``
+# (de-blessed from ``__all__`` in #1592 but kept importable) and the white-box
+# surface (``_REFRESH_ATTEMPTED_ENV``, used by tests) keep resolving against
+# ``notebooklm.auth``.
 NOTEBOOKLM_REFRESH_CMD_ENV = _auth_paths.NOTEBOOKLM_REFRESH_CMD_ENV
 NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV = _auth_paths.NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV
+# Mid-session refresh-cmd rung opt-in + captured-output opt-in (c-PR4). Kept
+# importable via the facade like the other refresh env-var names.
+NOTEBOOKLM_REFRESH_CMD_MIDSESSION_ENV = _auth_paths.NOTEBOOKLM_REFRESH_CMD_MIDSESSION_ENV
+NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT_ENV = _auth_paths.NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT_ENV
 _REFRESH_ATTEMPTED_ENV = _auth_paths._REFRESH_ATTEMPTED_ENV
 
 
 # --- Keepalive poke ----------------------------------------------------------
-# Rotation throttle + ``RotateCookies`` POST bodies live in
-# ``notebooklm._auth.keepalive``. Re-exported here so every name that was
-# previously module-level on ``notebooklm.auth`` (constants, the per-loop /
-# per-profile lock registry, the public ``KEEPALIVE_ROTATE_URL`` listed in
-# ``__all__``, and white-box helpers like ``_poke_session`` /
+# Rotation policy lives in ``_auth.keepalive``; the raw wire lives in
+# ``_auth.mint_service``. This facade re-exports through keepalive so every name formerly
+# module-level on ``notebooklm.auth`` (constants, the per-loop /
+# per-profile lock registry, ``KEEPALIVE_ROTATE_URL`` (de-blessed from ``__all__``
+# in #1592 but kept importable), and white-box helpers like ``_poke_session`` /
 # ``_rotate_cookies``) keeps resolving against this module. Tests that
-# need to substitute a moved body should patch the seam directly via
-# ``tests/_fixtures/auth_seam.py::patch_auth_seam`` — production code no
-# longer mirrors writes (``_AuthFacadeModule`` retired in D1 PR-2,
-# ADR-003).
+# need to substitute policy or its import-time wire binding should patch keepalive;
+# direct ``MintService`` wire substitutions patch ``_auth.mint_service.X``. Production
+# code no longer mirrors writes (``_AuthFacadeModule`` retired per ADR-0003).
 KEEPALIVE_ROTATE_URL = _auth_keepalive.KEEPALIVE_ROTATE_URL
 _KEEPALIVE_ROTATE_HEADERS = _auth_keepalive._KEEPALIVE_ROTATE_HEADERS
 _KEEPALIVE_ROTATE_BODY = _auth_keepalive._KEEPALIVE_ROTATE_BODY
@@ -517,6 +364,30 @@ _file_lock_try_exclusive = _auth_keepalive._file_lock_try_exclusive
 _is_recently_rotated = _auth_keepalive._is_recently_rotated
 _poke_session = _auth_keepalive._poke_session
 _rotate_cookies = _auth_keepalive._rotate_cookies
+# Inline PSIDTS recovery (issue #865). Static facade alias for public-surface
+# symmetry; the load path in ``load_auth_from_storage`` and
+# ``_auth/cookies.build_httpx_cookies_from_storage`` calls
+# ``_auth_psidts_recovery._recover_psidts_inline`` directly, so monkeypatches
+# against ``notebooklm.auth._recover_psidts_inline`` do NOT affect runtime
+# behavior. Tests that need to substitute the recovery body should patch
+# ``notebooklm._auth.psidts_recovery._recover_psidts_inline``.
+_recover_psidts_inline = _auth_psidts_recovery._recover_psidts_inline
+# In-memory variant for the browser-cookies extraction path (issue #990).
+# De-blessed from ``__all__`` in #1592 (kept importable); it has no first-party
+# importer today. Mutates the caller's rookiepy cookie list in place; no file
+# lock / throttle.
+recover_psidts_in_memory = _auth_psidts_recovery.recover_psidts_in_memory
+# Validate-with-recovery convenience: convert + validate rookiepy cookies and
+# transparently retry through ``recover_psidts_in_memory`` on the recoverable
+# PSIDTS-missing case (issue #990). Used by the CLI browser-extraction paths.
+validate_with_recovery = _auth_psidts_recovery.validate_with_recovery
+# Missing-cookies diagnostic hint (issue #990). Inspects which Tier-1/Tier-2
+# cookies are missing and returns a scenario-specific recovery message that
+# the CLI uses in place of the generic "Make sure you are logged in" tail.
+missing_cookies_hint = _cookie_policy.missing_cookies_hint
+# Helper: extract cookie names from a Playwright storage_state. Shared by
+# all three CLI browser-extraction paths to feed ``missing_cookies_hint``.
+cookie_names_from_storage = _cookie_policy.cookie_names_from_storage
 # Rotation sentinel path lives in ``_auth.paths``; the keepalive module also
 # aliases it locally. Re-exported here for white-box callers that resolve it
 # against ``notebooklm.auth``.
@@ -524,27 +395,29 @@ _rotation_lock_path = _auth_paths._rotation_lock_path
 
 
 # --- Refresh-cmd + token-fetch entry points ---------------------------------
-# All refresh coordination and the public ``fetch_tokens`` /
-# ``fetch_tokens_with_domains`` entry points live in
-# ``notebooklm._auth.refresh``. Re-exported so the public surface
-# (``fetch_tokens`` + ``fetch_tokens_with_domains`` listed in ``__all__``) and
-# the white-box surface (lock registries, ContextVar, ``_run_refresh_cmd``
-# carrying the tier-9 E (P1-18) redaction logic, etc.) keep resolving against
+# All refresh coordination and the token-fetch entry points live in
+# ``notebooklm._auth.refresh``. Re-exported so the kept public
+# ``fetch_tokens_with_domains`` / ``fetch_tokens_passive`` entry points,
+# ``fetch_tokens`` (de-blessed from ``__all__`` in #1592 but kept importable),
+# and the white-box surface (lock registries, ContextVar, ``_run_refresh_cmd``
+# carrying the redaction logic, etc.) keep resolving against
 # ``notebooklm.auth``. Tests that need to substitute a moved body should
-# patch the seam directly via
-# ``tests/_fixtures/auth_seam.py::patch_auth_seam`` — production code no
-# longer mirrors writes (``_AuthFacadeModule`` retired in D1 PR-2,
-# ADR-003).
+# patch the canonical home directly (``_auth.refresh.X``) — production
+# code no longer mirrors writes (``_AuthFacadeModule`` retired per ADR-0003).
 _REFRESH_ATTEMPTED_CONTEXT = _auth_refresh._REFRESH_ATTEMPTED_CONTEXT
-_REFRESH_STATE_LOCK = _auth_refresh._REFRESH_STATE_LOCK
-_REFRESH_LOCKS_BY_LOOP = _auth_refresh._REFRESH_LOCKS_BY_LOOP
-_REFRESH_GENERATIONS = _auth_refresh._REFRESH_GENERATIONS
-_REFRESH_INFLIGHT_BY_LOOP = _auth_refresh._REFRESH_INFLIGHT_BY_LOOP
-_REFRESH_INFLIGHT_TASKS = _auth_refresh._REFRESH_INFLIGHT_TASKS
+# The cross-loop coalescing machinery (per-loop future maps + the
+# ``_REFRESH_GENERATIONS`` counter + ``_get_refresh_lock`` /
+# ``_get_inflight_registry`` / ``_REFRESH_STATE_LOCK`` / ``_REFRESH_INFLIGHT_*``)
+# was replaced by ``notebooklm._auth.single_flight`` in c-PR2; the five
+# underscore-private facade test-bindings that mirrored it are removed (they
+# were never part of the supported facade surface). Tests substitute the new
+# behaviour by patching ``_auth.single_flight`` / ``_auth.refresh`` directly.
 _AUTH_ERROR_SIGNALS = _auth_refresh._AUTH_ERROR_SIGNALS
-_get_inflight_registry = _auth_refresh._get_inflight_registry
 _coalesced_run_refresh_cmd = _auth_refresh._coalesced_run_refresh_cmd
-_get_refresh_lock = _auth_refresh._get_refresh_lock
+# L2.5 mid-session refresh-cmd rung adapter (c-PR4). Consumed by
+# ``_auth.session.refresh_auth_session``; exposed here for white-box tests.
+try_refresh_cmd_reauth = _auth_refresh.try_refresh_cmd_reauth
+_midsession_refresh_cmd_enabled = _auth_refresh._midsession_refresh_cmd_enabled
 _should_try_refresh = _auth_refresh._should_try_refresh
 _split_refresh_cmd = _auth_refresh._split_refresh_cmd
 _run_refresh_cmd = _auth_refresh._run_refresh_cmd
@@ -552,3 +425,4 @@ _fetch_tokens_with_refresh = _auth_refresh._fetch_tokens_with_refresh
 _fetch_tokens_with_jar = _auth_refresh._fetch_tokens_with_jar
 fetch_tokens = _auth_refresh.fetch_tokens
 fetch_tokens_with_domains = _auth_refresh.fetch_tokens_with_domains
+fetch_tokens_passive = _auth_refresh.fetch_tokens_passive

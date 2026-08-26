@@ -16,19 +16,15 @@ Note: These tests are automatically skipped if cassettes are not available.
 import csv
 import json
 import os
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
-# Add tests directory to path for vcr_config import
-sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent))
-from conftest import get_vcr_auth, skip_no_cassettes
 from notebooklm import NotebookLMClient, ReportFormat
 from notebooklm.types import Artifact, ArtifactType
-from vcr_config import notebooklm_vcr
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # Skip all tests in this module if cassettes are not available
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
@@ -162,9 +158,9 @@ class TestSourcesAPI:
             guide = await client.sources.get_guide(READONLY_NOTEBOOK_ID, sources[0].id)
         assert guide is not None
         # Verify values are actually populated (catches parsing bugs like issue #70)
-        assert guide["summary"], "Expected non-empty summary from source guide"
-        assert isinstance(guide["keywords"], list)
-        assert len(guide["keywords"]) > 0, "Expected non-empty keywords from source guide"
+        assert guide.summary, "Expected non-empty summary from source guide"
+        assert isinstance(guide.keywords, tuple)
+        assert len(guide.keywords) > 0, "Expected non-empty keywords from source guide"
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -200,7 +196,7 @@ class TestSourcesAPI:
     @pytest.mark.vcr
     @pytest.mark.asyncio
     @notebooklm_vcr.use_cassette("sources_add_url.yaml")
-    async def test_add_url(self):
+    async def test_add_url(self, legacy_vcr_add_url_baseline):
         """Add a URL source."""
         async with vcr_client() as client:
             source = await client.sources.add_url(
@@ -225,14 +221,17 @@ class TestSourcesAPI:
             source = await client.sources.add_drive(
                 MUTABLE_NOTEBOOK_ID,
                 file_id="1oAk_INJHbIPsIh49jgNqj3FESSGHZrzxFY7t05Lvvl0",
-                title="VCR Test Drive Doc",
+                # Pass the doc's actual Drive title so the #1960 honor-title path is a
+                # no-op (add returns this title, so no post-add rename fires — the
+                # cassette records only the ADD_SOURCE call). A DIFFERENT title would
+                # trigger a follow-up rename, covered by the unit tests.
+                title="Rubisco Research: Status and Future",
                 mime_type="application/vnd.google-apps.document",
                 wait=False,  # Don't wait for processing during VCR recording
             )
         assert source is not None
         assert source.id, "Expected non-empty source ID"
-        # Drive sources use the actual document title, not the passed title
-        assert source.title, "Expected non-empty source title"
+        assert source.title == "Rubisco Research: Status and Future"
 
 
 # =============================================================================
@@ -286,6 +285,11 @@ class TestNotesAPI:
                 content="Original content.",
             )
             assert note is not None
+            # v0.8.0 (#1362): update() runs an existence preflight; stub the
+            # just-created note as a hit so the cassette (recorded pre-flip,
+            # without the extra GET_NOTES_AND_MIND_MAPS round-trip) still
+            # replays the create+update interactions only.
+            client.notes.get_or_none = AsyncMock(return_value=note)
             await client.notes.update(
                 MUTABLE_NOTEBOOK_ID,
                 note.id,
@@ -390,6 +394,39 @@ class TestArtifactsListAPI:
             )
             # The .kind property is a str-enum so equality holds both ways.
             assert art.kind == expected_kind.value
+
+    @pytest.mark.vcr
+    @pytest.mark.asyncio
+    @notebooklm_vcr.use_cassette("artifacts_list_slide_decks.yaml")
+    async def test_listing_decodes_recorded_content_metadata(self):
+        """Real rows expose media duration/URLs and visual accessibility text."""
+        async with vcr_client() as client:
+            rows = await client.artifacts._list_raw(READONLY_NOTEBOOK_ID)
+        artifacts = [Artifact.from_api_response(row) for row in rows]
+
+        audio = next(art for art in artifacts if art.kind is ArtifactType.AUDIO)
+        video = next(art for art in artifacts if art.kind is ArtifactType.VIDEO)
+        infographic = next(art for art in artifacts if art.kind is ArtifactType.INFOGRAPHIC)
+        slides = next(art for art in artifacts if art.kind is ArtifactType.SLIDE_DECK)
+        report = next(art for art in artifacts if art.kind is ArtifactType.REPORT)
+
+        assert audio.duration_seconds == 734.0
+        assert {media.type_code for media in audio.media_urls} == {1, 2, 3, 4}
+        assert video.duration_seconds is not None and video.duration_seconds > 400
+        assert {media.type_code for media in video.media_urls} == {1, 2, 3, 4}
+        assert infographic.infographics[0].alt_text
+        assert infographic.infographics[0].text
+        assert len(slides.slides) == 14
+        assert all(slide.alt_text and slide.text for slide in slides.slides)
+        # The VCR response scrubber replaces person-like/title-like values with
+        # SCRUBBED_NAME on some replay paths; either way the raw kind survives.
+        assert report.report_kind in {"Study Guide", "SCRUBBED_NAME"}
+        expected_report_format = (
+            ReportFormat.STUDY_GUIDE if report.report_kind == "Study Guide" else None
+        )
+        assert report.report_format is expected_report_format
+        assert all(art.source_ids for art in artifacts)
+        assert all(art.last_modified_at is not None for art in artifacts)
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -591,10 +628,35 @@ class TestArtifactsGenerateAPI:
     @pytest.mark.asyncio
     @notebooklm_vcr.use_cassette("artifacts_generate_flashcards.yaml")
     async def test_generate_flashcards(self):
-        """Generate flashcards."""
+        """Generate flashcards.
+
+        Note: this tier cannot pin the quantity/difficulty pair. The ``freq``
+        matcher compares request bodies *shape-only* (see ``_shape_only`` in
+        ``tests/vcr_config.py``), so ``[1, 3]``, ``[3, 1]`` and the ``[null,
+        null]`` this cassette actually recorded are indistinguishable to it.
+        The transposition in #2116 was therefore invisible here and would be
+        again — the ordering is pinned by the unit golden payloads in
+        ``tests/unit/test_rpc_golden_payloads.py`` instead.
+        """
         async with vcr_client() as client:
             result = await client.artifacts.generate_flashcards(MUTABLE_NOTEBOOK_ID)
         assert result is not None
+
+    @pytest.mark.vcr
+    @pytest.mark.asyncio
+    @notebooklm_vcr.use_cassette("artifacts_retry_failed.yaml")
+    async def test_retry_failed(self):
+        """Retry a failed artifact in place — the same id comes back re-queued.
+
+        The recorded row carries status code 1 (``ARTIFACT_STATUS_INITIALIZED``),
+        which decodes to ``"pending"`` since #2127 corrected the transposed
+        1/2 codes.
+        """
+        artifact_id = "11111111-2222-3333-4444-555555555555"
+        async with vcr_client() as client:
+            result = await client.artifacts.retry_failed(MUTABLE_NOTEBOOK_ID, artifact_id)
+        assert result.task_id == artifact_id
+        assert result.status == "pending"
 
 
 # =============================================================================
@@ -616,7 +678,7 @@ class TestChatAPI:
         # because most endpoints do not send ``f.req``.
         match_on=["method", "scheme", "host", "port", "path", "freq"],
     )
-    async def test_ask(self):
+    async def test_ask(self, legacy_vcr_follow_up_probe):
         """Ask a question."""
         async with vcr_client() as client:
             result = await client.chat.ask(
@@ -636,7 +698,7 @@ class TestChatAPI:
         # by replay-order. See ``test_ask`` above for the full rationale.
         match_on=["method", "scheme", "host", "port", "path", "freq"],
     )
-    async def test_ask_with_references(self):
+    async def test_ask_with_references(self, legacy_vcr_follow_up_probe):
         """Ask a question that generates references."""
         async with vcr_client() as client:
             result = await client.chat.ask(
@@ -807,8 +869,8 @@ class TestSourcesAdditionalAPI:
             if not url_source:
                 pytest.skip("No WEB_PAGE source available for refresh")
             result = await client.sources.refresh(MUTABLE_NOTEBOOK_ID, url_source.id)
-        # refresh() returns True if initiated successfully (no exception)
-        assert result is True, "refresh() should return True on success"
+        # v0.8.0 (#1290): refresh() returns None on success (no exception)
+        assert result is None, "refresh() should return None on success"
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -844,7 +906,7 @@ class TestSourcesAdditionalAPI:
             assert source is not None
             # Delete it
             result = await client.sources.delete(MUTABLE_NOTEBOOK_ID, source.id)
-        assert result is True
+        assert result is None
 
 
 # =============================================================================
@@ -878,7 +940,7 @@ class TestNotebooksAdditionalAPI:
             assert notebook is not None
             # Delete it
             result = await client.notebooks.delete(notebook.id)
-        assert result is True
+        assert result is None
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -914,7 +976,7 @@ class TestNotesAdditionalAPI:
             assert note is not None
             # Delete it
             result = await client.notes.delete(MUTABLE_NOTEBOOK_ID, note.id)
-        assert result is True
+        assert result is None
 
 
 # =============================================================================
@@ -937,10 +999,18 @@ class TestArtifactsAdditionalAPI:
                 pytest.skip("No artifacts available")
             artifact = artifacts[0]
             original_title = artifact.title
-            # Rename
-            await client.artifacts.rename(MUTABLE_NOTEBOOK_ID, artifact.id, "VCR Renamed Artifact")
-            # Restore original name
-            await client.artifacts.rename(MUTABLE_NOTEBOOK_ID, artifact.id, original_title)
+            # v0.8.0 (#1362): return_object=False now runs the existence
+            # preflight too. Stub it as a hit (the artifact came from the list
+            # above, so it exists) so no extra LIST_ARTIFACTS round-trip fires
+            # and the existing cassette (rename RPC only) keeps replaying.
+            client.artifacts._listing.get_studio_only = AsyncMock(return_value=artifact)
+            # Rename, then restore the original name.
+            await client.artifacts.rename(
+                MUTABLE_NOTEBOOK_ID, artifact.id, "VCR Renamed Artifact", return_object=False
+            )
+            await client.artifacts.rename(
+                MUTABLE_NOTEBOOK_ID, artifact.id, original_title, return_object=False
+            )
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -955,7 +1025,7 @@ class TestArtifactsAdditionalAPI:
             # Delete the first one
             artifact_id = artifacts[0].id
             deleted = await client.artifacts.delete(MUTABLE_NOTEBOOK_ID, artifact_id)
-        assert deleted is True
+        assert deleted is None
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -997,8 +1067,8 @@ class TestResearchAPI:
                 mode="fast",
             )
         assert result is not None
-        assert "task_id" in result
-        assert result["mode"] == "fast"
+        assert result.task_id
+        assert result.mode == "fast"
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -1007,16 +1077,22 @@ class TestResearchAPI:
         """Poll research status."""
         async with vcr_client() as client:
             # Start research first
-            await client.research.start(
+            start_result = await client.research.start(
                 MUTABLE_NOTEBOOK_ID,
                 query="Machine learning fundamentals",
                 source="web",
                 mode="fast",
             )
+            if not start_result or not start_result.task_id:
+                pytest.skip("Could not start research")
+
             # Poll for results
-            result = await client.research.poll(MUTABLE_NOTEBOOK_ID)
+            result = await client.research.poll(
+                MUTABLE_NOTEBOOK_ID,
+                task_id=start_result.task_id,
+            )
         assert result is not None
-        assert "status" in result
+        assert result.status
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
@@ -1031,19 +1107,22 @@ class TestResearchAPI:
                 source="web",
                 mode="fast",
             )
-            if not start_result:
+            if not start_result or not start_result.task_id:
                 pytest.skip("Could not start research")
 
             # Poll until we have sources (with timeout via cassette)
-            poll_result = await client.research.poll(MUTABLE_NOTEBOOK_ID)
-            if not poll_result.get("sources"):
+            poll_result = await client.research.poll(
+                MUTABLE_NOTEBOOK_ID,
+                task_id=start_result.task_id,
+            )
+            if not poll_result.sources:
                 pytest.skip("No research sources found")
 
             # Import first source
             imported = await client.research.import_sources(
                 MUTABLE_NOTEBOOK_ID,
-                start_result["task_id"],
-                poll_result["sources"][:1],
+                start_result.task_id,
+                poll_result.sources[:1],
             )
         assert isinstance(imported, list)
 
@@ -1060,5 +1139,5 @@ class TestResearchAPI:
                 mode="deep",
             )
         assert result is not None
-        assert "task_id" in result
-        assert result["mode"] == "deep"
+        assert result.task_id
+        assert result.mode == "deep"

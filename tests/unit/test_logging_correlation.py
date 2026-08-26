@@ -17,6 +17,7 @@ from notebooklm._logging import (
     reset_request_id,
     set_request_id,
 )
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 @pytest.fixture(autouse=True)
@@ -233,9 +234,9 @@ async def test_correlation_threads_through_child_loggers():
 
 @pytest.mark.asyncio
 async def test_retry_inherits_parent_request_id():
-    """Recursive rpc_call(_is_retry=True) must NOT mint a fresh id — the
+    """Recursive executor.rpc_call(_is_retry=True) must NOT mint a fresh id — the
     failure→refresh→retry sequence should appear under one prefix."""
-    from notebooklm._core import ClientCore
+    from notebooklm.auth import AuthTokens
 
     captured_ids: list[str | None] = []
 
@@ -245,29 +246,47 @@ async def test_retry_inherits_parent_request_id():
         source_path,
         allow_null,
         is_retry,
-        rate_limit_retries=0,
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        read_timeout: float | None = None,
+        raise_on_null_status: bool = False,
+        _refresh_budget=None,
+        _retry_deadline=None,
     ):
         captured_ids.append(get_request_id())
         # First call: raise to trigger retry path; second call: succeed.
         if not is_retry:
-            # Mimic recursive retry: outer rpc_call would call _try_refresh
-            # which calls rpc_call(_is_retry=True). Use our own ClientCore
-            # instance's rpc_call directly.
-            return await core.rpc_call(method, params, source_path, allow_null, _is_retry=True)
+            # Mimic decode-time retry without leaving the executor.
+            return await executor.rpc_call(
+                method,
+                params,
+                source_path,
+                allow_null,
+                _is_retry=True,
+            )
         return "ok"
 
-    core = ClientCore.__new__(ClientCore)
-    core._http_client = object()  # not-None; rpc_call doesn't dereference here
-    core._rpc_call_impl = fake_impl  # type: ignore[method-assign]
+    # Real NotebookLMClient shell — the executor's open-client guard
+    # requires a truthy http_client, so we ``open()`` and let the lifecycle
+    # construct one against the default httpx transport. ``fake_impl`` is
+    # monkeypatched onto ``_execute_once`` so no actual HTTP call fires;
+    # the test exercises the request-id propagation through the executor
+    # wrapper purely in-process.
+    auth = AuthTokens(cookies={"SID": "test_sid"}, csrf_token="csrf", session_id="sid")
+    core = build_client_shell_for_tests(auth)
+    await core.__aenter__()
+    try:
+        executor = core._rpc_executor
+        executor._execute_once = fake_impl  # type: ignore[method-assign]
 
-    result = await core.rpc_call(method=object(), params=[])  # type: ignore[arg-type]
-    assert result == "ok"
-    assert len(captured_ids) == 2
-    assert captured_ids[0] == captured_ids[1]
-    assert captured_ids[0] is not None
+        result = await core._rpc_executor.rpc_call(method=object(), params=[])  # type: ignore[arg-type]
+        assert result == "ok"
+        assert len(captured_ids) == 2
+        assert captured_ids[0] == captured_ids[1]
+        assert captured_ids[0] is not None
+    finally:
+        await core.close()
 
 
 def test_end_to_end_prefix_visible_in_rendered_output():

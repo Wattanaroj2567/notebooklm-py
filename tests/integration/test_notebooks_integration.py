@@ -12,6 +12,7 @@ import pytest
 from pytest_httpx import HTTPXMock
 
 from notebooklm import Notebook, NotebookLMClient
+from notebooklm.exceptions import UnknownRPCMethodError
 from notebooklm.rpc import RPCError, RPCMethod
 
 pytestmark = pytest.mark.allow_no_vcr
@@ -267,7 +268,7 @@ class TestDeleteNotebook:
         async with NotebookLMClient(auth_tokens) as client:
             result = await client.notebooks.delete("nb_123")
 
-        assert result is True
+        assert result is None
 
 
 class TestSummary:
@@ -361,26 +362,16 @@ class TestNotebooksAPIAdditional:
     """Additional integration tests for NotebooksAPI."""
 
     @pytest.mark.asyncio
-    async def test_share_notebook(
-        self,
-        auth_tokens,
-        httpx_mock: HTTPXMock,
-        build_rpc_response,
-    ):
-        """Test sharing a notebook."""
-        response = build_rpc_response(
-            RPCMethod.SHARE_ARTIFACT,
-            None,  # Share returns null, we build the URL
-        )
-        httpx_mock.add_response(content=response.encode())
+    async def test_share_method_removed(self, auth_tokens):
+        """NotebooksAPI.share() was removed in v0.8.0 (#1363).
 
+        Callers must use ``client.sharing.set_public`` for the public-sharing
+        toggle and ``client.notebooks.get_share_url`` for the deep-link URL.
+        """
         async with NotebookLMClient(auth_tokens) as client:
-            result = await client.notebooks.share("nb_123", public=True)
-
-        assert result["public"] is True
-        assert "nb_123" in result["url"]
-        request = httpx_mock.get_request()
-        assert RPCMethod.SHARE_ARTIFACT.value in str(request.url)
+            assert not hasattr(client.notebooks, "share")
+            with pytest.raises(AttributeError):
+                await client.notebooks.share("nb_123", public=True)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_get_summary_additional(
@@ -522,7 +513,7 @@ class TestGetNotebookFailures:
         httpx_mock.add_response(content=raw)
 
         async with NotebookLMClient(auth_tokens) as client:
-            with pytest.raises(RPCError, match="returned null result data"):
+            with pytest.raises(RPCError, match="empty result"):
                 await client.notebooks.get("nb_123")
 
     @pytest.mark.asyncio
@@ -538,7 +529,7 @@ class TestGetNotebookFailures:
         httpx_mock.add_response(content=raw)
 
         async with NotebookLMClient(auth_tokens) as client:
-            with pytest.raises(RPCError, match="returned null result data"):
+            with pytest.raises(RPCError, match="empty result"):
                 await client.notebooks.get("nb_123")
 
 
@@ -578,20 +569,60 @@ class TestNotebookEdgeCases:
         assert notebooks == []
 
     @pytest.mark.asyncio
-    async def test_get_summary_empty(
+    async def test_get_summary_empty_response_returns_empty(
         self,
         auth_tokens,
         httpx_mock: HTTPXMock,
         build_rpc_response,
     ):
-        """Test getting summary when empty."""
-        response = build_rpc_response(RPCMethod.SUMMARIZE, [])
-        httpx_mock.add_response(content=response.encode())
+        """A summary-less SUMMARIZE response returns "" rather than drifting.
 
-        async with NotebookLMClient(auth_tokens) as client:
-            result = await client.notebooks.get_summary("nb_123")
+        Regression for #1485: a brand-new, source-less notebook has no summary
+        yet, so the server returns an empty/absent result[0] payload. That
+        routine "no summary yet" state must surface as "" instead of being
+        mis-classified as wire-schema drift. Strict-mode unit coverage lives in
+        ``tests/unit/test_get_summary_drift.py``.
+        """
+        # ``[]`` (no outer[0] slot), ``[None]`` (result[0] is None), and ``[[]]``
+        # (result[0] is an empty list — no summary slot) are all legitimate
+        # summary-less payloads. ``[[None]]`` (summary slot explicitly null) is
+        # the same routine absence, now consistent between get_summary and
+        # get_description after delegating to _extract_summary (#1485).
+        for data in ([], [None], [[]], [[None]]):
+            response = build_rpc_response(RPCMethod.SUMMARIZE, data)
+            httpx_mock.add_response(content=response.encode())
 
-        assert result == ""
+            async with NotebookLMClient(auth_tokens) as client:
+                assert await client.notebooks.get_summary("nb_123") == ""
+
+    @pytest.mark.asyncio
+    async def test_get_summary_malformed_response_raises(
+        self,
+        auth_tokens,
+        httpx_mock: HTTPXMock,
+        build_rpc_response,
+    ):
+        """A present-but-malformed SUMMARIZE payload still drifts and raises.
+
+        Distinct from the routinely-absent summary slot (#1485): when result[0]
+        is present (non-None) but cannot be descended to the summary value, that
+        is genuine schema drift and must surface as ``UnknownRPCMethodError``
+        under strict decoding (the only mode; the ``NOTEBOOKLM_STRICT_DECODE=0``
+        soft-mode opt-out was retired in v0.7.0). This guards against
+        over-suppressing real drift while fixing the empty-summary case — in
+        particular a scalar ``result[0]`` must raise, not collapse to "".
+        """
+        # Each payload has a present, non-None result[0] that cannot be descended
+        # to result[0][0][0]: a non-empty-but-malformed inner list, and a bare
+        # scalar (the #1485 codex over-suppression case). Contrast with [] /
+        # [None] / [[]] which are routine absence and return "" above.
+        for data in ([[[]]], [[42]], [123]):
+            response = build_rpc_response(RPCMethod.SUMMARIZE, data)
+            httpx_mock.add_response(content=response.encode())
+
+            async with NotebookLMClient(auth_tokens) as client:
+                with pytest.raises(UnknownRPCMethodError):
+                    await client.notebooks.get_summary("nb_123")
 
     @pytest.mark.asyncio
     async def test_get_description_empty_topics(
@@ -715,42 +746,13 @@ class TestDescribeEdgeCases:
 
 
 class TestShareEdgeCases:
-    """Tests for share() and get_share_url() branch edge cases."""
+    """Tests for get_share_url() branch edge cases.
 
-    @pytest.mark.asyncio
-    async def test_share_with_artifact_id(
-        self,
-        auth_tokens,
-        httpx_mock: HTTPXMock,
-        build_rpc_response,
-    ):
-        """Line 260: share() public=True with artifact_id builds deep-link URL."""
-        response = build_rpc_response(RPCMethod.SHARE_ARTIFACT, None)
-        httpx_mock.add_response(content=response.encode())
-
-        async with NotebookLMClient(auth_tokens) as client:
-            result = await client.notebooks.share("nb_123", public=True, artifact_id="art_456")
-
-        assert result["public"] is True
-        assert result["url"] == "https://notebooklm.google.com/notebook/nb_123?artifactId=art_456"
-        assert result["artifact_id"] == "art_456"
-
-    @pytest.mark.asyncio
-    async def test_share_public_false_returns_none_url(
-        self,
-        auth_tokens,
-        httpx_mock: HTTPXMock,
-        build_rpc_response,
-    ):
-        """Line 264: share() public=False sets url to None."""
-        response = build_rpc_response(RPCMethod.SHARE_ARTIFACT, None)
-        httpx_mock.add_response(content=response.encode())
-
-        async with NotebookLMClient(auth_tokens) as client:
-            result = await client.notebooks.share("nb_123", public=False)
-
-        assert result["public"] is False
-        assert result["url"] is None
+    ``share()`` was removed in v0.8.0 (#1363); its deep-link URL building and the
+    public=False url-is-None behavior are covered by ``ShareManager`` unit tests
+    and the ``get_share_url`` cases below. Use ``client.sharing.set_public`` for
+    the public-sharing toggle.
+    """
 
     @pytest.mark.asyncio
     async def test_get_share_url_without_artifact(
@@ -762,7 +764,7 @@ class TestShareEdgeCases:
         async with NotebookLMClient(auth_tokens) as client:
             url = client.notebooks.get_share_url("nb_123")
 
-        assert url == "https://notebooklm.google.com/notebook/nb_123"
+        assert url == "https://notebook.google.com/notebook/nb_123"
 
     @pytest.mark.asyncio
     async def test_get_share_url_with_artifact(
@@ -774,4 +776,4 @@ class TestShareEdgeCases:
         async with NotebookLMClient(auth_tokens) as client:
             url = client.notebooks.get_share_url("nb_123", artifact_id="art_789")
 
-        assert url == "https://notebooklm.google.com/notebook/nb_123?artifactId=art_789"
+        assert url == "https://notebook.google.com/notebook/nb_123?artifactId=art_789"
