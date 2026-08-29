@@ -607,9 +607,7 @@ class TestAuthStatus:
         assert logging.getLogger("notebooklm.rpc.decoder").filter(record) is not False
 
     @pytest.mark.asyncio
-    async def test_check_auth_status_reports_live_auth_failure_authoritatively(
-        self, monkeypatch
-    ):
+    async def test_check_auth_status_reports_live_auth_failure_authoritatively(self, monkeypatch):
         import notebooklm.mcp_server as srv
 
         health = {
