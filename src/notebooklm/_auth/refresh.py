@@ -437,14 +437,10 @@ def _split_refresh_cmd(cmd: str) -> list[str]:
     import ctypes
     from ctypes import wintypes
 
-    windll = getattr(ctypes, "windll", None)
-    if windll is None:
-        return shlex.split(cmd)
-
-    CommandLineToArgvW = windll.shell32.CommandLineToArgvW
+    CommandLineToArgvW = ctypes.windll.shell32.CommandLineToArgvW  # type: ignore[attr-defined]
     CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
     CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
-    LocalFree = windll.kernel32.LocalFree
+    LocalFree = ctypes.windll.kernel32.LocalFree  # type: ignore[attr-defined]
     LocalFree.argtypes = [wintypes.HLOCAL]
     LocalFree.restype = wintypes.HLOCAL
 

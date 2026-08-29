@@ -162,6 +162,12 @@ ALLOWLIST: tuple[_AllowlistEntry, ...] = (
         "Lifespan-local lock created and discarded within one FastAPI event "
         "loop; it is never retained by the reusable app across lifespan runs.",
     ),
+    _AllowlistEntry(
+        "src/notebooklm/mcp_server.py",
+        None,
+        "Lifespan-local lock created and discarded within one FastAPI/MCP event "
+        "loop; it is never retained across event loops.",
+    ),
 )
 
 _ALLOWLIST_BY_KEY = {entry.key: entry for entry in ALLOWLIST}

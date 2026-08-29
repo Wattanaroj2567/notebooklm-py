@@ -10,7 +10,7 @@ Tests cover:
 """
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -410,7 +410,7 @@ class TestToolSchemas:
 
 class TestGetClient:
     @pytest.mark.asyncio
-    async def test_get_client_raises_runtime_error_on_failure(self):
+    async def test_get_client_raises_runtime_error_on_failure(self, monkeypatch):
         import notebooklm.mcp_server as srv
 
         original = srv._client
@@ -418,20 +418,21 @@ class TestGetClient:
         srv._client = None
         srv._client_storage_signature = None
         try:
-            with (
-                patch(
-                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
-                    side_effect=FileNotFoundError("no credentials"),
-                ),
-                pytest.raises(RuntimeError, match="NotebookLM client not ready"),
-            ):
+            monkeypatch.setattr(
+                srv.NotebookLMClient,
+                "from_storage",
+                AsyncMock(side_effect=FileNotFoundError("no credentials")),
+            )
+            with pytest.raises(RuntimeError, match="NotebookLM client not ready"):
                 await srv.get_client()
         finally:
             srv._client = original
             srv._client_storage_signature = original_signature
 
     @pytest.mark.asyncio
-    async def test_get_client_sanitizes_google_redirect_url_on_auth_failure(self, caplog):
+    async def test_get_client_sanitizes_google_redirect_url_on_auth_failure(
+        self, caplog, monkeypatch
+    ):
         import notebooklm.mcp_server as srv
 
         original = srv._client
@@ -440,16 +441,17 @@ class TestGetClient:
         srv._client_storage_signature = None
         caplog.set_level("ERROR", logger="notebooklm-mcp")
         try:
-            with (
-                patch(
-                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
+            monkeypatch.setattr(
+                srv.NotebookLMClient,
+                "from_storage",
+                AsyncMock(
                     side_effect=RuntimeError(
                         "Authentication expired or invalid. Redirected to: "
                         "https://accounts.google.com/v3/signin/accountchooser?continue=..."
-                    ),
+                    )
                 ),
-                pytest.raises(RuntimeError) as exc_info,
-            ):
+            )
+            with pytest.raises(RuntimeError) as exc_info:
                 await srv.get_client()
 
             message = str(exc_info.value)
@@ -464,7 +466,7 @@ class TestGetClient:
             srv._client_storage_signature = original_signature
 
     @pytest.mark.asyncio
-    async def test_get_client_returns_same_instance_on_second_call(self):
+    async def test_get_client_returns_same_instance_on_second_call(self, monkeypatch):
         import notebooklm.mcp_server as srv
 
         mock_client = _make_mock_client()
@@ -475,22 +477,21 @@ class TestGetClient:
         srv._client = None
         srv._client_storage_signature = None
         try:
-            with (
-                patch("notebooklm.mcp_server._storage_state_signature", return_value=None),
-                patch(
-                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
-                    new=AsyncMock(return_value=mock_client),
-                ),
-            ):
-                c1 = await srv.get_client()
-                c2 = await srv.get_client()
-                assert c1 is c2
+            monkeypatch.setattr(srv, "_storage_state_signature", lambda: None)
+            monkeypatch.setattr(
+                srv.NotebookLMClient,
+                "from_storage",
+                AsyncMock(return_value=mock_client),
+            )
+            c1 = await srv.get_client()
+            c2 = await srv.get_client()
+            assert c1 is c2
         finally:
             srv._client = original
             srv._client_storage_signature = original_signature
 
     @pytest.mark.asyncio
-    async def test_get_client_reloads_when_storage_state_changes(self):
+    async def test_get_client_reloads_when_storage_state_changes(self, monkeypatch):
         import notebooklm.mcp_server as srv
 
         first_client = _make_mock_client()
@@ -505,23 +506,22 @@ class TestGetClient:
         srv._client_storage_signature = None
         try:
             from_storage = AsyncMock(side_effect=[first_client, second_client])
-            with (
-                patch(
-                    "notebooklm.mcp_server._storage_state_signature",
-                    side_effect=[
-                        ("storage.json", 1, 100),
-                        ("storage.json", 1, 100),
-                        ("storage.json", 2, 100),
-                    ],
-                ),
-                patch(
-                    "notebooklm.mcp_server.NotebookLMClient.from_storage",
-                    new=from_storage,
-                ),
-            ):
-                c1 = await srv.get_client()
-                c2 = await srv.get_client()
-                c3 = await srv.get_client()
+            sigs = iter(
+                [
+                    ("storage.json", 1, 100),
+                    ("storage.json", 1, 100),
+                    ("storage.json", 2, 100),
+                ]
+            )
+            monkeypatch.setattr(srv, "_storage_state_signature", lambda: next(sigs))
+            monkeypatch.setattr(
+                srv.NotebookLMClient,
+                "from_storage",
+                from_storage,
+            )
+            c1 = await srv.get_client()
+            c2 = await srv.get_client()
+            c3 = await srv.get_client()
 
         finally:
             srv._client = original
@@ -607,7 +607,9 @@ class TestAuthStatus:
         assert logging.getLogger("notebooklm.rpc.decoder").filter(record) is not False
 
     @pytest.mark.asyncio
-    async def test_check_auth_status_reports_live_auth_failure_authoritatively(self):
+    async def test_check_auth_status_reports_live_auth_failure_authoritatively(
+        self, monkeypatch
+    ):
         import notebooklm.mcp_server as srv
 
         health = {
@@ -620,17 +622,18 @@ class TestAuthStatus:
             "message": "Auth cookies look healthy.",
         }
 
-        with (
-            patch("notebooklm.mcp_server._check_auth_health", return_value=health),
-            patch(
-                "notebooklm.mcp_server.get_client",
+        monkeypatch.setattr(srv, "_check_auth_health", lambda: health)
+        monkeypatch.setattr(
+            srv,
+            "get_client",
+            AsyncMock(
                 side_effect=RuntimeError(
                     "Authentication expired or invalid. Redirected to: "
                     "https://accounts.google.com/v3/signin/accountchooser"
-                ),
+                )
             ),
-        ):
-            result = await srv.check_auth_status(deep=True)
+        )
+        result = await srv.check_auth_status(deep=True)
 
         assert result["file_check"] == "ok"
         assert result["status"] == "expired"
@@ -658,11 +661,12 @@ class TestAuthStatus:
             },
         )
 
-        with patch(
-            "notebooklm.mcp_server.get_client",
-            side_effect=RuntimeError("NotebookLM client not ready"),
-        ):
-            result = await srv.check_mcp_readiness()
+        monkeypatch.setattr(
+            srv,
+            "get_client",
+            AsyncMock(side_effect=RuntimeError("NotebookLM client not ready")),
+        )
+        result = await srv.check_mcp_readiness()
 
         assert result["overall_status"] == "blocked"
         assert result["ready_for_read"] is False
@@ -738,7 +742,7 @@ class TestToolLogic:
 
         result = await get_notebook_summary("nb-1")
         assert result["notebook_id"] == "nb-1"
-        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook_url"] == "https://notebook.google.com/notebook/nb-1"
         assert result["summary"] == "Notebook summary text"
         assert isinstance(result["topics"], list)
         assert result["topics"][0]["question"] == "Sample topic?"
@@ -749,7 +753,7 @@ class TestToolLogic:
 
         result = await list_sources("nb-1")
         assert result["notebook_id"] == "nb-1"
-        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook_url"] == "https://notebook.google.com/notebook/nb-1"
         assert result["count"] == 1
         assert result["ready_count"] == 1
         assert result["processing_count"] == 0
@@ -796,7 +800,7 @@ class TestToolLogic:
         result = await poll_artifact_status("nb-1", "task-1")
         assert result["status"] == "pending"
         assert result["is_complete"] is False
-        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook_url"] == "https://notebook.google.com/notebook/nb-1"
         assert result["next_action"]["tool"] == "poll_artifact_status"
 
     @pytest.mark.asyncio
@@ -833,9 +837,9 @@ class TestToolLogic:
 
         result = await run_deep_search_workflow("climate tips", "Research NB")
         assert result["status"] == "in_progress"
-        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook_url"] == "https://notebook.google.com/notebook/nb-1"
         assert result["notebook"]["id"] == "nb-1"
-        assert result["notebook"]["url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook"]["url"] == "https://notebook.google.com/notebook/nb-1"
         assert result["notebook"]["title"] == "Research NB"
         assert result["research"]["task_id"] == "res-1"
         assert result["research"]["query"] == "climate tips"
@@ -894,7 +898,8 @@ class TestToolLogic:
         assert isinstance(out, dict) and "error" in out
 
     @pytest.mark.asyncio
-    async def test_research_wait_and_import(self, patch_client):
+    async def test_research_wait_and_import(self, patch_client, monkeypatch):
+        import notebooklm.mcp_server as srv
         from notebooklm.mcp_server import research_wait_and_import
 
         calls = {"n": 0}
@@ -916,8 +921,8 @@ class TestToolLogic:
             }
 
         patch_client.research.poll = AsyncMock(side_effect=poll_side_effect)
-        with patch("notebooklm.mcp_server.asyncio.sleep", new_callable=AsyncMock):
-            result = await research_wait_and_import("nb-1", "res-1", timeout_seconds=60)
+        monkeypatch.setattr(srv.asyncio, "sleep", AsyncMock())
+        result = await research_wait_and_import("nb-1", "res-1", timeout_seconds=60)
         assert result.get("status") == "imported"
         assert result.get("sources_imported") == 1
 
@@ -929,7 +934,7 @@ class TestToolLogic:
         assert result == {
             "id": "nb-1",
             "title": "New Title",
-            "url": "https://notebooklm.google.com/notebook/nb-1",
+            "url": "https://notebook.google.com/notebook/nb-1",
         }
 
     @pytest.mark.asyncio
@@ -947,7 +952,7 @@ class TestToolLogic:
 
         result = await list_artifacts("nb-1")
         assert result["notebook_id"] == "nb-1"
-        assert result["notebook_url"] == "https://notebooklm.google.com/notebook/nb-1"
+        assert result["notebook_url"] == "https://notebook.google.com/notebook/nb-1"
         assert result["count"] == 1
         assert result["artifacts"][0]["id"] == "art-1"
         assert result["artifacts"][0]["kind"] == "audio"

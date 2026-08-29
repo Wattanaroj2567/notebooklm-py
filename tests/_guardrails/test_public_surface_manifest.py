@@ -1047,7 +1047,7 @@ def test_auth_update_cookie_input_lives_in_cookies_module() -> None:
 # Mirrors scripts/audit_public_api_compat.py: EXCLUDED_TOP_LEVEL_MODULES /
 # EXTRA_PUBLIC_PACKAGES. Keep in sync with the audit's discovery so the two
 # gates agree on the public top-level surface.
-_AUDIT_EXCLUDED_TOP_LEVEL_MODULES = {"__main__", "notebooklm_cli"}
+_AUDIT_EXCLUDED_TOP_LEVEL_MODULES = {"__main__", "notebooklm_cli", "mcp_server"}
 _AUDIT_EXTRA_PUBLIC_PACKAGES = ("rpc",)
 _NOTEBOOKLM_PACKAGE_DIR = Path(__file__).resolve().parents[2] / "src" / "notebooklm"
 

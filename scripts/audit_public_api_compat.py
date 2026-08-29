@@ -45,7 +45,7 @@ from typing import Any
 
 PUBLIC_PACKAGE = "notebooklm"
 DEFAULT_ALLOWLIST = "scripts/api-compat-allowlist.json"
-EXCLUDED_TOP_LEVEL_MODULES = {"__main__", "notebooklm_cli"}
+EXCLUDED_TOP_LEVEL_MODULES = {"__main__", "notebooklm_cli", "mcp_server"}
 EXTRA_PUBLIC_PACKAGES = ("rpc",)
 CLIENT_NAMESPACE_ATTRIBUTES = (
     "artifacts",

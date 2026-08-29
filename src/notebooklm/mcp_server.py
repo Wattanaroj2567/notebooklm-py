@@ -24,6 +24,7 @@ from mcp.types import Icon
 
 from notebooklm import NotebookLMClient
 from notebooklm._app.serialize import to_jsonable
+from notebooklm._env import DEFAULT_BASE_URL
 from notebooklm.exceptions import ValidationError
 from notebooklm.paths import get_storage_path
 from notebooklm.rpc import (
@@ -86,7 +87,7 @@ _configure_mcp_logging()
 # --- NotebookLM AI Framework Configuration ---
 FRAMEWORK_NOTEBOOK_ID_ENV = "NOTEBOOKLM_FRAMEWORK_NOTEBOOK_ID"
 FRAMEWORK_ROLES = ("auto", "Minnie", "Reas", "Vera", "Indy", "Day", "Chris")
-NOTEBOOKLM_BASE_URL = "https://notebooklm.google.com"
+NOTEBOOKLM_BASE_URL = DEFAULT_BASE_URL
 
 
 # --- Advanced Deduplication Helpers ---

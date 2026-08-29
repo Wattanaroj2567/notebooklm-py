@@ -33,6 +33,7 @@ jobs:
         # triggering ref for push/pull_request (input is empty there).
         ref: ${{ inputs.custom_branch || github.ref }}
         fetch-depth: 0
+        fetch-tags: true
         persist-credentials: false
 
     - name: Set up Python

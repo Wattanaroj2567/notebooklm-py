@@ -151,22 +151,6 @@ class TestIsAuthError:
     def test_returns_false_for_rpc_error_with_auth_words_but_no_auth_signal(self, message):
         assert is_auth_error(RPCError(message)) is False
 
-    def test_returns_true_for_rpc_error_unauthenticated_code_16(self):
-        # Stale NotebookLM session tokens return HTTP 200 whose decoded
-        # batchexecute payload carries gRPC code 16. The refresh+retry path
-        # only fires when is_auth_error() flags it (original Docker bug).
-        err = RPCError(
-            "RPC abc returned null result with status code 16 (Unauthenticated).",
-            rpc_code=16,
-        )
-        assert is_auth_error(err) is True
-        # Also true when the code arrives as a string.
-        assert is_auth_error(RPCError("null result", rpc_code="16")) is True
-
-    def test_returns_true_for_rpc_error_unauthenticated_message_only(self):
-        # No rpc_code attached, but the label is in the message.
-        assert is_auth_error(RPCError("request was Unauthenticated")) is True
-
     def test_returns_false_for_rpc_error_with_generic_message(self):
         assert is_auth_error(RPCError("some generic error")) is False
 

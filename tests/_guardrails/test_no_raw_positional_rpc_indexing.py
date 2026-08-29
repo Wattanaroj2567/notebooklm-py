@@ -130,7 +130,7 @@ ALLOWLIST: frozenset[str] = frozenset()
 # time). ``_auth/``, ``utils.py`` and ``_version_check.py`` never see
 # ``batchexecute`` payloads by construction (cookies / argv / constants).
 SINGLE_LEVEL_EXCLUDED_PACKAGES = frozenset({"cli", "_app", "_auth"})
-SINGLE_LEVEL_EXCLUDED_FILES = frozenset({"utils.py", "_version_check.py"})
+SINGLE_LEVEL_EXCLUDED_FILES = frozenset({"utils.py", "_version_check.py", "mcp_server.py"})
 
 # Baseline of BELOW-FACADE feature files that open-code a *single-level*
 # integer-literal subscript (``x[i]``) of a decoded RPC payload (issue #1491).

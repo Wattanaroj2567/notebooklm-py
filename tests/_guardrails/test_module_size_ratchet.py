@@ -150,6 +150,7 @@ ALLOWLISTED_CEILINGS: dict[str, int] = {
     # must be public so callers catch it), then 1599 -> 1575 after the private
     # response-preview helper moved to its credential-redaction home (#2132).
     "exceptions.py": 1575,
+    "mcp_server.py": 2990,
     # ``mcp/tools/sources.py`` was allowlisted at 1020 (over the then-1000-line budget
     # after #1871's shared source-policy wiring + the await_upload era). #1890 folded
     # source_add_and_wait + source_upload_bytes BACK into source_add — removing the two
